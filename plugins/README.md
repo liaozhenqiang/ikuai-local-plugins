@@ -4,8 +4,16 @@
 `Release` / `install.sh` / `boot.sh` / `uninstall.sh`、后端 `function/*`、`bin/*ctl` 控制脚本、
 `www/plugins/**` 卡片与页面，以及必要的默认配置。
 
-**第三方程序本体没有放进仓库**——它们体积大（几个到几百 MB）、各有自己的许可证和发布渠道，
-请按各自的上游获取后放到对应位置。所以这里的目录是「源码 / 集成层」，不是能直接安装的成品包。
+**第三方程序本体没有放进仓库**——它们体积大（几个到几百 MB）、各有自己的许可证和发布渠道。
+不过 [Releases](../../releases) 里提供了**含程序本体的完整包**（打包时排除了各插件的 `data/`），
+可以直接 `ikplugin install` 或被「插件在线升级」(ikupd) 直接升级：
+
+| 有完整包 | 只有源码 |
+| --- | --- |
+| adguardhome、alist、aria2、bnfix、ddnsgo、frpc、frps、ikupd、miot-panel、npc、nps、openclash、ttyd | awesun（向日葵官方闭源客户端，473MB）、gecoos（集客 AC 厂商二进制）——主体是厂商程序，不在这里再分发 |
+
+要自己重新打完整包：在路由器上 `bash tools/pack-on-device.sh <插件名>`，它会排除 `data/`
+（证书 / token / 清单都在那里），并按 `<插件名>-v<版本>-plugin.zip` 命名。
 
 | 插件 | 版本 | 作用 | 仓库里有 | 需要自己补 |
 | --- | --- | --- | --- | --- |

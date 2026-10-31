@@ -25,7 +25,10 @@ OUTDIR="${2:-/tmp}"
 OUT="$OUTDIR/$P-v$VER-plugin.zip"
 
 rm -f "$OUT"
-( cd "$SRC" && zip -qr "$OUT" . -x "data/*" "*.log" "*.tmp" ".*" ) || {
+# 排除 data/（证书/token/清单等运行时数据）、日志，以及可能已过期的签名清单
+# （MANIFEST.MF 里的文件哈希对不上会让 plugin_verify 失败；框架不强制签名）
+( cd "$SRC" && zip -qr "$OUT" . \
+    -x "data/*" "*.log" "*.tmp" ".*" "MANIFEST.MF" "SIGNATURE.RSA" ) || {
     echo "压缩失败" >&2; exit 1
 }
 
