@@ -1,0 +1,91 @@
+#!/bin/bash /etc/ikcommon
+#
+# function/devmon —— 本地设备监控后端接口
+#
+#   show TYPE=data   返回 status/devices/events/config
+#   show TYPE=scan   局域网发现（ARP + iKuai 终端列表），返回 candidates
+#   save     新增/保存设备（add/edit 共用）
+#   toggle   启用/暂停监控
+#   forget   删除设备
+#   seting   修改采集间隔/离线判定
+#   refresh  立即检测一轮
+
+MROOT="/etc/mnt/plugins/devmon"
+BIN="$MROOT/bin/devmon"
+MLOG=/etc/log/devmon.log
+
+dec() { printf '%s' "${1:-}" | tr '+' ' '; }
+
+__show_data() {
+    local status devices events
+    status="$("$BIN" status 2>>"$MLOG")"; [ -n "$status" ] || status='{}'
+    devices="$("$BIN" devices all 2>>"$MLOG")"; [ -n "$devices" ] || devices='[]'
+    events="$("$BIN" events 30 2>>"$MLOG")"; [ -n "$events" ] || events='[]'
+    json_append __json_result__ status:json
+    json_append __json_result__ devices:json
+    json_append __json_result__ events:json
+}
+
+show()
+{
+    Show __json_result__
+}
+
+# 框架约定：只有 show 的 stdout 会被解析成 Data，其它动作的 stdout 一律丢弃，
+# 所以局域网发现挂在 TYPE=scan 上，不能单独做成 scan 动作。
+__show_scan() {
+    local candidates
+    candidates="$("$BIN" scan 2>>"$MLOG")" || return 1
+    [ -n "$candidates" ] || candidates='[]'
+    json_append __json_result__ candidates:json
+    return 0
+}
+
+save()
+{
+    local m i c n v mo h l nt u p e
+    m="${mac:-}"
+    i="${ip:-}"
+    c="${category:-peripheral}"
+    n="$(dec "${name:-}")"
+    v="$(dec "${vendor:-}")"
+    mo="$(dec "${model:-}")"
+    h="$(dec "${hostname:-}")"
+    l="$(dec "${location:-}")"
+    nt="$(dec "${note:-}")"
+    u="${url:-}"
+    p="${ports:-}"
+    e="${enabled:-1}"
+    "$BIN" save "$m" "$i" "$c" "$n" "$v" "$mo" "$h" "$l" "$nt" "$u" "$p" "$e" >>"$MLOG" 2>&1 \
+        || { echo "保存失败：MAC/类别/端口等参数不合法"; return 1; }
+    return 0
+}
+
+toggle()
+{
+    "$BIN" toggle "${mac:-}" "${enabled:-1}" >>"$MLOG" 2>&1 || { echo "操作失败"; return 1; }
+    return 0
+}
+
+forget()
+{
+    "$BIN" forget "${mac:-}" >>"$MLOG" 2>&1 || { echo "删除失败：设备不存在"; return 1; }
+    return 0
+}
+
+seting()
+{
+    local k="${key:-}" v="${value:-}"
+    case "$k" in
+        interval|offline_after|retain_events|auto_add) ;;
+        *) echo "不支持的配置项: $k"; return 1 ;;
+    esac
+    "$BIN" set "$k" "$v" >>"$MLOG" 2>&1 || { echo "保存失败：取值不合法"; return 1; }
+    return 0
+}
+
+refresh()
+{
+    "$BIN" observe >>"$MLOG" 2>&1 || { echo "检测失败，请查看 $MLOG"; return 1; }
+    return 0
+}

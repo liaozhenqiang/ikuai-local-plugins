@@ -1,0 +1,38 @@
+{
+  "status": {
+    "daemon_running": true,
+    "sweep_running": false,
+    "total": 5,
+    "online": 4,
+    "offline": 1,
+    "iot": 3,
+    "router": 1,
+    "terminal": 1,
+    "unknown": 0,
+    "interval": 60,
+    "offline_after": 3,
+    "miio": 1,
+    "sweep_enabled": 1,
+    "sweep_every": 600,
+    "sweep_cidr": "auto",
+    "retain_events": 300,
+    "last_scan": 1792654204,
+    "last_sweep": 1792654000,
+    "last_error": "",
+    "db_size": 45056
+  },
+  "devices": [
+    {"mac":"34:ce:00:11:22:33","ip":"192.168.9.10","did":"111","model":"xiaomi.router.r4","name":"客厅路由器","kind":"router","vendor":"xiaomi","online":true,"miss":0,"manual":false,"first_seen":1792640000,"last_seen":1792654204,"last_online":1792654204,"last_offline":0,"source":"miio"},
+    {"mac":"64:09:80:aa:bb:cc","ip":"192.168.9.11","did":"222","model":"yeelink.light.color3","name":"卧室灯","kind":"iot","vendor":"xiaomi","online":true,"miss":0,"manual":false,"first_seen":1792640000,"last_seen":1792654204,"last_online":1792654204,"last_offline":0,"source":"ping"},
+    {"mac":"10:2a:b3:44:55:66","ip":"192.168.9.12","did":"333","model":"chuangmi.plug.v3","name":"门口插座","kind":"iot","vendor":"xiaomi","online":false,"miss":4,"manual":false,"first_seen":1792640000,"last_seen":1792653000,"last_online":1792653000,"last_offline":1792654100,"source":"ping"},
+    {"mac":"78:11:dc:77:88:99","ip":"192.168.9.13","did":"444","model":"xiaomi.sound.x6a","name":"小爱音箱","kind":"terminal","vendor":"xiaomi","online":true,"miss":0,"manual":true,"first_seen":1792640000,"last_seen":1792654204,"last_online":1792654204,"last_offline":0,"source":"ping"},
+    {"mac":"5c:02:14:aa:bb:cc","ip":"192.168.9.14","did":"555","model":"lumi.gateway.mgl03","name":"","kind":"iot","vendor":"miio","online":true,"miss":0,"manual":false,"first_seen":1792640000,"last_seen":1792654204,"last_online":1792654204,"last_offline":0,"source":"miio"}
+  ],
+  "events": [
+    {"ts":1792654204,"mac":"34:ce:00:11:22:33","type":"online","detail":"miio"},
+    {"ts":1792654100,"mac":"10:2a:b3:44:55:66","type":"offline","detail":"连续3次无响应"},
+    {"ts":1792654000,"mac":"5c:02:14:aa:bb:cc","type":"new","detail":"miio"},
+    {"ts":1792653900,"mac":"78:11:dc:77:88:99","type":"new","detail":"arp"},
+    {"ts":1792653800,"mac":"64:09:80:aa:bb:cc","type":"online","detail":"ping"}
+  ]
+}

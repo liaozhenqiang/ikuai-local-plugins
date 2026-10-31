@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>小米设备接入</title>
+<!-- UI 套件由基础包提供（/plugins/app/ikui.js|css），插件不带任何 UI 资源 -->
+<link rel="stylesheet" href="./ikui.css">
+</head>
+<body>
+
+<script type="text/x-template" id="tpl">
+<ik-page title="小米设备接入" tag="mimon" :sub="narrow ? '' : 'ARP + miIO 局域网发现，无需 token'">
+  <template #actions>
+    <el-tag :type="st.daemon_running ? 'success' : 'danger'" size="small" effect="plain">
+      {{ st.daemon_running ? '监控中' : '守护未运行' }}
+    </el-tag>
+    <el-tag v-if="st.sweep_running" type="warning" size="small" effect="plain">扫描中</el-tag>
+    <span class="ik-msg">{{ msg }}</span>
+    <el-button size="small" :loading="loading" @click="load">刷新</el-button>
+    <el-button size="small" type="primary" :loading="scanning" @click="doScan">立即扫描</el-button>
+  </template>
+
+  <ik-tiles :items="tiles"></ik-tiles>
+
+  <ik-sec title="设备" :desc="'共 ' + devices.length + ' 台'">
+    <div class="ik-toolbar">
+      <el-input v-model="q" placeholder="搜索名称 / MAC / IP / 型号 / 主机名" clearable style="width:280px"></el-input>
+      <el-select v-model="kindFilter" style="width:140px">
+        <el-option label="全部类型" value="all"></el-option>
+        <el-option label="米家设备" value="iot"></el-option>
+        <el-option label="小米路由器" value="router"></el-option>
+        <el-option label="小米终端" value="terminal"></el-option>
+        <el-option label="未识别" value="unknown"></el-option>
+      </el-select>
+      <el-select v-model="onlineFilter" style="width:120px">
+        <el-option label="全部状态" value="all"></el-option>
+        <el-option label="在线" value="online"></el-option>
+        <el-option label="离线" value="offline"></el-option>
+      </el-select>
+      <el-button @click="openAdd">添加设备</el-button>
+      <el-button :loading="sweeping" @click="doSweep">网段扫描</el-button>
+    </div>
+
+    <el-table :data="filtered" size="small" stripe style="width:100%">
+      <el-table-column label="状态" :width="narrow ? 64 : 86">
+        <template #default="s">
+          <span class="ik-dot" :class="s.row.online ? 'ik-ok' : 'ik-mut'"></span>
+          <span :class="s.row.online ? 'ik-ok' : 'ik-mut'">{{ s.row.online ? '在线' : '离线' }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="设备" :min-width="narrow ? 130 : 180">
+        <template #default="s">
+          <div><b>{{ nameOf(s.row) }}</b></div>
+          <div class="ik-mut" style="font-size:12px">{{ s.row.mac }}</div>
+          <div v-if="narrow" class="ik-mut" style="font-size:12px">
+            {{ s.row.ip || '—' }}<span v-if="s.row.model"> · {{ s.row.model }}</span><span v-if="s.row.did"> · miIO</span>
+          </div>
+          <div v-if="narrow && s.row.hostname" class="ik-mut" style="font-size:12px">{{ s.row.hostname }}</div>
+          <div v-if="narrow" class="ik-mut" style="font-size:12px">最近在线 {{ fmtTime(s.row.last_seen) }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="!narrow" label="IP" width="130">
+        <template #default="s"><span class="ik-code">{{ s.row.ip || '—' }}</span></template>
+      </el-table-column>
+      <el-table-column label="类型" :width="narrow ? 84 : 112">
+        <template #default="s">
+          <el-tag size="small" :type="kindTag(s.row.kind)" effect="plain">
+            {{ narrow ? kindShort(s.row.kind) : kindLabel(s.row.kind) }}
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="!narrow" label="型号 / 主机名" min-width="190">
+        <template #default="s">
+          <div>{{ s.row.model || '—' }}</div>
+          <div v-if="s.row.hostname" class="ik-mut" style="font-size:12px">{{ s.row.hostname }}</div>
+          <div v-if="s.row.did" class="ik-mut" style="font-size:12px">DID {{ s.row.did }}</div>
+          <el-tag v-if="s.row.did" size="small" type="success" effect="plain" style="margin-top:4px">miIO</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="!narrow" label="最近在线" width="150">
+        <template #default="s">{{ fmtTime(s.row.last_seen) }}</template>
+      </el-table-column>
+      <el-table-column label="操作" :width="narrow ? 88 : 120" fixed="right">
+        <template #default="s">
+          <el-button link size="small" @click="openEdit(s.row)">编辑</el-button>
+          <el-button link type="danger" size="small" @click="doForget(s.row)">删除</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+
+    <p class="ik-tip">
+      自动识别覆盖 ARP 里的小米 MAC 前缀，以及 miIO 广播（udp/54321）应答的设备。
+      小米手机默认使用随机 MAC 时可能识别不到，可点「添加设备」手动登记；
+      型号为空说明只拿到了 MAC，还没收到 miIO 应答。
+    </p>
+  </ik-sec>
+
+  <ik-sec title="扫描与判定" desc="改完点保存">
+    <el-form :label-width="narrow ? '112px' : '150px'" @submit.prevent>
+      <el-form-item label="采集间隔">
+        <el-input-number v-model="cfg.interval" :min="10" :max="3600" :step="10" style="width:160px"></el-input-number>
+        <span class="ik-tip" style="margin-left:10px">秒；每轮扫描会 ping 已知设备</span>
+      </el-form-item>
+      <el-form-item label="离线判定">
+        <el-input-number v-model="cfg.offline_after" :min="2" :max="20" :step="1" style="width:160px"></el-input-number>
+        <span class="ik-tip" style="margin-left:10px">连续多少轮无响应才算离线</span>
+      </el-form-item>
+      <el-form-item label="miIO 广播探测">
+        <el-switch v-model="cfg.miio" :active-value="1" :inactive-value="0"></el-switch>
+        <span class="ik-tip" style="margin-left:10px">发现米家设备/小米路由器，并读取型号；失败不影响 ARP</span>
+      </el-form-item>
+      <el-form-item label="周期网段扫描">
+        <el-switch v-model="cfg.sweep_enabled" :active-value="1" :inactive-value="0"></el-switch>
+        <span class="ik-tip" style="margin-left:10px">定期 ping 一遍 LAN，发现不主动发流量的设备</span>
+      </el-form-item>
+      <el-form-item label="网段扫描周期">
+        <el-input-number v-model="cfg.sweep_every" :min="60" :max="86400" :step="60" style="width:160px"></el-input-number>
+        <span class="ik-tip" style="margin-left:10px">秒</span>
+      </el-form-item>
+      <el-form-item label="扫描网段">
+        <el-input v-model="cfg.sweep_cidr" placeholder="auto 或 192.168.9 / 192.168.9.0/24" style="width:260px"></el-input>
+        <span class="ik-tip" style="margin-left:10px">auto = 从路由表取直连的 /24 LAN</span>
+      </el-form-item>
+    </el-form>
+    <div class="ik-toolbar">
+      <el-button type="primary" :loading="saving" @click="saveCfg">保存配置</el-button>
+      <span class="ik-mut" style="font-size:12px">
+        上次扫描 {{ fmtTime(st.last_scan) }} · 上次网段扫描 {{ fmtTime(st.last_sweep) }}
+      </span>
+    </div>
+    <p v-if="st.last_error" class="ik-tip ik-warn">上次 miIO 探测异常：{{ st.last_error }}</p>
+  </ik-sec>
+
+  <ik-sec title="最近事件" desc="只保留状态变化与新增">
+    <el-table :data="events" size="small" style="width:100%">
+      <el-table-column label="时间" :width="narrow ? 138 : 160">
+        <template #default="s">{{ fmtTime(s.row.ts) }}</template>
+      </el-table-column>
+      <el-table-column v-if="!narrow" label="设备" min-width="180">
+        <template #default="s">{{ nameByMac(s.row.mac) }}</template>
+      </el-table-column>
+      <el-table-column label="事件" :width="narrow ? 76 : 100">
+        <template #default="s">
+          <el-tag size="small" :type="eventTag(s.row.type)" effect="plain">{{ eventLabel(s.row.type) }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="详情" min-width="140">
+        <template #default="s">
+          <span v-if="narrow" class="ik-mut">{{ nameByMac(s.row.mac) }} · </span>{{ detailText(s.row.detail) || '—' }}
+        </template>
+      </el-table-column>
+    </el-table>
+  </ik-sec>
+
+  <el-collapse>
+    <el-collapse-item title="发现原理、数据位置与限制" name="how">
+      <div class="ik-tip">
+        <p><b>1) 发现</b>：读取设备 ARP 表，按 IEEE OUI 清单里的 343 个小米前缀识别；同时向各个 LAN 广播地址的
+        UDP/54321 发送 miIO 握手包，应答里拿 MAC、型号、DID（<b>发现阶段不需要 token</b>，也拿不到 token）。</p>
+        <p><b>2) 在线监控</b>：每轮 ping 已知 IP，miIO 有应答也算在线；连续 N 轮无响应才记离线，避免设备休眠/丢包误判。</p>
+        <p><b>3) 数据</b>：<code class="ik-code">/etc/mnt/plugins/mimon/data/mimon.db</code>（sqlite3，重启不丢）；
+        日志 <code class="ik-code">/etc/log/mimon.log</code>。守护进程由 <code class="ik-code">boot.sh</code> 每次开机重新拉起。</p>
+        <p><b>限制</b>：只做发现和在线状态，不控制设备；miIO 设备若固件不回广播，就只能靠 ARP + OUI 识别；
+        随机 MAC 的手机/终端建议手动登记。</p>
+      </div>
+    </el-collapse-item>
+  </el-collapse>
+
+  <el-dialog v-model="addDlg" title="添加设备" width="460px">
+    <el-form label-width="80px" @submit.prevent>
+      <el-form-item label="MAC">
+        <el-input v-model="form.mac" placeholder="AA:BB:CC:DD:EE:FF"></el-input>
+      </el-form-item>
+      <el-form-item label="名称">
+        <el-input v-model="form.name" placeholder="例如：客厅电视"></el-input>
+      </el-form-item>
+      <el-form-item label="类型">
+        <el-select v-model="form.kind" style="width:100%">
+          <el-option label="自动识别" value="auto"></el-option>
+          <el-option label="米家设备" value="iot"></el-option>
+          <el-option label="小米路由器" value="router"></el-option>
+          <el-option label="小米终端" value="terminal"></el-option>
+          <el-option label="其他" value="other"></el-option>
+        </el-select>
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="addDlg = false">取消</el-button>
+      <el-button type="primary" :loading="savingOne" @click="doAdd">添加</el-button>
+    </template>
+  </el-dialog>
+
+  <el-dialog v-model="editDlg" title="编辑设备" width="460px">
+    <el-form label-width="80px" @submit.prevent>
+      <el-form-item label="MAC">
+        <el-input v-model="form.mac" disabled></el-input>
+      </el-form-item>
+      <el-form-item label="名称">
+        <el-input v-model="form.name" placeholder="留空则显示型号"></el-input>
+      </el-form-item>
+      <el-form-item label="类型">
+        <el-select v-model="form.kind" style="width:100%">
+          <el-option label="自动识别" value="auto"></el-option>
+          <el-option label="米家设备" value="iot"></el-option>
+          <el-option label="小米路由器" value="router"></el-option>
+          <el-option label="小米终端" value="terminal"></el-option>
+          <el-option label="其他" value="other"></el-option>
+        </el-select>
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="editDlg = false">取消</el-button>
+      <el-button type="primary" :loading="savingOne" @click="doEdit">保存</el-button>
+    </template>
+  </el-dialog>
+</ik-page>
+</script>
+
+<div id="app"></div>
+
+<script src="./ikui.js"></script>
+<script>
+IKUI.mount('#app', {
+  tpl: '#tpl',
+  func: 'mimon',
+  data: function () {
+    return {
+      msg: '', loading: false, scanning: false, sweeping: false, saving: false, savingOne: false,
+      narrow: typeof window !== 'undefined' && window.innerWidth < 1000,
+      st: {}, devices: [], events: [], tiles: [],
+      q: '', kindFilter: 'all', onlineFilter: 'all',
+      cfg: { interval: 60, offline_after: 3, miio: 1, sweep_enabled: 0, sweep_every: 600, sweep_cidr: 'auto' },
+      cfgLoaded: false,
+      addDlg: false, editDlg: false,
+      form: { mac: '', name: '', kind: 'auto' }
+    };
+  },
+  computed: {
+    filtered: function () {
+      var self = this;
+      var q = String(this.q || '').trim().toLowerCase();
+      return this.devices.filter(function (d) {
+        if (self.kindFilter === 'unknown') {
+          if (['iot', 'router', 'terminal'].indexOf(d.kind) >= 0) { return false; }
+        } else if (self.kindFilter !== 'all' && d.kind !== self.kindFilter) {
+          return false;
+        }
+        if (self.onlineFilter === 'online' && !d.online) { return false; }
+        if (self.onlineFilter === 'offline' && d.online) { return false; }
+        if (!q) { return true; }
+        return [d.name, d.mac, d.ip, d.model, d.hostname, d.did].join(' ').toLowerCase().indexOf(q) >= 0;
+      });
+    }
+  },
+  methods: {
+    fmtTime: function (sec) {
+      sec = parseInt(sec, 10) || 0;
+      if (sec <= 0) { return '—'; }
+      var d = new Date(sec * 1000);
+      var p = function (n) { return (n < 10 ? '0' : '') + n; };
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+        p(d.getHours()) + ':' + p(d.getMinutes());
+    },
+    nameOf: function (d) {
+      if (!d) { return ''; }
+      if (d.name) { return d.name; }
+      if (d.model) { return d.model; }
+      if (d.kind === 'router') { return '小米路由器'; }
+      if (d.kind === 'iot') { return '米家设备'; }
+      return '小米设备';
+    },
+    nameByMac: function (mac) {
+      for (var i = 0; i < this.devices.length; i++) {
+        if (this.devices[i].mac === mac) { return this.nameOf(this.devices[i]); }
+      }
+      return mac;
+    },
+    kindLabel: function (k) {
+      return { iot: '米家设备', router: '小米路由器', terminal: '小米终端', other: '其他', unknown: '未识别' }[k] || '未识别';
+    },
+    kindShort: function (k) {
+      return { iot: '米家', router: '路由', terminal: '终端', other: '其他', unknown: '未识别' }[k] || '未识别';
+    },
+    kindTag: function (k) {
+      return { iot: 'success', router: 'warning', terminal: 'primary', other: 'info', unknown: 'info' }[k] || 'info';
+    },
+    eventLabel: function (t) {
+      return { new: '发现', online: '上线', offline: '离线' }[t] || t;
+    },
+    eventTag: function (t) {
+      return { new: 'success', online: 'success', offline: 'danger' }[t] || 'info';
+    },
+    detailText: function (d) {
+      if (!d) { return ''; }
+      return { arp: 'ARP', miio: 'miIO', ping: 'ping', ikuai: 'iKuai 终端', manual: '手动添加' }[d] || d;
+    },
+    validMac: function (m) {
+      return /^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$/.test(m) || /^[0-9a-fA-F]{12}$/.test(m);
+    },
+    validCidr: function (v) {
+      if (v === 'auto') { return true; }
+      var m = String(v).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\.(\d{1,3}))?(?:\/24)?$/);
+      if (!m) { return false; }
+      for (var i = 1; i <= 4; i++) {
+        if (m[i] !== undefined && parseInt(m[i], 10) > 255) { return false; }
+      }
+      return true;
+    },
+    load: function () {
+      var self = this;
+      this.loading = true;
+      return this.ik('show', { TYPE: 'data' }).then(function (d) {
+        var s = d.status || {};
+        self.st = s;
+        self.devices = d.devices || [];
+        self.events = d.events || [];
+        self.tiles = [
+          { k: '设备总数', v: s.total || 0 },
+          { k: '在线', v: s.online || 0, tone: 'ok' },
+          { k: '离线', v: s.offline || 0, tone: (s.offline ? 'warn' : '') },
+          { k: '米家设备', v: s.iot || 0, size: 'sm' },
+          { k: '小米路由器', v: s.router || 0, size: 'sm' },
+          { k: '小米终端', v: s.terminal || 0, size: 'sm' }
+        ];
+        if (!self.cfgLoaded) {
+          self.cfg.interval = parseInt(s.interval, 10) || 60;
+          self.cfg.offline_after = parseInt(s.offline_after, 10) || 3;
+          self.cfg.miio = parseInt(s.miio, 10) ? 1 : 0;
+          self.cfg.sweep_enabled = parseInt(s.sweep_enabled, 10) ? 1 : 0;
+          self.cfg.sweep_every = parseInt(s.sweep_every, 10) || 600;
+          self.cfg.sweep_cidr = s.sweep_cidr || 'auto';
+          self.cfgLoaded = true;
+        }
+        self.msg = '';
+      }).catch(function (e) {
+        self.msg = '读取失败: ' + e.message;
+      }).then(function () { self.loading = false; });
+    },
+    doScan: function () {
+      var self = this;
+      this.scanning = true;
+      this.ik('scan', {}).then(function () {
+        self.msg = '扫描完成';
+        IKUI.toast('扫描完成', 'success');
+        return self.load();
+      }).catch(function (e) {
+        self.msg = e.message;
+        IKUI.toast('扫描失败: ' + e.message, 'error');
+      }).then(function () { self.scanning = false; });
+    },
+    doSweep: function () {
+      var self = this;
+      this.sweeping = true;
+      this.ik('sweep', {}).then(function () {
+        IKUI.toast('网段扫描已启动，稍后自动刷新', 'success');
+        setTimeout(function () { self.load(); }, 6000);
+        setTimeout(function () { self.load(); self.sweeping = false; }, 15000);
+      }).catch(function (e) {
+        IKUI.toast('启动失败: ' + e.message, 'error');
+        self.sweeping = false;
+      });
+    },
+    saveCfg: function () {
+      var self = this;
+      var interval = parseInt(this.cfg.interval, 10) || 0;
+      var oa = parseInt(this.cfg.offline_after, 10) || 0;
+      var se = parseInt(this.cfg.sweep_every, 10) || 0;
+      var cidr = String(this.cfg.sweep_cidr || 'auto').trim();
+      if (interval < 10 || interval > 3600) { IKUI.toast('采集间隔需在 10~3600 秒', 'warning'); return; }
+      if (oa < 2 || oa > 20) { IKUI.toast('离线判定需在 2~20 轮', 'warning'); return; }
+      if (se < 60 || se > 86400) { IKUI.toast('扫描周期需在 60~86400 秒', 'warning'); return; }
+      if (!cidr || /\s/.test(cidr) || !this.validCidr(cidr)) {
+        IKUI.toast('扫描网段填 auto、192.168.9 或 192.168.9.0/24', 'warning');
+        return;
+      }
+
+      var items = [
+        ['interval', interval],
+        ['offline_after', oa],
+        ['miio', this.cfg.miio ? 1 : 0],
+        ['sweep_enabled', this.cfg.sweep_enabled ? 1 : 0],
+        ['sweep_every', se],
+        ['sweep_cidr', cidr]
+      ];
+      this.saving = true;
+      var p = Promise.resolve();
+      items.forEach(function (it) {
+        p = p.then(function () { return self.ik('seting', { key: it[0], value: String(it[1]) }); });
+      });
+      p.then(function () {
+        IKUI.toast('配置已保存', 'success');
+        return self.load();
+      }).catch(function (e) {
+        IKUI.toast('保存失败: ' + e.message, 'error');
+      }).then(function () { self.saving = false; });
+    },
+    openAdd: function () {
+      this.form = { mac: '', name: '', kind: 'auto' };
+      this.addDlg = true;
+    },
+    doAdd: function () {
+      var self = this;
+      var f = this.form;
+      if (!String(f.mac || '').trim()) { IKUI.toast('请填写 MAC', 'warning'); return; }
+      if (!this.validMac(String(f.mac).trim())) { IKUI.toast('MAC 格式示例：AA:BB:CC:DD:EE:FF', 'warning'); return; }
+      this.savingOne = true;
+      this.ik('add', {
+        mac: String(f.mac).trim(),
+        name: String(f.name || '').replace(/ /g, '+'),
+        kind: f.kind || 'auto'
+      }).then(function () {
+        IKUI.toast('已添加', 'success');
+        self.addDlg = false;
+        return self.load();
+      }).catch(function (e) {
+        IKUI.toast('添加失败: ' + e.message, 'error');
+      }).then(function () { self.savingOne = false; });
+    },
+    openEdit: function (row) {
+      this.form = { mac: row.mac, name: row.name || '', kind: row.manual ? row.kind : 'auto' };
+      this.editDlg = true;
+    },
+    doEdit: function () {
+      var self = this;
+      var f = this.form;
+      this.savingOne = true;
+      this.ik('rename', {
+        mac: f.mac,
+        name: String(f.name || '').replace(/ /g, '+'),
+        kind: f.kind || 'auto'
+      }).then(function () {
+        IKUI.toast('已保存', 'success');
+        self.editDlg = false;
+        return self.load();
+      }).catch(function (e) {
+        IKUI.toast('保存失败: ' + e.message, 'error');
+      }).then(function () { self.savingOne = false; });
+    },
+    doForget: function (row) {
+      var self = this;
+      this.confirm('删除 ' + this.nameOf(row) + ' 的记录？设备再次出现时会重新发现。', '确认删除').then(function (ok) {
+        if (!ok) { return; }
+        return self.ik('forget', { mac: row.mac }).then(function () {
+          IKUI.toast('已删除', 'success');
+          return self.load();
+        }).catch(function (e) {
+          IKUI.toast('删除失败: ' + e.message, 'error');
+        });
+      });
+    }
+  },
+  mounted: function () {
+    var self = this;
+    this.load();
+    this.onResize = function () { self.narrow = window.innerWidth < 1000; };
+    window.addEventListener('resize', this.onResize);
+    this.timer = setInterval(function () {
+      if (!document.hidden && !self.addDlg && !self.editDlg) { self.load(); }
+    }, 30000);
+  },
+  unmounted: function () {
+    if (this.timer) { clearInterval(this.timer); }
+    if (this.onResize) { window.removeEventListener('resize', this.onResize); }
+  }
+});
+</script>
+</body>
+</html>

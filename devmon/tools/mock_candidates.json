@@ -1,0 +1,7 @@
+[
+  {"mac":"aa:bb:cc:00:00:50","ip":"192.168.9.50","hostname":"cam-1","vendor":"Hikvision","model":"摄像头 DS-2CD3T46","typeid":"109002009","type":"Linux","comment":"门口摄像头","online":true,"managed":true,"category":"camera"},
+  {"mac":"aa:bb:cc:00:00:51","ip":"192.168.9.51","hostname":"sw-1","vendor":"H3C","model":"交换机 S5130","typeid":"0","type":"Unknown","comment":"弱电箱交换机","online":true,"managed":true,"category":"switch"},
+  {"mac":"aa:bb:cc:00:00:54","ip":"192.168.9.54","hostname":"cam-2","vendor":"Dahua","model":"摄像头 IPC-HFW2439","typeid":"109002009","type":"Linux","comment":"车库摄像头","online":true,"managed":false,"category":""},
+  {"mac":"aa:bb:cc:00:00:55","ip":"192.168.9.55","hostname":"tv-1","vendor":"Xiaomi","model":"小米电视 ES65","typeid":"103002001","type":"Android","comment":"客厅电视","online":true,"managed":false,"category":""},
+  {"mac":"aa:bb:cc:00:00:56","ip":"192.168.9.56","hostname":"nas","vendor":"Synology","model":"DS920+","typeid":"0","type":"Linux","comment":"NAS","online":false,"managed":false,"category":""}
+]

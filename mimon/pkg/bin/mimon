@@ -1,0 +1,946 @@
+#!/bin/bash
+#
+# mimon —— 小米设备接入（局域网发现 + 在线监控）
+#
+# 发现：
+#   * ARP 表里的小米 OUI 设备（MAC 前缀清单见 share/xiaomi_oui.txt）
+#   * miIO 广播（udp/54321）应答的米家设备 / 小米路由器（发现不需要 token）
+# 探活：
+#   * ping 已知地址；miIO 应答、ARP 变化也会刷新 IP
+# 存储：
+#   * /etc/mnt/plugins/mimon/data/mimon.db（sqlite3，重启不丢）
+# 自启：
+#   * boot.sh -> mimon daemon-start（根分区每次重启还原，进程必须重新拉起）
+# 菜单：
+#   * 状态监控 -> 小米设备（share/menu_patch.sh 前端集成；失败不影响插件卡片）
+#
+set -u
+
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+ROOT="${PLUGIN_DIR:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+DATA="${MIMON_DATA:-$ROOT/data}"
+DB="${MIMON_DB:-$DATA/mimon.db}"
+PIDFILE="$DATA/daemon.pid"
+SWEEP_PID="$DATA/sweep.pid"
+SCAN_PID="$DATA/scan.pid"
+LOG="${MIMON_LOG:-/etc/log/mimon.log}"
+ARP_FILE="${MIMON_ARP_FILE:-/proc/net/arp}"
+ROUTE_FILE="${MIMON_ROUTE_FILE:-/proc/net/route}"
+OUI_FILE="${MIMON_OUI_FILE:-$ROOT/share/xiaomi_oui.txt}"
+MI_SCRIPT="${MIMON_DISCOVER:-$ROOT/share/discover.lua}"
+TERM_SCRIPT="${MIMON_TERMS:-$ROOT/share/ikuai_terminals.sh}"
+PING="${MIMON_PING:-ping}"
+# 调试/本地测试用：直接用一份 discovery JSON 代替 luajit 广播
+MIIO_JSON_FILE="${MIMON_MIIO_JSON:-}"
+
+declare -A OUI=()
+declare -A ARP_MAC_BY_IP=()
+declare -A ARP_IP_BY_MAC=()
+
+log() {
+    local d
+    d="$(dirname "$LOG")"
+    [ -d "$d" ] || mkdir -p "$d" 2>/dev/null
+    printf '%s [%s] %s\n' "$(date '+%F %T')" "${1:-info}" "${*:2}" >> "$LOG" 2>/dev/null
+}
+
+now_ts() { date +%s; }
+
+db() { sqlite3 -cmd ".timeout 3000" "$DB" "$@" 2>/dev/null; }
+
+cfg_or() {
+    local v
+    v="$(db "SELECT value FROM config WHERE key='$1';")"
+    [ -n "$v" ] || v="${2:-}"
+    printf '%s' "$v"
+}
+
+cfg_int() {
+    local v
+    v="$(db "SELECT value FROM config WHERE key='$1';")"
+    case "$v" in
+        ''|*[!0-9]*) v="${2:-0}" ;;
+        *) v="$(printf '%s' "$v" | sed 's/^0*//')"; [ -n "$v" ] || v=0 ;;
+    esac
+    printf '%s' "$v"
+}
+
+set_cfg() {
+    db "INSERT OR REPLACE INTO config(key,value) VALUES('$1','$2');" >/dev/null
+}
+
+norm_mac() {
+    local m="${1:-}"
+    m="$(printf '%s' "$m" | tr -d ' \t\r\n' | tr 'A-F' 'a-f' | tr '-' ':')"
+    if [[ "$m" =~ ^[0-9a-f]{12}$ ]]; then
+        m="${m:0:2}:${m:2:2}:${m:4:2}:${m:6:2}:${m:8:2}:${m:10:2}"
+    fi
+    [[ "$m" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || return 1
+    case "$m" in
+        00:00:00:00:00:00|ff:ff:ff:ff:ff:ff) return 1 ;;
+    esac
+    printf '%s' "$m"
+}
+
+valid_octet() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$((10#$1))" -le 255 ] 2>/dev/null
+}
+
+valid_ip() {
+    local ip="${1:-}" a b c d n
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r a b c d <<< "$ip"
+    for n in "$a" "$b" "$c" "$d"; do
+        valid_octet "$n" || return 1
+    done
+    [ "$ip" != "0.0.0.0" ] && [ "$ip" != "255.255.255.255" ]
+}
+
+clean_ip() {
+    local ip
+    ip="$(printf '%s' "${1:-}" | tr -d ' \t\r\n')"
+    valid_ip "$ip" || return 1
+    printf '%s' "$ip"
+}
+
+clean_name() {
+    local s="${1:-}"
+    s="${s//\'/}"; s="${s//\"/}"; s="${s//\`/}"; s="${s//\\/}"
+    s="${s//$'\t'/ }"; s="${s//$'\r'/ }"; s="${s//$'\n'/ }"
+    s="$(printf '%s' "$s" | tr -s ' ' | sed 's/^ //; s/ $//' 2>/dev/null)"
+    printf '%s' "$s" | cut -c1-48
+}
+
+clean_token() {
+    printf '%s' "${1:-}" | tr -cd 'A-Za-z0-9._:-' | cut -c1-64
+}
+
+clean_err() {
+    local s="${1:-}"
+    s="${s//\'/}"; s="${s//\"/}"
+    s="${s//$'\r'/ }"; s="${s//$'\n'/ }"
+    printf '%s' "${s:0:160}"
+}
+
+kind_from_model() {
+    local m
+    m="$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z')"
+    case "$m" in
+        *router*) echo router ;;
+        *tv*|*sound*|*speaker*|*phone*|*pad*) echo terminal ;;
+        chuangmi.*|yeelink.*|lumi.*|zhimi.*|roborock.*|rockrobo.*|dreame.*|mijia.*|isa.*|deerma.*|cuco.*|viomi.*|scishare.*|qmi.*|zimi.*|huayi.*|fimi.*|miband*) echo iot ;;
+        *) echo unknown ;;
+    esac
+}
+
+# iKuai 终端列表的 client_model/typeid 比 miIO 的 DID 更能说明具体设备
+kind_from_native() {
+    local brand="$1" model="$2" host="$3" comment="$4" typeid="$5" s
+    s="$(printf '%s %s %s %s' "$model" "$host" "$comment" | tr 'A-Z' 'a-z')"
+    case "$s" in
+        *router*|*路由*|*miwifi*|*xiaomirouter*|*redmirouter*) echo router; return 0 ;;
+    esac
+    case "$typeid" in
+        105*|101*) echo terminal; return 0 ;;
+        109*|116*|121*|134*|127*) echo iot; return 0 ;;
+    esac
+    case "$s" in
+        *音箱*|*soundbox*|*miai*|*音响*|*手机*|*phone*|*pad*|*平板*|*电视*|*tv*|*redmi*|*红米*) echo terminal; return 0 ;;
+        *插座*|*开关*|*灯*|*light*|*摄像*|*camera*|*网关*|*gateway*|*传感*|*sensor*|*净饮*|*空调伴侣*|*电饭煲*|*扫地*|*vacuum*|*净化*|*风扇*|*窗帘*|*门锁*|*plug*|*chuangmi*|*cuco*|*chunmi*|*qjiang*|*yeelink*|*lumi*|*zhimi*) echo iot; return 0 ;;
+    esac
+    echo unknown
+}
+
+native_is_xiaomi() {
+    local brand="$1" model="$2" host="$3" comment="$4"
+    case "$(printf '%s' "$brand" | tr 'A-Z' 'a-z')" in
+        xiaomi*|redmi*|mi) return 0 ;;
+    esac
+    case "$(printf '%s %s %s %s' "$brand" "$model" "$host" "$comment" | tr 'A-Z' 'a-z')" in
+        *xiaomi*|*redmi*|*mijia*|*小米*|*米家*|*红米*|*chuangmi*|*cuco*|*chunmi*|*qjiang*|*yeelink*|*lumi*|*zhimi*|*miai*|*mitv*) return 0 ;;
+    esac
+    return 1
+}
+
+valid_kind() {
+    case "${1:-}" in
+        auto|iot|router|terminal|unknown|other) return 0 ;;
+    esac
+    return 1
+}
+
+valid_cidr() {
+    local v="${1:-}" plen p o1 o2 o3 o4 n
+    case "$v" in auto) return 0 ;; esac
+    case "$v" in
+        */*) plen="${v##*/}"; [ "$plen" = "24" ] || return 1; p="${v%%/*}" ;;
+        *) p="$v" ;;
+    esac
+    IFS=. read -r o1 o2 o3 o4 <<< "$p"
+    for n in "$o1" "$o2" "$o3"; do
+        valid_octet "$n" || return 1
+    done
+    [ -z "${o4:-}" ] || valid_octet "$o4"
+}
+
+load_oui() {
+    OUI=()
+    [ -f "$OUI_FILE" ] || return 0
+    local p rest
+    while read -r p rest; do
+        case "$p" in ''|'#'*) continue ;; esac
+        p="${p//:/}"
+        p="${p^^}"
+        OUI["$p"]=1
+    done < "$OUI_FILE"
+}
+
+is_xiaomi_mac() {
+    local h="${1//:/}"
+    h="${h^^}"
+    [ -n "${OUI[${h:0:6}]:-}" ]
+}
+
+parse_arp() {
+    local file="${1:-$ARP_FILE}" ip hw flags mac mask dev
+    [ -f "$file" ] || return 0
+    while read -r ip hw flags mac mask dev; do
+        [ "$ip" = "IP" ] && continue
+        valid_ip "$ip" || continue
+        case "$flags" in 0x*|0X*) ;; *) continue ;; esac
+        (( (flags & 2) == 0 )) && continue
+        mac="$(norm_mac "$mac")" || continue
+        printf '%s\t%s\n' "$ip" "$mac"
+    done < "$file"
+}
+
+load_arp_file() {
+    local f="$1" ip mac
+    ARP_MAC_BY_IP=()
+    ARP_IP_BY_MAC=()
+    [ -f "$f" ] || return 0
+    while IFS=$'\t' read -r ip mac; do
+        [ -n "$ip" ] || continue
+        ARP_MAC_BY_IP["$ip"]="$mac"
+        ARP_IP_BY_MAC["$mac"]="$ip"
+    done < "$f"
+}
+
+ping_many() {
+    local list="$1" out="$2" ip pids=() n=0 p
+    : > "$out"
+    command -v "$PING" >/dev/null 2>&1 || return 0
+    while IFS= read -r ip; do
+        valid_ip "$ip" || continue
+        ( "$PING" -c 1 -W 1 "$ip" >/dev/null 2>&1 && printf '%s\n' "$ip" >> "$out" ) &
+        pids+=("$!")
+        n=$((n + 1))
+        if [ $((n % 16)) -eq 0 ]; then
+            for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+            pids=()
+        fi
+    done < "$list"
+    for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+}
+
+sweep_prefixes() {
+    local cfg="${1:-auto}" p plen o1 o2 o3 o4
+    if [ -n "$cfg" ] && [ "$cfg" != "auto" ]; then
+        case "$cfg" in
+            */*) plen="${cfg##*/}"; [ "$plen" = "24" ] || return 0; p="${cfg%%/*}" ;;
+            *) p="$cfg" ;;
+        esac
+        IFS=. read -r o1 o2 o3 o4 <<< "$p"
+        if valid_octet "${o1:-}" && valid_octet "${o2:-}" && valid_octet "${o3:-}"; then
+            printf '%s.%s.%s\n' "$o1" "$o2" "$o3"
+        fi
+        return 0
+    fi
+
+    local iface dest gw flags ref use metric mask mtu win irtt a b c p seen=" " found=0
+    if [ -f "$ROUTE_FILE" ]; then
+        while read -r iface dest gw flags ref use metric mask mtu win irtt; do
+            [ "$iface" = "Iface" ] && continue
+            [ "$iface" = "lo" ] && continue
+            [ "$dest" = "00000000" ] && continue
+            [ "$gw" != "00000000" ] && continue
+            [ "$mask" = "00FFFFFF" ] || continue
+            a=$(( (16#$dest) & 255 ))
+            b=$(( (16#$dest >> 8) & 255 ))
+            c=$(( (16#$dest >> 16) & 255 ))
+            [ "$a" -eq 127 ] && continue
+            [ "$a" -eq 169 ] && [ "$b" -eq 254 ] && continue
+            p="$a.$b.$c"
+            case "$seen" in *" $p "*) continue ;; esac
+            seen="$seen$p "
+            found=1
+            printf '%s\n' "$p"
+        done < "$ROUTE_FILE"
+    fi
+
+    # 路由表看不到 LAN 时，从 ARP 地址反推 /24（策略路由/多表环境）
+    if [ "$found" = 0 ] && [ -f "$ARP_FILE" ]; then
+        while IFS=$'\t' read -r ip mac; do
+            valid_ip "$ip" || continue
+            p="${ip%.*}"
+            case "$seen" in *" $p "*) continue ;; esac
+            seen="$seen$p "
+            printf '%s\n' "$p"
+        done < <(parse_arp "$ARP_FILE")
+    fi
+}
+
+do_sweep() {
+    local cfg="${1:-auto}" p ip i pids=() n=0 pid
+    command -v "$PING" >/dev/null 2>&1 || return 0
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        log sweep "扫描网段 $p.0/24"
+        for ((i = 1; i <= 254; i++)); do
+            ip="$p.$i"
+            ( "$PING" -c 1 -W 1 "$ip" >/dev/null 2>&1 ) &
+            pids+=("$!")
+            n=$((n + 1))
+            if [ $((n % 32)) -eq 0 ]; then
+                for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null; done
+                pids=()
+            fi
+        done
+    done < <(sweep_prefixes "$cfg")
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null; done
+}
+
+cmd_init() {
+    mkdir -p "$DATA" 2>/dev/null
+    db "PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS devices(
+            mac         TEXT PRIMARY KEY,
+            ip          TEXT NOT NULL DEFAULT '',
+            hostname    TEXT NOT NULL DEFAULT '',
+            did         TEXT NOT NULL DEFAULT '',
+            model       TEXT NOT NULL DEFAULT '',
+            name        TEXT NOT NULL DEFAULT '',
+            kind        TEXT NOT NULL DEFAULT 'unknown',
+            vendor      TEXT NOT NULL DEFAULT 'xiaomi',
+            online      INTEGER NOT NULL DEFAULT 0,
+            miss        INTEGER NOT NULL DEFAULT 0,
+            manual      INTEGER NOT NULL DEFAULT 0,
+            first_seen  INTEGER NOT NULL DEFAULT 0,
+            last_seen   INTEGER NOT NULL DEFAULT 0,
+            last_online INTEGER NOT NULL DEFAULT 0,
+            last_offline INTEGER NOT NULL DEFAULT 0,
+            last_source TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_devices_online ON devices(online);
+        CREATE INDEX IF NOT EXISTS idx_devices_did ON devices(did);
+        CREATE TABLE IF NOT EXISTS events(
+            id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts     INTEGER NOT NULL,
+            mac    TEXT NOT NULL,
+            type   TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+        CREATE INDEX IF NOT EXISTS idx_events_mac ON events(mac);
+        CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT OR IGNORE INTO config(key,value) VALUES('interval','60');
+        INSERT OR IGNORE INTO config(key,value) VALUES('offline_after','3');
+        INSERT OR IGNORE INTO config(key,value) VALUES('miio','1');
+        INSERT OR IGNORE INTO config(key,value) VALUES('sweep_enabled','0');
+        INSERT OR IGNORE INTO config(key,value) VALUES('sweep_every','600');
+        INSERT OR IGNORE INTO config(key,value) VALUES('sweep_cidr','auto');
+        INSERT OR IGNORE INTO config(key,value) VALUES('retain_events','300');
+        INSERT OR IGNORE INTO config(key,value) VALUES('last_scan','0');
+        INSERT OR IGNORE INTO config(key,value) VALUES('last_sweep','0');
+        INSERT OR IGNORE INTO config(key,value) VALUES('last_error','');" >/dev/null
+    # 旧库升级: 3.8 没有 ADD COLUMN IF NOT EXISTS，先查表结构
+    if ! db "PRAGMA table_info(devices);" 2>/dev/null | cut -d'|' -f2 | grep -qx hostname; then
+        db "ALTER TABLE devices ADD COLUMN hostname TEXT NOT NULL DEFAULT '';" >/dev/null
+    fi
+    return 0
+}
+
+ensure_db() {
+    cmd_init >/dev/null 2>&1
+}
+
+cmd_status() {
+    ensure_db
+    local run=false sweep_run=false
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && run=true
+    [ -f "$SWEEP_PID" ] && kill -0 "$(cat "$SWEEP_PID" 2>/dev/null)" 2>/dev/null && sweep_run=true
+
+    local total=0 online=0 offline=0 iot=0 router=0 terminal=0 unknown=0
+    local row
+    row="$(db -separator '|' "SELECT COUNT(*),
+        COALESCE(SUM(CASE WHEN online=1 THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN online=0 THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN kind='iot' THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN kind='router' THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN kind='terminal' THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN kind NOT IN ('iot','router','terminal') THEN 1 ELSE 0 END),0)
+        FROM devices;")"
+    [ -n "$row" ] && IFS='|' read -r total online offline iot router terminal unknown <<< "$row"
+
+    local interval offline_after miio sweep_enabled sweep_every sweep_cidr retain_events last_scan last_sweep last_error size
+    interval="$(cfg_int interval 60)"
+    offline_after="$(cfg_int offline_after 3)"
+    miio="$(cfg_int miio 1)"
+    sweep_enabled="$(cfg_int sweep_enabled 0)"
+    sweep_every="$(cfg_int sweep_every 600)"
+    sweep_cidr="$(cfg_or sweep_cidr auto)"
+    retain_events="$(cfg_int retain_events 300)"
+    last_scan="$(cfg_int last_scan 0)"
+    last_sweep="$(cfg_int last_sweep 0)"
+    last_error="$(clean_err "$(cfg_or last_error '')")"
+    size="$(ls -l "$DB" 2>/dev/null | awk '{print $5}')"
+    [ -n "$size" ] || size=0
+
+    # 设备端 jq 是 1.4：不支持 --argjson / 组合短选项，全部用 --arg + tonumber
+    jq -c -n \
+        --arg run "$run" \
+        --arg sweep_run "$sweep_run" \
+        --arg total "${total:-0}" \
+        --arg online "${online:-0}" \
+        --arg offline "${offline:-0}" \
+        --arg iot "${iot:-0}" \
+        --arg router "${router:-0}" \
+        --arg terminal "${terminal:-0}" \
+        --arg unknown "${unknown:-0}" \
+        --arg interval "${interval:-60}" \
+        --arg offline_after "${offline_after:-3}" \
+        --arg miio "${miio:-1}" \
+        --arg sweep_enabled "${sweep_enabled:-0}" \
+        --arg sweep_every "${sweep_every:-600}" \
+        --arg retain_events "${retain_events:-300}" \
+        --arg last_scan "${last_scan:-0}" \
+        --arg last_sweep "${last_sweep:-0}" \
+        --arg db_size "${size:-0}" \
+        --arg sweep_cidr "$sweep_cidr" \
+        --arg last_error "$last_error" \
+        '{daemon_running:($run=="true"),sweep_running:($sweep_run=="true"),total:($total|tonumber),online:($online|tonumber),offline:($offline|tonumber),iot:($iot|tonumber),router:($router|tonumber),terminal:($terminal|tonumber),unknown:($unknown|tonumber),interval:($interval|tonumber),offline_after:($offline_after|tonumber),miio:($miio|tonumber),sweep_enabled:($sweep_enabled|tonumber),sweep_every:($sweep_every|tonumber),retain_events:($retain_events|tonumber),last_scan:($last_scan|tonumber),last_sweep:($last_sweep|tonumber),db_size:($db_size|tonumber),sweep_cidr:$sweep_cidr,last_error:$last_error}'
+}
+
+cmd_devices() {
+    ensure_db
+    db -separator $'\t' "SELECT mac,ip,hostname,did,model,name,kind,vendor,online,miss,manual,
+        first_seen,last_seen,last_online,last_offline,last_source
+        FROM devices ORDER BY online DESC, last_seen DESC, mac;" |
+    jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {
+        mac: .[0], ip: .[1], hostname: .[2], did: .[3], model: .[4], name: .[5],
+        kind: .[6], vendor: .[7], online: (.[8] == "1"),
+        miss: ((.[9] // "0") | tonumber), manual: (.[10] == "1"),
+        first_seen: ((.[11] // "0") | tonumber),
+        last_seen: ((.[12] // "0") | tonumber),
+        last_online: ((.[13] // "0") | tonumber),
+        last_offline: ((.[14] // "0") | tonumber),
+        source: .[15]
+    })'
+}
+
+cmd_events() {
+    ensure_db
+    local n="${1:-40}"
+    case "$n" in ''|*[!0-9]*) n=40 ;; esac
+    [ "$n" -gt 500 ] && n=500
+    db -separator $'\t' "SELECT ts,mac,type,detail FROM events ORDER BY id DESC LIMIT $n;" |
+    jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {
+        ts: ((.[0] // "0") | tonumber), mac: .[1], type: .[2], detail: .[3]
+    })'
+}
+
+cmd_set() {
+    ensure_db
+    local k="${1:-}" v="${2:-}"
+    case "$k" in
+        interval)
+            case "$v" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$v" -ge 10 ] && [ "$v" -le 3600 ] || return 1 ;;
+        offline_after)
+            case "$v" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$v" -ge 2 ] && [ "$v" -le 20 ] || return 1 ;;
+        miio|sweep_enabled)
+            case "$v" in 0|1) ;; *) return 1 ;; esac ;;
+        sweep_every)
+            case "$v" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$v" -ge 60 ] && [ "$v" -le 86400 ] || return 1 ;;
+        sweep_cidr)
+            valid_cidr "$v" || return 1 ;;
+        retain_events)
+            case "$v" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$v" -ge 50 ] && [ "$v" -le 2000 ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    set_cfg "$k" "$v"
+    log config "设置 $k=$v"
+    return 0
+}
+
+cmd_edit() {
+    ensure_db
+    local mac name kind manual model hostname
+    mac="$(norm_mac "${1:-}")" || return 1
+    name="$(clean_name "${2:-}")"
+    kind="${3:-auto}"
+    valid_kind "$kind" || return 1
+    [ -n "$(db "SELECT mac FROM devices WHERE mac='$mac';")" ] || return 1
+
+    if [ "$kind" = "auto" ]; then
+        manual=0
+        model="$(db "SELECT model FROM devices WHERE mac='$mac';")"
+        hostname="$(db "SELECT hostname FROM devices WHERE mac='$mac';")"
+        kind="$(kind_from_native "" "$model" "$hostname" "$name" "")"
+        [ "$kind" = "unknown" ] && kind="$(kind_from_model "$model")"
+    else
+        manual=1
+    fi
+    db "UPDATE devices SET name='$name', kind='$kind', manual=$manual WHERE mac='$mac';" >/dev/null
+    log device "修改 $mac name=$name kind=$kind"
+    return 0
+}
+
+cmd_add() {
+    ensure_db
+    local mac name kind manual now
+    mac="$(norm_mac "${1:-}")" || return 1
+    name="$(clean_name "${2:-}")"
+    kind="${3:-auto}"
+    valid_kind "$kind" || return 1
+    if [ "$kind" = "auto" ]; then manual=0; kind=unknown; else manual=1; fi
+    now="$(now_ts)"
+    db "INSERT OR IGNORE INTO devices(mac,name,kind,vendor,manual,online,first_seen,last_source)
+            VALUES('$mac','$name','$kind','xiaomi',$manual,0,$now,'manual');
+        INSERT INTO events(ts,mac,type,detail)
+            SELECT $now,'$mac','new','manual' WHERE changes() > 0;
+        UPDATE devices SET name='$name', kind='$kind', manual=$manual WHERE mac='$mac';" >/dev/null
+    log device "手动添加 $mac name=$name kind=$kind"
+    return 0
+}
+
+cmd_forget() {
+    ensure_db
+    local mac cnt
+    mac="$(norm_mac "${1:-}")" || return 1
+    cnt="$(db "SELECT COUNT(*) FROM devices WHERE mac='$mac';")"
+    [ "${cnt:-0}" -gt 0 ] || return 1
+    db "DELETE FROM devices WHERE mac='$mac';
+        DELETE FROM events WHERE mac='$mac';" >/dev/null
+    log device "删除 $mac"
+    return 0
+}
+
+# ---------------------------------------------------------------- 扫描/监控
+
+scan_inner() {
+    local force_sweep="${1:-}"
+    ensure_db
+    command -v sqlite3 >/dev/null 2>&1 || { log scan "缺少 sqlite3"; return 1; }
+    command -v jq >/dev/null 2>&1 || { log scan "缺少 jq"; return 1; }
+
+    local now interval offline_after miio_enabled sweep_enabled sweep_every sweep_cidr retain_events last_sweep
+    now="$(now_ts)"
+    interval="$(cfg_int interval 60)"
+    offline_after="$(cfg_int offline_after 3)"
+    miio_enabled="$(cfg_int miio 1)"
+    sweep_enabled="$(cfg_int sweep_enabled 0)"
+    sweep_every="$(cfg_int sweep_every 600)"
+    sweep_cidr="$(cfg_or sweep_cidr auto)"
+    retain_events="$(cfg_int retain_events 300)"
+    last_sweep="$(cfg_int last_sweep 0)"
+
+    local tmpdir
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/mimon.XXXXXX" 2>/dev/null)" || return 1
+    local sql="$tmpdir/apply.sql"
+    : > "$sql"
+    printf 'BEGIN;\n' >> "$sql"
+
+    if [ "$force_sweep" = "--sweep" ]; then
+        do_sweep "$sweep_cidr"
+        set_cfg last_sweep "$now"
+    elif [ "$sweep_enabled" = 1 ] && [ $((now - last_sweep)) -ge "$sweep_every" ]; then
+        do_sweep "$sweep_cidr"
+        set_cfg last_sweep "$now"
+    fi
+
+    load_oui
+
+    # 1) ping 目标：库里已有 IP + ARP 里的小米设备
+    parse_arp "$ARP_FILE" > "$tmpdir/arp_a.tsv" 2>/dev/null
+    : > "$tmpdir/ping.txt"
+    while IFS='|' read -r mac ip; do
+        [ -n "$ip" ] && valid_ip "$ip" && printf '%s\n' "$ip" >> "$tmpdir/ping.txt"
+    done < <(db -separator '|' "SELECT mac,ip FROM devices;")
+    while IFS=$'\t' read -r ip mac; do
+        is_xiaomi_mac "$mac" && printf '%s\n' "$ip" >> "$tmpdir/ping.txt"
+    done < "$tmpdir/arp_a.tsv"
+    sort -u "$tmpdir/ping.txt" > "$tmpdir/ping.sorted" 2>/dev/null && mv "$tmpdir/ping.sorted" "$tmpdir/ping.txt"
+
+    ping_many "$tmpdir/ping.txt" "$tmpdir/up.txt"
+
+    # 2) miIO 广播探测（失败不影响 ARP 主流程）
+    : > "$tmpdir/miio.tsv"
+    local miio_err="" miio_count=0
+    if [ "$miio_enabled" = 1 ]; then
+        : > "$tmpdir/miio.json"
+        if [ -n "$MIIO_JSON_FILE" ] && [ -f "$MIIO_JSON_FILE" ]; then
+            cp "$MIIO_JSON_FILE" "$tmpdir/miio.json" 2>/dev/null
+        elif command -v luajit >/dev/null 2>&1 && [ -f "$MI_SCRIPT" ]; then
+            luajit "$MI_SCRIPT" > "$tmpdir/miio.json" 2>>"$LOG" &
+            local mpid=$! waited=0
+            while kill -0 "$mpid" 2>/dev/null && [ "$waited" -lt 6 ]; do
+                sleep 1
+                waited=$((waited + 1))
+            done
+            if kill -0 "$mpid" 2>/dev/null; then
+                kill "$mpid" 2>/dev/null
+                miio_err="miio timeout"
+            fi
+            wait "$mpid" 2>/dev/null
+        else
+            miio_err="luajit missing"
+        fi
+
+        if [ -s "$tmpdir/miio.json" ]; then
+            local luaerr
+            luaerr="$(jq -r '.error // empty' "$tmpdir/miio.json" 2>/dev/null)"
+            [ -n "$luaerr" ] && miio_err="$luaerr"
+            # discover.lua 直接给 shell 用的 tsv（jq 1.4 只做最简的 .tsv 提取）
+            if ! jq -r '.tsv // empty' "$tmpdir/miio.json" > "$tmpdir/miio.txt" 2>/dev/null; then
+                miio_err="miio tsv parse failed"
+                : > "$tmpdir/miio.txt"
+            fi
+            tr -d '\r' < "$tmpdir/miio.txt" > "$tmpdir/miio.tsv"
+        else
+            [ -n "$miio_err" ] || miio_err="no miio output"
+        fi
+    fi
+
+    # 3) 探测后的 ARP 快照才是准的（ping / miIO 流量会补全表项）
+    parse_arp "$ARP_FILE" > "$tmpdir/arp_b.tsv" 2>/dev/null
+    load_arp_file "$tmpdir/arp_b.tsv"
+
+    # 4) 载入库内状态（只更新扫描前就存在的设备，新设备单独插入）
+    local -A EXISTS=() DB_ONLINE=() DB_MISS=() DB_IP=() DB_MANUAL=() DB_MAC_BY_IP=() DB_NAME=() DB_HOST=()
+    local known_macs=()
+    while IFS='|' read -r mac ip hostname did model name kind manual online miss; do
+        [ -n "$mac" ] || continue
+        EXISTS["$mac"]=1
+        DB_IP["$mac"]="$ip"
+        DB_HOST["$mac"]="$hostname"
+        DB_NAME["$mac"]="$name"
+        DB_MANUAL["$mac"]="$manual"
+        DB_ONLINE["$mac"]="$online"
+        DB_MISS["$mac"]="$miss"
+        [ -n "$ip" ] && DB_MAC_BY_IP["$ip"]="$mac"
+        known_macs+=("$mac")
+    done < <(db -separator '|' "SELECT mac,ip,hostname,did,model,name,kind,manual,online,miss FROM devices;")
+
+    local have_ping=0
+    command -v "$PING" >/dev/null 2>&1 && have_ping=1
+
+    local -A SEEN=() SEEN_SRC=()
+    while IFS= read -r ip; do
+        valid_ip "$ip" || continue
+        local mac="${ARP_MAC_BY_IP[$ip]:-${DB_MAC_BY_IP[$ip]:-}}"
+        [ -n "$mac" ] || continue
+        SEEN["$mac"]=1
+        SEEN_SRC["$mac"]="ping"
+    done < "$tmpdir/up.txt"
+
+    local new_count=0
+
+    # 5) ARP 里的设备：新的小米设备入库；已有的只顺手修 IP
+    while IFS=$'\t' read -r ip mac; do
+        [ -n "$mac" ] || continue
+        if [ -n "${EXISTS[$mac]:-}" ]; then
+            [ "${DB_IP[$mac]:-}" != "$ip" ] && printf "UPDATE devices SET ip='%s' WHERE mac='%s';\n" "$ip" "$mac" >> "$sql"
+            if [ "$have_ping" = 0 ]; then
+                SEEN["$mac"]=1
+                [ -n "${SEEN_SRC[$mac]:-}" ] || SEEN_SRC["$mac"]="arp"
+            fi
+            continue
+        fi
+        is_xiaomi_mac "$mac" || continue
+        printf "INSERT OR IGNORE INTO devices(mac,ip,kind,vendor,online,first_seen,last_seen,last_online,last_source)
+                VALUES('%s','%s','unknown','xiaomi',1,%s,%s,%s,'arp');
+                INSERT INTO events(ts,mac,type,detail)
+                SELECT %s,'%s','new','arp' WHERE changes() > 0;\n" \
+            "$mac" "$ip" "$now" "$now" "$now" "$now" "$mac" >> "$sql"
+        EXISTS["$mac"]=1
+        SEEN["$mac"]=1
+        SEEN_SRC["$mac"]="arp"
+        new_count=$((new_count + 1))
+    done < "$tmpdir/arp_b.tsv"
+
+    # 6) miIO 应答：补型号/kind，必要时新建
+    if [ -s "$tmpdir/miio.tsv" ]; then
+        local did model ip mac kind sets
+        while IFS=$'\x1f' read -r did model ip mac; do
+            did="$(clean_token "$did")"
+            model="$(clean_token "$model")"
+            ip="$(clean_ip "$ip")" || ip=""
+            mac="$(norm_mac "$mac" 2>/dev/null)" || mac=""
+            if [ -z "$mac" ] && [ -n "$ip" ]; then
+                mac="${ARP_MAC_BY_IP[$ip]:-}"
+            fi
+            [ -n "$mac" ] || continue
+            kind="$(kind_from_model "$model")"
+            # 很多固件只回 32 字节 header（只有 DID，没有 model）：按米家设备归类，
+            # 路由器/终端可在页面里手动改（manual=1 后不会被覆盖）。
+            [ -z "$model" ] && kind="iot"
+            miio_count=$((miio_count + 1))
+
+            if [ -n "${EXISTS[$mac]:-}" ]; then
+                SEEN["$mac"]=1
+                SEEN_SRC["$mac"]="miio"
+                sets="last_source='miio'"
+                [ -n "$ip" ] && sets="$sets, ip='$ip'"
+                [ -n "$did" ] && sets="$sets, did='$did'"
+                [ -n "$model" ] && sets="$sets, model='$model'"
+                printf "UPDATE devices SET %s WHERE mac='%s';\n" "$sets" "$mac" >> "$sql"
+                if [ "$kind" != "unknown" ] && [ "${DB_MANUAL[$mac]:-0}" = "0" ]; then
+                    printf "UPDATE devices SET kind='%s' WHERE mac='%s' AND manual=0;\n" "$kind" "$mac" >> "$sql"
+                fi
+            else
+                printf "INSERT OR IGNORE INTO devices(mac,ip,did,model,kind,vendor,online,first_seen,last_seen,last_online,last_source)
+                        VALUES('%s','%s','%s','%s','%s','miio',1,%s,%s,%s,'miio');
+                        INSERT INTO events(ts,mac,type,detail)
+                        SELECT %s,'%s','new','miio' WHERE changes() > 0;\n" \
+                    "$mac" "$ip" "$did" "$model" "$kind" "$now" "$now" "$now" "$now" "$mac" >> "$sql"
+                EXISTS["$mac"]=1
+                SEEN["$mac"]=1
+                SEEN_SRC["$mac"]="miio"
+                new_count=$((new_count + 1))
+            fi
+        done < "$tmpdir/miio.tsv"
+    fi
+
+    # 6.5) iKuai 终端列表：具体型号/备注/hostname（本机函数，无需 token）
+    : > "$tmpdir/term.tsv"
+    if [ -f "$TERM_SCRIPT" ]; then
+        bash "$TERM_SCRIPT" > "$tmpdir/term.tsv" 2>>"$LOG" || : > "$tmpdir/term.tsv"
+    fi
+    if [ -s "$tmpdir/term.tsv" ]; then
+        local tmac tip thost tbrand tmodel ttype ttypeid tcomment tap tssid tsig nkind tname native_mi
+        while IFS=$'\x1f' read -r tmac tip thost tbrand tmodel ttype ttypeid tcomment tap tssid tsig; do
+            tmac="$(norm_mac "$tmac" 2>/dev/null)" || continue
+            tip="$(clean_ip "$tip")" || tip=""
+            thost="$(clean_name "$thost")"
+            tbrand="$(clean_name "$tbrand")"
+            tmodel="$(clean_name "$tmodel")"
+            tcomment="$(clean_name "$tcomment")"
+            ttypeid="$(clean_token "$ttypeid")"
+            nkind="$(kind_from_native "$tbrand" "$tmodel" "$thost" "$tcomment" "$ttypeid")"
+            native_mi=0
+            native_is_xiaomi "$tbrand" "$tmodel" "$thost" "$tcomment" && native_mi=1
+
+            if [ -n "${EXISTS[$tmac]:-}" ]; then
+                SEEN["$tmac"]=1
+                [ -n "${SEEN_SRC[$tmac]:-}" ] || SEEN_SRC["$tmac"]="ikuai"
+                local sets="last_source='ikuai'"
+                [ -n "$tip" ] && sets="$sets, ip='$tip'"
+                [ -n "$thost" ] && sets="$sets, hostname='$thost'"
+                [ -n "$tmodel" ] && sets="$sets, model='$tmodel'"
+                if [ -n "$tcomment" ] && [ -z "${DB_NAME[$tmac]:-}" ]; then
+                    sets="$sets, name='$tcomment'"
+                fi
+                # 终端列表明确是别家品牌（如华为）时，清掉此前 miIO 关联的 DID，避免误导
+                if [ "$native_mi" = 0 ] && [ -n "$tbrand" ] && [ "$tbrand" != "Unknown" ]; then
+                    sets="$sets, did='', vendor='$tbrand'"
+                fi
+                printf "UPDATE devices SET %s WHERE mac='%s';\n" "$sets" "$tmac" >> "$sql"
+                if [ "$nkind" != "unknown" ] && [ "${DB_MANUAL[$tmac]:-0}" = "0" ]; then
+                    printf "UPDATE devices SET kind='%s' WHERE mac='%s' AND manual=0;\n" "$nkind" "$tmac" >> "$sql"
+                fi
+            elif native_is_xiaomi "$tbrand" "$tmodel" "$thost" "$tcomment"; then
+                tname="$tcomment"
+                printf "INSERT OR IGNORE INTO devices(mac,ip,hostname,did,model,name,kind,vendor,online,first_seen,last_seen,last_online,last_source)
+                        VALUES('%s','%s','%s','','%s','%s','%s','xiaomi',1,%s,%s,%s,'ikuai');
+                        INSERT INTO events(ts,mac,type,detail)
+                        SELECT %s,'%s','new','ikuai' WHERE changes() > 0;\n" \
+                    "$tmac" "$tip" "$thost" "$tmodel" "$tname" "$nkind" "$now" "$now" "$now" "$now" "$tmac" >> "$sql"
+                EXISTS["$tmac"]=1
+                SEEN["$tmac"]=1
+                SEEN_SRC["$tmac"]="ikuai"
+                new_count=$((new_count + 1))
+            fi
+        done < "$tmpdir/term.tsv"
+    fi
+
+    # 7) 在线/离线状态机
+    local mac ip online miss src
+    for mac in "${known_macs[@]}"; do
+        if [ -n "${SEEN[$mac]:-}" ]; then
+            ip="${ARP_IP_BY_MAC[$mac]:-${DB_IP[$mac]:-}}"
+            valid_ip "$ip" || ip="${DB_IP[$mac]:-}"
+            online="${DB_ONLINE[$mac]:-0}"
+            src="${SEEN_SRC[$mac]:-ping}"
+            printf "UPDATE devices SET ip='%s', last_seen=%s, miss=0, online=1, last_online=%s, last_source='%s' WHERE mac='%s';\n" \
+                "$ip" "$now" "$now" "$src" "$mac" >> "$sql"
+            if [ "$online" != "1" ]; then
+                printf "INSERT INTO events(ts,mac,type,detail) VALUES(%s,'%s','online','%s');\n" "$now" "$mac" "$src" >> "$sql"
+            fi
+        else
+            miss=$(( ${DB_MISS[$mac]:-0} + 1 ))
+            [ "$miss" -gt 999 ] && miss=999
+            online="${DB_ONLINE[$mac]:-0}"
+            if [ "$online" = "1" ] && [ "$miss" -ge "$offline_after" ]; then
+                printf "UPDATE devices SET miss=%s, online=0, last_offline=%s WHERE mac='%s';\n" "$miss" "$now" "$mac" >> "$sql"
+                printf "INSERT INTO events(ts,mac,type,detail) VALUES(%s,'%s','offline','连续%s次无响应');\n" "$now" "$mac" "$offline_after" >> "$sql"
+            else
+                printf "UPDATE devices SET miss=%s WHERE mac='%s';\n" "$miss" "$mac" >> "$sql"
+            fi
+        fi
+    done
+
+    printf "INSERT OR REPLACE INTO config(key,value) VALUES('last_scan','%s');\n" "$now" >> "$sql"
+    printf "INSERT OR REPLACE INTO config(key,value) VALUES('last_error','%s');\n" "$(clean_err "$miio_err")" >> "$sql"
+    printf "DELETE FROM events WHERE id <= (SELECT MAX(id) - %s FROM events);\n" "$retain_events" >> "$sql"
+    printf 'COMMIT;\n' >> "$sql"
+
+    if ! sqlite3 -cmd ".timeout 3000" "$DB" < "$sql" 2>>"$LOG"; then
+        log scan "写入数据库失败"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    local counts ct=0 co=0
+    counts="$(db -separator '|' "SELECT COUNT(*),COALESCE(SUM(online),0) FROM devices;")"
+    [ -n "$counts" ] && IFS='|' read -r ct co <<< "$counts"
+    log scan "设备=${ct:-0} 在线=${co:-0} 新增=$new_count miIO应答=$miio_count ${miio_err:+err=$miio_err}"
+    printf '{"ok":true,"devices":%s,"online":%s,"new":%s,"miio":%s,"last_scan":%s}\n' \
+        "${ct:-0}" "${co:-0}" "$new_count" "$miio_count" "$now"
+    rm -rf "$tmpdir"
+    return 0
+}
+
+cmd_scan() {
+    ensure_db
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -n 9 || { printf '{"ok":true,"skipped":"busy"}\n'; exit 0; }
+            echo $$ > "$SCAN_PID" 2>/dev/null
+            trap 'rm -f "$SCAN_PID"' EXIT
+            scan_inner "${1:-}"
+        ) 9>"$DATA/scan.lock"
+        return $?
+    fi
+    scan_inner "${1:-}"
+}
+
+cmd_sweep_run() {
+    ensure_db
+    if [ -f "$SWEEP_PID" ] && kill -0 "$(cat "$SWEEP_PID" 2>/dev/null)" 2>/dev/null; then
+        echo "扫描已在运行"
+        return 0
+    fi
+    echo $$ > "$SWEEP_PID"
+    trap 'rm -f "$SWEEP_PID"' EXIT TERM INT HUP
+    do_sweep "$(cfg_or sweep_cidr auto)"
+    set_cfg last_sweep "$(now_ts)"
+    cmd_scan >/dev/null 2>&1
+    log sweep "完成"
+    return 0
+}
+
+cmd_sweep_start() {
+    if [ -f "$SWEEP_PID" ] && kill -0 "$(cat "$SWEEP_PID" 2>/dev/null)" 2>/dev/null; then
+        echo "扫描已在运行"
+        return 0
+    fi
+    mkdir -p "$DATA" "$(dirname "$LOG")" 2>/dev/null
+    ( trap '' HUP; exec "$SELF" sweep >> "$LOG" 2>&1 ) &
+    sleep 1
+    echo "网段扫描已启动"
+    return 0
+}
+
+cmd_probe() {
+    if command -v luajit >/dev/null 2>&1 && [ -f "$MI_SCRIPT" ]; then
+        luajit "$MI_SCRIPT"
+    else
+        echo '{"devices":[],"error":"luajit or discover.lua missing"}'
+        return 1
+    fi
+}
+
+cmd_daemon() {
+    trap 'rm -f "$PIDFILE"; log daemon "退出 pid=$$"; exit 0' TERM INT HUP
+    echo $$ > "$PIDFILE"
+    log daemon "启动 pid=$$"
+    ensure_db
+    local itv
+    while :; do
+        cmd_scan >/dev/null 2>&1
+        itv="$(cfg_int interval 60)"
+        [ "$itv" -ge 10 ] || itv=10
+        sleep "$itv"
+    done
+}
+
+cmd_daemon_start() {
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "守护进程已在运行 pid=$(cat "$PIDFILE")"
+        return 0
+    fi
+    mkdir -p "$DATA" "$(dirname "$LOG")" 2>/dev/null
+    ( trap '' HUP; exec "$SELF" daemon >> "$LOG" 2>&1 ) &
+    sleep 1
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "守护进程已启动 pid=$(cat "$PIDFILE")"
+        return 0
+    fi
+    echo "守护进程启动失败" >&2
+    return 1
+}
+
+cmd_daemon_stop() {
+    local pid i
+    if [ -f "$PIDFILE" ]; then
+        pid="$(cat "$PIDFILE" 2>/dev/null)"
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        i=0
+        while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$i" -lt 5 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+    if [ -f "$SCAN_PID" ]; then
+        pid="$(cat "$SCAN_PID" 2>/dev/null)"
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        rm -f "$SCAN_PID"
+    fi
+    if [ -f "$SWEEP_PID" ]; then
+        pid="$(cat "$SWEEP_PID" 2>/dev/null)"
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        rm -f "$SWEEP_PID"
+    fi
+    return 0
+}
+
+case "${1:-}" in
+    init)          cmd_init ;;
+    status)        cmd_status ;;
+    devices|list)  cmd_devices ;;
+    events)        shift; cmd_events "${1:-40}" ;;
+    scan)          shift; cmd_scan "${1:-}" ;;
+    sweep)         cmd_sweep_run ;;
+    sweep-start)   cmd_sweep_start ;;
+    probe)         cmd_probe ;;
+    set)           shift; cmd_set "${1:-}" "${2:-}" ;;
+    edit)          shift; cmd_edit "${1:-}" "${2:-}" "${3:-auto}" ;;
+    add)           shift; cmd_add "${1:-}" "${2:-}" "${3:-auto}" ;;
+    forget)        shift; cmd_forget "${1:-}" ;;
+    daemon)        cmd_daemon ;;
+    daemon-start)  cmd_daemon_start ;;
+    daemon-stop)   cmd_daemon_stop ;;
+    menu-apply)    bash "$ROOT/share/menu_patch.sh" apply ;;
+    menu-remove)   bash "$ROOT/share/menu_patch.sh" remove ;;
+    *)
+        sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'
+        exit 1
+        ;;
+esac

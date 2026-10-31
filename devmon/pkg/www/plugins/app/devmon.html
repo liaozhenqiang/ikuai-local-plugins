@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>本地设备监控</title>
+<link rel="stylesheet" href="./ikui.css">
+</head>
+<body>
+
+<script type="text/x-template" id="tpl">
+<ik-page :title="catTitle" tag="devmon" sub="本地管理 · 不依赖云平台">
+  <template #actions>
+    <el-tag :type="st.daemon_running ? 'success' : 'danger'" size="small" effect="plain">
+      {{ st.daemon_running ? '监控中' : '守护未运行' }}
+    </el-tag>
+    <span class="ik-msg">{{ msg }}</span>
+    <el-button size="small" :loading="loading" @click="load">刷新</el-button>
+    <el-button size="small" :loading="refreshing" @click="doRefresh">立即检测</el-button>
+    <el-button size="small" :loading="scanning" @click="doScan">扫描发现</el-button>
+    <el-button size="small" type="primary" @click="openAdd">添加设备</el-button>
+  </template>
+
+  <ik-tiles :items="tiles"></ik-tiles>
+
+  <ik-sec title="设备清单" :desc="'当前类别 ' + catDevices.length + ' 台'">
+    <div class="ik-toolbar">
+      <el-radio-group v-model="cat" size="small">
+        <el-radio-button label="all">全部</el-radio-button>
+        <el-radio-button label="camera">摄像头</el-radio-button>
+        <el-radio-button label="switch">交换机</el-radio-button>
+        <el-radio-button label="peripheral">周边设备</el-radio-button>
+      </el-radio-group>
+      <el-input v-model="q" placeholder="搜索名称 / IP / MAC / 型号 / 备注" clearable style="width:260px"></el-input>
+      <el-select v-model="onlineFilter" style="width:120px">
+        <el-option label="全部状态" value="all"></el-option>
+        <el-option label="在线" value="online"></el-option>
+        <el-option label="离线" value="offline"></el-option>
+        <el-option label="已暂停" value="paused"></el-option>
+      </el-select>
+    </div>
+
+    <el-table :data="filtered" size="small" stripe style="width:100%">
+      <el-table-column label="状态" :width="narrow ? 70 : 86">
+        <template #default="s">
+          <span class="ik-dot" :class="statusClass(s.row)"></span>
+          <span :class="statusClass(s.row)">{{ statusText(s.row) }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="设备" :min-width="narrow ? 140 : 190">
+        <template #default="s">
+          <div><b>{{ nameOf(s.row) }}</b></div>
+          <div class="ik-mut" style="font-size:12px">{{ s.row.mac }}</div>
+          <div v-if="narrow" class="ik-mut" style="font-size:12px">
+            {{ s.row.ip || '—' }}<span v-if="s.row.model"> · {{ s.row.model }}</span>
+          </div>
+          <div v-if="narrow && s.row.location" class="ik-mut" style="font-size:12px">{{ s.row.location }}</div>
+          <div v-if="narrow && s.row.note" class="ik-mut" style="font-size:12px">{{ s.row.note }}</div>
+          <div v-if="narrow" class="ik-mut" style="font-size:12px">最近在线 {{ fmtTime(s.row.last_seen) }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="!narrow" label="IP" width="130">
+        <template #default="s"><span class="ik-code">{{ s.row.ip || '—' }}</span></template>
+      </el-table-column>
+      <el-table-column label="类别" :width="narrow ? 86 : 96">
+        <template #default="s">
+          <el-tag size="small" :type="catTag(s.row.category)" effect="plain">{{ catShort(s.row.category) }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="!narrow" label="品牌 / 型号" min-width="180">
+        <template #default="s">
+          <div>{{ s.row.model || '—' }}</div>
+          <div v-if="s.row.vendor" class="ik-mut" style="font-size:12px">{{ s.row.vendor }}</div>
+          <div v-if="s.row.hostname" class="ik-mut" style="font-size:12px">{{ s.row.hostname }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="!narrow" label="位置 / 备注" min-width="150">
+        <template #default="s">
+          <div>{{ s.row.location || '—' }}</div>
+          <div v-if="s.row.note" class="ik-mut" style="font-size:12px">{{ s.row.note }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="!narrow" label="链接" width="120">
+        <template #default="s">
+          <el-button v-if="openTarget(s.row)" link type="primary" size="small" @click="openDevice(s.row)">打开</el-button>
+          <el-button v-if="s.row.url" link size="small" @click="copyText(s.row.url)">复制</el-button>
+          <span v-if="!s.row.url && !s.row.ip" class="ik-mut">—</span>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="!narrow" label="最近在线" width="150">
+        <template #default="s">{{ fmtTime(s.row.last_seen) }}</template>
+      </el-table-column>
+      <el-table-column label="操作" :width="narrow ? 96 : 160" fixed="right">
+        <template #default="s">
+          <el-button link size="small" @click="openEdit(s.row)">编辑</el-button>
+          <el-button link size="small" @click="doToggle(s.row)">{{ s.row.enabled ? '暂停' : '启用' }}</el-button>
+          <el-button link type="danger" size="small" @click="doForget(s.row)">删除</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+
+    <p class="ik-tip">
+      设备清单保存在本地 sqlite（<code class="ik-code">/etc/mnt/plugins/devmon/data/devmon.db</code>）。
+      终端列表里新出现的设备会自动收进「周边设备」并带上品牌/型号/hostname；手动删除过的设备不会再被自动加回来。
+      在线判定 = ping 通或出现在 iKuai 终端列表中；连续 N 轮无响应才离线。
+    </p>
+  </ik-sec>
+
+  <ik-sec title="监控设置" desc="改完点保存">
+    <el-form :label-width="narrow ? '112px' : '140px'" @submit.prevent>
+      <el-form-item label="检测间隔">
+        <el-input-number v-model="cfg.interval" :min="10" :max="3600" :step="10" style="width:160px"></el-input-number>
+        <span class="ik-tip" style="margin-left:10px">秒</span>
+      </el-form-item>
+      <el-form-item label="离线判定">
+        <el-input-number v-model="cfg.offline_after" :min="2" :max="20" :step="1" style="width:160px"></el-input-number>
+        <span class="ik-tip" style="margin-left:10px">连续多少轮无响应才算离线</span>
+      </el-form-item>
+      <el-form-item label="自动收录">
+        <el-switch v-model="cfg.auto_add" :active-value="1" :inactive-value="0"></el-switch>
+        <span class="ik-tip" style="margin-left:10px">新上线设备自动进清单（类别：周边设备）</span>
+      </el-form-item>
+    </el-form>
+    <div class="ik-toolbar">
+      <el-button type="primary" :loading="saving" @click="saveCfg">保存设置</el-button>
+      <span class="ik-mut" style="font-size:12px">上次检测 {{ fmtTime(st.last_scan) }}</span>
+    </div>
+  </ik-sec>
+
+  <ik-sec title="最近事件" desc="上线/离线/新增">
+    <el-table :data="events" size="small" style="width:100%">
+      <el-table-column label="时间" :width="narrow ? 138 : 160">
+        <template #default="s">{{ fmtTime(s.row.ts) }}</template>
+      </el-table-column>
+      <el-table-column v-if="!narrow" label="设备" min-width="160">
+        <template #default="s">{{ nameByMac(s.row.mac) }}</template>
+      </el-table-column>
+      <el-table-column label="事件" :width="narrow ? 76 : 100">
+        <template #default="s">
+          <el-tag size="small" :type="eventTag(s.row.type)" effect="plain">{{ eventLabel(s.row.type) }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="详情" min-width="140">
+        <template #default="s">
+          <span v-if="narrow" class="ik-mut">{{ nameByMac(s.row.mac) }} · </span>{{ detailText(s.row.detail) || '—' }}
+        </template>
+      </el-table-column>
+    </el-table>
+  </ik-sec>
+
+  <el-collapse>
+    <el-collapse-item title="本地监控范围与说明" name="how">
+      <div class="ik-tip">
+        <p><b>这一页替代的是云平台的「摄像头监控 / 交换机监控 / 周边设备监控」三个入口</b>，
+        现在合并成一个「周边设备监控」；数据、在线状态和管理全部在本地，不需要云平台绑定。</p>
+        <p><b>能做</b>：设备清单、类别、品牌/型号/主机名、位置/备注、在线/离线、暂停监控、
+        增删改、局域网发现导入、打开设备 Web/RTSP 链接、复制链接、上下线事件。</p>
+        <p><b>不做</b>：摄像头 PTZ/录像、交换机端口开关等厂商级控制 —— 这些需要具体品牌的
+        API/协议/账号，通用插件不内置；可以用「链接」直达设备自己的管理页。</p>
+        <p><b>发现</b>：ARP + iKuai 终端列表（<code class="ik-code">monitor_lanip</code>）+ ping；
+        终端列表能提供品牌/型号/hostname，随机 MAC 的手机/平板也能看到。
+        自动收录只收终端列表里的设备（不收纯 ARP 条目），删除过的设备进忽略名单。</p>
+      </div>
+    </el-collapse-item>
+  </el-collapse>
+
+  <el-dialog v-model="editDlg" :title="editMode === 'add' ? '添加设备' : '编辑设备'" width="min(560px, 92vw)">
+    <el-form label-width="92px" @submit.prevent>
+      <el-form-item label="MAC">
+        <el-input v-model="form.mac" :disabled="editMode === 'edit'" placeholder="AA:BB:CC:DD:EE:FF"></el-input>
+      </el-form-item>
+      <el-form-item label="IP">
+        <el-input v-model="form.ip" placeholder="192.168.1.100（可留空）"></el-input>
+      </el-form-item>
+      <el-form-item label="类别">
+        <el-select v-model="form.category" style="width:100%">
+          <el-option label="摄像头" value="camera"></el-option>
+          <el-option label="交换机" value="switch"></el-option>
+          <el-option label="周边设备" value="peripheral"></el-option>
+        </el-select>
+      </el-form-item>
+      <el-form-item label="名称">
+        <el-input v-model="form.name" placeholder="例如：门口摄像头"></el-input>
+      </el-form-item>
+      <el-form-item label="品牌">
+        <el-input v-model="form.vendor" placeholder="例如：Hikvision / Xiaomi"></el-input>
+      </el-form-item>
+      <el-form-item label="型号">
+        <el-input v-model="form.model" placeholder="例如：DS-2CD3T46 / 小米AI音箱 LX04"></el-input>
+      </el-form-item>
+      <el-form-item label="hostname">
+        <el-input v-model="form.hostname" placeholder="可留空"></el-input>
+      </el-form-item>
+      <el-form-item label="位置">
+        <el-input v-model="form.location" placeholder="例如：客厅 / 弱电箱"></el-input>
+      </el-form-item>
+      <el-form-item label="备注">
+        <el-input v-model="form.note" type="textarea" :rows="2" placeholder="可留空"></el-input>
+      </el-form-item>
+      <el-form-item label="链接">
+        <el-input v-model="form.url" placeholder="http://... 或 rtsp://...（可留空）"></el-input>
+      </el-form-item>
+      <el-form-item label="端口">
+        <el-input v-model="form.ports" placeholder="80,443,554（可留空）"></el-input>
+      </el-form-item>
+      <el-form-item label="监控">
+        <el-switch v-model="form.enabled" :active-value="1" :inactive-value="0"></el-switch>
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="editDlg = false">取消</el-button>
+      <el-button type="primary" :loading="savingOne" @click="doSave">保存</el-button>
+    </template>
+  </el-dialog>
+
+  <el-dialog v-model="scanDlg" title="发现局域网设备" width="min(900px, 94vw)">
+    <div class="ik-toolbar">
+      <span class="ik-tip">选择要导入的设备，导入到：</span>
+      <el-select v-model="scanCat" style="width:140px">
+        <el-option label="摄像头" value="camera"></el-option>
+        <el-option label="交换机" value="switch"></el-option>
+        <el-option label="周边设备" value="peripheral"></el-option>
+      </el-select>
+      <el-button size="small" :loading="scanning" @click="doScan">重新扫描</el-button>
+    </div>
+    <el-table ref="scanTable" :data="candidates" size="small" style="width:100%" max-height="460" @selection-change="onScanSelect">
+      <el-table-column type="selection" width="46" :selectable="canSelect"></el-table-column>
+      <el-table-column label="状态" width="70">
+        <template #default="s">
+          <span class="ik-dot" :class="s.row.online ? 'ik-ok' : 'ik-mut'"></span>
+          {{ s.row.online ? '在线' : '离线' }}
+        </template>
+      </el-table-column>
+      <el-table-column label="IP" width="125">
+        <template #default="s">{{ s.row.ip || '—' }}</template>
+      </el-table-column>
+      <el-table-column label="MAC" width="150">
+        <template #default="s">{{ s.row.mac }}</template>
+      </el-table-column>
+      <el-table-column label="型号 / 品牌" min-width="180">
+        <template #default="s">
+          <div>{{ s.row.model || '—' }}</div>
+          <div class="ik-mut" style="font-size:12px">{{ s.row.vendor || '' }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column label="hostname / 备注" min-width="180">
+        <template #default="s">
+          <div>{{ s.row.hostname || '—' }}</div>
+          <div class="ik-mut" style="font-size:12px">{{ s.row.comment || '' }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column label="已管理" width="80">
+        <template #default="s">
+          <el-tag v-if="s.row.managed" size="small" type="info" effect="plain">已导入</el-tag>
+          <span v-else class="ik-mut">—</span>
+        </template>
+      </el-table-column>
+    </el-table>
+    <template #footer>
+      <el-button @click="scanDlg = false">取消</el-button>
+      <el-button type="primary" :disabled="!selected.length" :loading="importing" @click="doImport">
+        导入选中（{{ selected.length }}）
+      </el-button>
+    </template>
+  </el-dialog>
+</ik-page>
+</script>
+
+<div id="app"></div>
+
+<script src="./ikui.js"></script>
+<script>
+(function () {
+  function initialCat() {
+    try {
+      var c = new URLSearchParams(location.search).get('cat');
+      return ['camera', 'switch', 'peripheral'].indexOf(c) >= 0 ? c : 'all';
+    } catch (e) { return 'all'; }
+  }
+  function enc(s) { return String(s == null ? '' : s).replace(/ /g, '+'); }
+  function validMac(m) {
+    return /^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$/.test(m) || /^[0-9a-fA-F]{12}$/.test(m);
+  }
+  function validIp(v) {
+    return /^(\d{1,3}\.){3}\d{1,3}$/.test(v) && v.split('.').every(function (x) { return +x <= 255; });
+  }
+
+  IKUI.mount('#app', {
+    tpl: '#tpl',
+    func: 'devmon',
+    data: function () {
+      return {
+        msg: '', loading: false, refreshing: false, scanning: false, importing: false, saving: false, savingOne: false,
+        narrow: typeof window !== 'undefined' && window.innerWidth < 1000,
+        st: {}, devices: [], events: [], candidates: [], selected: [],
+        cat: initialCat(),
+        q: '', onlineFilter: 'all',
+        cfg: { interval: 60, offline_after: 3, auto_add: 1 }, cfgLoaded: false,
+        editDlg: false, editMode: 'add',
+        form: { mac: '', ip: '', category: 'peripheral', name: '', vendor: '', model: '',
+                hostname: '', location: '', note: '', url: '', ports: '', enabled: 1 },
+        scanDlg: false, scanCat: 'camera'
+      };
+    },
+    computed: {
+      catTitle: function () {
+        return { all: '周边设备监控', camera: '摄像头监控', switch: '交换机监控', peripheral: '周边设备监控' }[this.cat] || '周边设备监控';
+      },
+      catDevices: function () {
+        var c = this.cat;
+        return this.devices.filter(function (d) { return c === 'all' || d.category === c; });
+      },
+      filtered: function () {
+        var self = this;
+        var q = String(this.q || '').trim().toLowerCase();
+        return this.catDevices.filter(function (d) {
+          if (self.onlineFilter === 'online' && !(d.enabled && d.online)) { return false; }
+          if (self.onlineFilter === 'offline' && !(d.enabled && !d.online)) { return false; }
+          if (self.onlineFilter === 'paused' && d.enabled) { return false; }
+          if (!q) { return true; }
+          return [d.name, d.ip, d.mac, d.model, d.vendor, d.hostname, d.location, d.note]
+            .join(' ').toLowerCase().indexOf(q) >= 0;
+        });
+      },
+      tiles: function () {
+        var ds = this.catDevices;
+        var on = ds.filter(function (d) { return d.enabled && d.online; }).length;
+        var off = ds.filter(function (d) { return d.enabled && !d.online; }).length;
+        var paused = ds.filter(function (d) { return !d.enabled; }).length;
+        return [
+          { k: '设备总数', v: ds.length },
+          { k: '在线', v: on, tone: 'ok' },
+          { k: '离线', v: off, tone: off ? 'warn' : '' },
+          { k: '已暂停', v: paused, tone: paused ? 'mut' : '', size: 'sm' }
+        ];
+      }
+    },
+    methods: {
+      syncTopTitle: function () {
+        try {
+          if (window.top && window.top !== window) {
+            window.top.document.title = (window.top.sessionStorage.hostName || '') + this.catTitle;
+          }
+        } catch (e) { /* 跨域或宿主不允许改名，忽略 */ }
+      },
+      fmtTime: function (sec) {
+        sec = parseInt(sec, 10) || 0;
+        if (sec <= 0) { return '—'; }
+        var d = new Date(sec * 1000);
+        var p = function (n) { return (n < 10 ? '0' : '') + n; };
+        return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+          p(d.getHours()) + ':' + p(d.getMinutes());
+      },
+      nameOf: function (d) {
+        return d.name || d.model || d.hostname || d.mac;
+      },
+      nameByMac: function (mac) {
+        for (var i = 0; i < this.devices.length; i++) {
+          if (this.devices[i].mac === mac) { return this.nameOf(this.devices[i]); }
+        }
+        return mac;
+      },
+      catShort: function (c) {
+        return { camera: '摄像头', switch: '交换机', peripheral: '周边设备' }[c] || c;
+      },
+      catTag: function (c) {
+        return { camera: 'warning', switch: 'success', peripheral: 'info' }[c] || 'info';
+      },
+      statusText: function (d) {
+        if (!d.enabled) { return '已暂停'; }
+        return d.online ? '在线' : '离线';
+      },
+      statusClass: function (d) {
+        if (!d.enabled) { return 'ik-mut'; }
+        return d.online ? 'ik-ok' : 'ik-err';
+      },
+      openTarget: function (d) {
+        if (d.url) { return d.url; }
+        if (d.ip) { return 'http://' + d.ip + '/'; }
+        return '';
+      },
+      openDevice: function (d) {
+        var u = this.openTarget(d);
+        if (!u) { return; }
+        if (u.indexOf('rtsp://') === 0) { this.copyText(u); return; }
+        window.open(u, '_blank');
+      },
+      copyText: function (t) {
+        var self = this;
+        var done = function () { IKUI.toast('已复制', 'success'); };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(t).then(done).catch(function () { self.copyFallback(t, done); });
+        } else {
+          this.copyFallback(t, done);
+        }
+      },
+      copyFallback: function (t, cb) {
+        var ta = document.createElement('textarea');
+        ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); cb(); } catch (e) { IKUI.toast('复制失败', 'error'); }
+        document.body.removeChild(ta);
+      },
+      load: function () {
+        var self = this;
+        this.loading = true;
+        return this.ik('show', { TYPE: 'data' }).then(function (d) {
+          self.st = d.status || {};
+          self.devices = d.devices || [];
+          self.events = d.events || [];
+          if (!self.cfgLoaded) {
+            self.cfg.interval = parseInt(self.st.interval, 10) || 60;
+            self.cfg.offline_after = parseInt(self.st.offline_after, 10) || 3;
+            self.cfg.auto_add = (parseInt(self.st.auto_add, 10) === 0) ? 0 : 1;
+            self.cfgLoaded = true;
+          }
+          self.msg = '';
+        }).catch(function (e) {
+          self.msg = '读取失败: ' + e.message;
+        }).then(function () { self.loading = false; });
+      },
+      doRefresh: function () {
+        var self = this;
+        this.refreshing = true;
+        this.ik('refresh', {}).then(function () {
+          IKUI.toast('检测完成', 'success');
+          return self.load();
+        }).catch(function (e) {
+          IKUI.toast('检测失败: ' + e.message, 'error');
+        }).then(function () { self.refreshing = false; });
+      },
+      doScan: function () {
+        var self = this;
+        this.scanning = true;
+        this.ik('show', { TYPE: 'scan' }).then(function (d) {
+          self.candidates = d.candidates || [];
+          self.selected = [];
+          self.scanCat = self.cat !== 'all' ? self.cat : 'peripheral';
+          self.scanDlg = true;
+        }).catch(function (e) {
+          IKUI.toast('扫描失败: ' + e.message, 'error');
+        }).then(function () { self.scanning = false; });
+      },
+      canSelect: function (row) { return !row.managed; },
+      onScanSelect: function (rows) { this.selected = rows; },
+      doImport: function () {
+        var self = this;
+        if (!this.selected.length) { return; }
+        this.importing = true;
+        var p = Promise.resolve();
+        this.selected.forEach(function (r) {
+          p = p.then(function () {
+            return self.ik('save', {
+              mac: r.mac,
+              ip: r.ip || '',
+              category: self.scanCat,
+              name: enc(r.comment || r.model || r.hostname || r.mac),
+              vendor: enc(r.vendor || ''),
+              model: enc(r.model || ''),
+              hostname: enc(r.hostname || ''),
+              location: '', note: '',
+              url: '', ports: '', enabled: 1
+            });
+          });
+        });
+        p.then(function () {
+          IKUI.toast('已导入 ' + self.selected.length + ' 台', 'success');
+          self.scanDlg = false;
+          return self.ik('refresh', {});
+        }).then(function () { return self.load(); })
+          .catch(function (e) { IKUI.toast('导入失败: ' + e.message, 'error'); })
+          .then(function () { self.importing = false; });
+      },
+      loadFormCat: function () {
+        return this.cat !== 'all' ? this.cat : 'peripheral';
+      },
+      openAdd: function () {
+        this.editMode = 'add';
+        this.form = { mac: '', ip: '', category: this.loadFormCat(), name: '', vendor: '', model: '',
+                      hostname: '', location: '', note: '', url: '', ports: '', enabled: 1 };
+        this.editDlg = true;
+      },
+      openEdit: function (row) {
+        this.editMode = 'edit';
+        this.form = {
+          mac: row.mac, ip: row.ip || '', category: row.category, name: row.name || '',
+          vendor: row.vendor || '', model: row.model || '', hostname: row.hostname || '',
+          location: row.location || '', note: row.note || '', url: row.url || '',
+          ports: row.ports || '', enabled: row.enabled ? 1 : 0
+        };
+        this.editDlg = true;
+      },
+      doSave: function () {
+        var self = this;
+        var f = this.form;
+        if (!validMac(String(f.mac || '').trim())) { IKUI.toast('MAC 格式示例：AA:BB:CC:DD:EE:FF', 'warning'); return; }
+        if (f.ip && !validIp(String(f.ip).trim())) { IKUI.toast('IP 格式不正确', 'warning'); return; }
+        if (f.ports && !/^[0-9]+(,[0-9]+)*$/.test(String(f.ports).trim())) { IKUI.toast('端口用逗号分隔，如 80,443,554', 'warning'); return; }
+        this.savingOne = true;
+        this.ik('save', {
+          mac: String(f.mac).trim(),
+          ip: String(f.ip || '').trim(),
+          category: f.category || 'peripheral',
+          name: enc(f.name), vendor: enc(f.vendor), model: enc(f.model), hostname: enc(f.hostname),
+          location: enc(f.location), note: enc(f.note),
+          url: String(f.url || '').trim(), ports: String(f.ports || '').trim(),
+          enabled: f.enabled ? 1 : 0
+        }).then(function () {
+          IKUI.toast('已保存', 'success');
+          self.editDlg = false;
+          return self.ik('refresh', {});
+        }).then(function () { return self.load(); })
+          .catch(function (e) { IKUI.toast('保存失败: ' + e.message, 'error'); })
+          .then(function () { self.savingOne = false; });
+      },
+      doToggle: function (row) {
+        var self = this;
+        this.ik('toggle', { mac: row.mac, enabled: row.enabled ? 0 : 1 }).then(function () {
+          return self.load();
+        }).catch(function (e) { IKUI.toast('操作失败: ' + e.message, 'error'); });
+      },
+      doForget: function (row) {
+        var self = this;
+        this.confirm('删除「' + this.nameOf(row) + '」的本地记录？', '确认删除').then(function (ok) {
+          if (!ok) { return; }
+          return self.ik('forget', { mac: row.mac }).then(function () {
+            IKUI.toast('已删除', 'success');
+            return self.load();
+          }).catch(function (e) { IKUI.toast('删除失败: ' + e.message, 'error'); });
+        });
+      },
+      saveCfg: function () {
+        var self = this;
+        var iv = parseInt(this.cfg.interval, 10) || 0;
+        var oa = parseInt(this.cfg.offline_after, 10) || 0;
+        if (iv < 10 || iv > 3600) { IKUI.toast('检测间隔需在 10~3600 秒', 'warning'); return; }
+        if (oa < 2 || oa > 20) { IKUI.toast('离线判定需在 2~20 轮', 'warning'); return; }
+        this.saving = true;
+        var p = Promise.resolve();
+        [['interval', iv], ['offline_after', oa], ['auto_add', this.cfg.auto_add ? 1 : 0]].forEach(function (it) {
+          p = p.then(function () { return self.ik('seting', { key: it[0], value: String(it[1]) }); });
+        });
+        p.then(function () { IKUI.toast('设置已保存', 'success'); return self.load(); })
+          .catch(function (e) { IKUI.toast('保存失败: ' + e.message, 'error'); })
+          .then(function () { self.saving = false; });
+      },
+      eventLabel: function (t) {
+        return { new: '新增', online: '上线', offline: '离线' }[t] || t;
+      },
+      eventTag: function (t) {
+        return { new: 'success', online: 'success', offline: 'danger' }[t] || 'info';
+      },
+      detailText: function (d) {
+        if (!d) { return ''; }
+        return { manual: '手动添加', auto: '自动收录', ikuai: 'iKuai 终端', ping: 'ping 响应' }[d] || d;
+      }
+    },
+    mounted: function () {
+      var self = this;
+      this.load();
+      this.syncTopTitle();
+      this.onResize = function () { self.narrow = window.innerWidth < 1000; };
+      window.addEventListener('resize', this.onResize);
+      this.timer = setInterval(function () {
+        if (!document.hidden && !self.editDlg && !self.scanDlg) { self.load(); }
+      }, 30000);
+    },
+    unmounted: function () {
+      if (this.timer) { clearInterval(this.timer); }
+      if (this.onResize) { window.removeEventListener('resize', this.onResize); }
+    }
+  });
+})();
+</script>
+</body>
+</html>

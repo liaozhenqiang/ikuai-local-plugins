@@ -1,0 +1,28 @@
+{
+  "status": {
+    "daemon_running": true,
+    "total": 3,
+    "online": 2,
+    "offline": 1,
+    "paused": 0,
+    "camera": 1,
+    "switch": 1,
+    "peripheral": 1,
+    "interval": 60,
+    "offline_after": 3,
+    "retain_events": 300,
+    "last_scan": 1792659600,
+    "last_error": "",
+    "db_size": 20480
+  },
+  "devices": [
+    {"mac":"aa:bb:cc:00:00:50","ip":"192.168.9.50","name":"门口摄像头","category":"camera","vendor":"Hikvision","model":"摄像头 DS-2CD3T46","hostname":"cam-1","location":"门口","note":"门禁旁","url":"http://192.168.9.50","ports":"80,554","enabled":true,"online":true,"miss":0,"first_seen":1792640000,"last_seen":1792659600,"source":"manual"},
+    {"mac":"aa:bb:cc:00:00:51","ip":"192.168.9.51","name":"弱电箱交换机","category":"switch","vendor":"H3C","model":"交换机 S5130","hostname":"sw-1","location":"弱电箱","note":"","url":"http://192.168.9.51","ports":"22,80","enabled":true,"online":true,"miss":0,"first_seen":1792640000,"last_seen":1792659600,"source":"ikuai"},
+    {"mac":"aa:bb:cc:00:00:52","ip":"192.168.9.52","name":"办公室打印机","category":"peripheral","vendor":"HP","model":"打印机 M404","hostname":"printer-1","location":"办公室","note":"","url":"","ports":"","enabled":true,"online":false,"miss":3,"first_seen":1792640000,"last_seen":1792659000,"source":"ping"}
+  ],
+  "events": [
+    {"ts":1792659600,"mac":"aa:bb:cc:00:00:50","type":"online","detail":"ping"},
+    {"ts":1792659500,"mac":"aa:bb:cc:00:00:52","type":"offline","detail":"连续3次无响应"},
+    {"ts":1792659000,"mac":"aa:bb:cc:00:00:51","type":"new","detail":"ikuai"}
+  ]
+}

@@ -1,0 +1,652 @@
+#!/bin/bash
+#
+# devmon —— 本地设备监控（单页「周边设备监控」）
+#
+# 给 iKuai 的「状态监控 → 周边设备监控」提供本地替代（三个云页面已合并成一个入口）：
+#   * 本地设备清单（类别、品牌/型号、位置、备注、Web/RTSP/SSH 链接）
+#   * 在线监控：ping + iKuai 终端列表（monitor_lanip），连续 N 轮无响应才离线
+#   * 新上线设备自动收录为「周边设备」（auto_add，可在页面关掉）
+#   * 局域网发现：ARP + iKuai 终端列表，可批量导入/改类别
+#
+# 数据: /etc/mnt/plugins/devmon/data/devmon.db
+# 日志: /etc/log/devmon.log
+#
+set -u
+
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+ROOT="${PLUGIN_DIR:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+DATA="${DEVMON_DATA:-$ROOT/data}"
+DB="${DEVMON_DB:-$DATA/devmon.db}"
+PIDFILE="$DATA/daemon.pid"
+LOG="${DEVMON_LOG:-/etc/log/devmon.log}"
+ARP_FILE="${DEVMON_ARP_FILE:-/proc/net/arp}"
+TERM_SCRIPT="${DEVMON_TERMS:-$ROOT/share/ikuai_terminals.sh}"
+PING="${DEVMON_PING:-ping}"
+
+declare -A OUI=() 2>/dev/null || true
+
+log() {
+    local d
+    d="$(dirname "$LOG")"
+    [ -d "$d" ] || mkdir -p "$d" 2>/dev/null
+    printf '%s [%s] %s\n' "$(date '+%F %T')" "${1:-info}" "${*:2}" >> "$LOG" 2>/dev/null
+}
+
+now_ts() { date +%s; }
+
+db() { sqlite3 -cmd ".timeout 3000" "$DB" "$@" 2>/dev/null; }
+
+cfg_or() {
+    local v
+    v="$(db "SELECT value FROM config WHERE key='$1';")"
+    [ -n "$v" ] || v="${2:-}"
+    printf '%s' "$v"
+}
+
+cfg_int() {
+    local v
+    v="$(db "SELECT value FROM config WHERE key='$1';")"
+    case "$v" in
+        ''|*[!0-9]*) v="${2:-0}" ;;
+        *) v="$(printf '%s' "$v" | sed 's/^0*//')"; [ -n "$v" ] || v=0 ;;
+    esac
+    printf '%s' "$v"
+}
+
+set_cfg() { db "INSERT OR REPLACE INTO config(key,value) VALUES('$1','$2');" >/dev/null; }
+
+norm_mac() {
+    local m="${1:-}"
+    m="$(printf '%s' "$m" | tr -d ' \t\r\n' | tr 'A-F' 'a-f' | tr '-' ':')"
+    if [[ "$m" =~ ^[0-9a-f]{12}$ ]]; then
+        m="${m:0:2}:${m:2:2}:${m:4:2}:${m:6:2}:${m:8:2}:${m:10:2}"
+    fi
+    [[ "$m" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || return 1
+    case "$m" in 00:00:00:00:00:00|ff:ff:ff:ff:ff:ff) return 1 ;; esac
+    printf '%s' "$m"
+}
+
+valid_octet() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$((10#$1))" -le 255 ] 2>/dev/null
+}
+
+valid_ip() {
+    local ip="${1:-}" a b c d n
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r a b c d <<< "$ip"
+    for n in "$a" "$b" "$c" "$d"; do valid_octet "$n" || return 1; done
+    [ "$ip" != "0.0.0.0" ] && [ "$ip" != "255.255.255.255" ]
+}
+
+clean_ip() {
+    local ip
+    ip="$(printf '%s' "${1:-}" | tr -d ' \t\r\n')"
+    valid_ip "$ip" || return 1
+    printf '%s' "$ip"
+}
+
+clean_name() {
+    local s="${1:-}"
+    s="${s//\'/}"; s="${s//\"/}"; s="${s//\`/}"; s="${s//\\/}"
+    s="${s//$'\t'/ }"; s="${s//$'\r'/ }"; s="${s//$'\n'/ }"
+    s="$(printf '%s' "$s" | tr -s ' ' | sed 's/^ //; s/ $//' 2>/dev/null)"
+    printf '%s' "$s" | cut -c1-64
+}
+
+clean_text() {
+    local s="${1:-}"
+    s="${s//\'/}"; s="${s//\"/}"; s="${s//\`/}"; s="${s//\\/}"
+    s="${s//$'\t'/ }"; s="${s//$'\r'/ }"; s="${s//$'\n'/ }"
+    s="$(printf '%s' "$s" | tr -s ' ' | sed 's/^ //; s/ $//' 2>/dev/null)"
+    printf '%s' "$s" | cut -c1-200
+}
+
+clean_token() {
+    printf '%s' "${1:-}" | tr -cd 'A-Za-z0-9._:-' | cut -c1-64
+}
+
+valid_category() {
+    case "${1:-}" in camera|switch|peripheral) return 0 ;; esac
+    return 1
+}
+
+valid_ports() {
+    local v="${1:-}" p
+    [ -z "$v" ] && return 0
+    case "$v" in *[!0-9,]*) return 1 ;; esac
+    IFS=, read -ra arr <<< "$v"
+    for p in "${arr[@]}"; do
+        [ -n "$p" ] || return 1
+        [ "$p" -ge 1 ] 2>/dev/null && [ "$p" -le 65535 ] 2>/dev/null || return 1
+    done
+    return 0
+}
+
+parse_arp() {
+    local file="${1:-$ARP_FILE}" ip hw flags mac mask dev
+    [ -f "$file" ] || return 0
+    while read -r ip hw flags mac mask dev; do
+        [ "$ip" = "IP" ] && continue
+        valid_ip "$ip" || continue
+        case "$flags" in 0x*|0X*) ;; *) continue ;; esac
+        (( (flags & 2) == 0 )) && continue
+        mac="$(norm_mac "$mac")" || continue
+        printf '%s\t%s\n' "$ip" "$mac"
+    done < "$file"
+}
+
+ping_many() {
+    local list="$1" out="$2" ip pids=() n=0 p
+    : > "$out"
+    command -v "$PING" >/dev/null 2>&1 || return 0
+    while IFS= read -r ip; do
+        valid_ip "$ip" || continue
+        ( "$PING" -c 1 -W 1 "$ip" >/dev/null 2>&1 && printf '%s\n' "$ip" >> "$out" ) &
+        pids+=("$!")
+        n=$((n + 1))
+        if [ $((n % 16)) -eq 0 ]; then
+            for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+            pids=()
+        fi
+    done < "$list"
+    for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+}
+
+load_term() {
+    local f="$1"
+    : > "$f"
+    if [ -f "$TERM_SCRIPT" ]; then
+        bash "$TERM_SCRIPT" > "$f" 2>/dev/null || : > "$f"
+    fi
+}
+
+cmd_init() {
+    mkdir -p "$DATA" 2>/dev/null
+    db "PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS devices(
+            mac         TEXT PRIMARY KEY,
+            ip          TEXT NOT NULL DEFAULT '',
+            name        TEXT NOT NULL DEFAULT '',
+            category    TEXT NOT NULL DEFAULT 'peripheral',
+            vendor      TEXT NOT NULL DEFAULT '',
+            model       TEXT NOT NULL DEFAULT '',
+            hostname    TEXT NOT NULL DEFAULT '',
+            location    TEXT NOT NULL DEFAULT '',
+            note        TEXT NOT NULL DEFAULT '',
+            url         TEXT NOT NULL DEFAULT '',
+            ports       TEXT NOT NULL DEFAULT '',
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            online      INTEGER NOT NULL DEFAULT 0,
+            miss        INTEGER NOT NULL DEFAULT 0,
+            source      TEXT NOT NULL DEFAULT 'manual',
+            first_seen  INTEGER NOT NULL DEFAULT 0,
+            last_seen   INTEGER NOT NULL DEFAULT 0,
+            last_online INTEGER NOT NULL DEFAULT 0,
+            last_offline INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_dev_online ON devices(online);
+        CREATE INDEX IF NOT EXISTS idx_dev_cat ON devices(category);
+        CREATE TABLE IF NOT EXISTS events(
+            id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts     INTEGER NOT NULL,
+            mac    TEXT NOT NULL,
+            type   TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+        CREATE INDEX IF NOT EXISTS idx_events_mac ON events(mac);
+        CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS hidden(mac TEXT PRIMARY KEY, ts INTEGER NOT NULL DEFAULT 0);
+        INSERT OR IGNORE INTO config(key,value) VALUES('interval','60');
+        INSERT OR IGNORE INTO config(key,value) VALUES('offline_after','3');
+        INSERT OR IGNORE INTO config(key,value) VALUES('retain_events','300');
+        INSERT OR IGNORE INTO config(key,value) VALUES('auto_add','1');
+        INSERT OR IGNORE INTO config(key,value) VALUES('last_scan','0');
+        INSERT OR IGNORE INTO config(key,value) VALUES('last_error','');" >/dev/null
+    return 0
+}
+
+ensure_db() { cmd_init >/dev/null 2>&1; }
+
+cmd_status() {
+    ensure_db
+    local run=false
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && run=true
+
+    local total=0 online=0 offline=0 paused=0 camera=0 switch_=0 peripheral=0 row
+    row="$(db -separator '|' "SELECT COUNT(*),
+        COALESCE(SUM(CASE WHEN enabled=1 AND online=1 THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN enabled=1 AND online=0 THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN enabled=0 THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN category='camera' THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN category='switch' THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN category='peripheral' THEN 1 ELSE 0 END),0)
+        FROM devices;")"
+    [ -n "$row" ] && IFS='|' read -r total online offline paused camera switch_ peripheral <<< "$row"
+
+    local interval offline_after retain_events auto_add last_scan last_error size
+    interval="$(cfg_int interval 60)"
+    offline_after="$(cfg_int offline_after 3)"
+    retain_events="$(cfg_int retain_events 300)"
+    auto_add="$(cfg_int auto_add 1)"
+    last_scan="$(cfg_int last_scan 0)"
+    last_error="$(clean_text "$(cfg_or last_error '')")"
+    size="$(ls -l "$DB" 2>/dev/null | awk '{print $5}')"
+    [ -n "$size" ] || size=0
+
+    jq -c -n \
+        --arg run "$run" \
+        --arg total "${total:-0}" --arg online "${online:-0}" --arg offline "${offline:-0}" \
+        --arg paused "${paused:-0}" --arg camera "${camera:-0}" --arg switch "${switch_:-0}" \
+        --arg peripheral "${peripheral:-0}" --arg interval "${interval:-60}" \
+        --arg offline_after "${offline_after:-3}" --arg retain_events "${retain_events:-300}" \
+        --arg auto_add "${auto_add:-1}" \
+        --arg last_scan "${last_scan:-0}" --arg last_error "$last_error" --arg db_size "${size:-0}" \
+        '{daemon_running:($run=="true"),total:($total|tonumber),online:($online|tonumber),offline:($offline|tonumber),paused:($paused|tonumber),camera:($camera|tonumber),switch:($switch|tonumber),peripheral:($peripheral|tonumber),interval:($interval|tonumber),offline_after:($offline_after|tonumber),retain_events:($retain_events|tonumber),auto_add:($auto_add|tonumber),last_scan:($last_scan|tonumber),last_error:$last_error,db_size:($db_size|tonumber)}'
+}
+
+cmd_devices() {
+    ensure_db
+    local cat="${1:-all}" where=""
+    case "$cat" in
+        camera|switch|peripheral) where="WHERE category='$cat'" ;;
+        all|'') ;;
+        *) return 1 ;;
+    esac
+    db -separator $'\t' "SELECT mac,ip,name,category,vendor,model,hostname,location,note,url,ports,
+        enabled,online,miss,first_seen,last_seen,source
+        FROM devices $where ORDER BY enabled DESC, online DESC, category, name, mac;" |
+    jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {
+        mac: .[0], ip: .[1], name: .[2], category: .[3], vendor: .[4], model: .[5],
+        hostname: .[6], location: .[7], note: .[8], url: .[9], ports: .[10],
+        enabled: (.[11] == "1"), online: (.[12] == "1"),
+        miss: ((.[13] // "0") | tonumber),
+        first_seen: ((.[14] // "0") | tonumber),
+        last_seen: ((.[15] // "0") | tonumber),
+        source: .[16]
+    })'
+}
+
+cmd_events() {
+    ensure_db
+    local n="${1:-40}"
+    case "$n" in ''|*[!0-9]*) n=40 ;; esac
+    [ "$n" -gt 500 ] && n=500
+    db -separator $'\t' "SELECT ts,mac,type,detail FROM events ORDER BY id DESC LIMIT $n;" |
+    jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {
+        ts: ((.[0] // "0") | tonumber), mac: .[1], type: .[2], detail: .[3]
+    })'
+}
+
+cmd_set() {
+    ensure_db
+    local k="${1:-}" v="${2:-}"
+    case "$k" in
+        interval)
+            case "$v" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$v" -ge 10 ] && [ "$v" -le 3600 ] || return 1 ;;
+        offline_after)
+            case "$v" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$v" -ge 2 ] && [ "$v" -le 20 ] || return 1 ;;
+        retain_events)
+            case "$v" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$v" -ge 50 ] && [ "$v" -le 2000 ] || return 1 ;;
+        auto_add)
+            case "$v" in 0|1) ;; *) return 1 ;; esac ;;
+        *) return 1 ;;
+    esac
+    set_cfg "$k" "$v"
+    log config "设置 $k=$v"
+    return 0
+}
+
+cmd_upsert() {
+    ensure_db
+    local mac ip cat name vendor model hostname location note url ports enabled
+    mac="$(norm_mac "${1:-}")" || return 1
+    ip="$(clean_ip "${2:-}")" || ip=""
+    cat="${3:-peripheral}"
+    valid_category "$cat" || return 1
+    name="$(clean_name "${4:-}")"
+    vendor="$(clean_name "${5:-}")"
+    model="$(clean_name "${6:-}")"
+    hostname="$(clean_name "${7:-}")"
+    location="$(clean_name "${8:-}")"
+    note="$(clean_text "${9:-}")"
+    url="$(clean_text "${10:-}")"
+    ports="$(printf '%s' "${11:-}" | tr -d ' \t\r\n')"
+    valid_ports "$ports" || return 1
+    enabled="${12:-1}"
+    case "$enabled" in 0|1) ;; *) return 1 ;; esac
+
+    local now
+    now="$(now_ts)"
+    db "INSERT OR IGNORE INTO devices(mac,ip,name,category,vendor,model,hostname,location,note,url,ports,enabled,source,first_seen)
+            VALUES('$mac','$ip','$name','$cat','$vendor','$model','$hostname','$location','$note','$url','$ports',$enabled,'manual',$now);
+        INSERT INTO events(ts,mac,type,detail)
+            SELECT $now,'$mac','new','manual' WHERE changes() > 0;
+        UPDATE devices SET ip='$ip', name='$name', category='$cat', vendor='$vendor',
+            model='$model', hostname='$hostname', location='$location', note='$note',
+            url='$url', ports='$ports', enabled=$enabled WHERE mac='$mac';
+        DELETE FROM hidden WHERE mac='$mac';" >/dev/null
+    log device "保存 $mac category=$cat name=$name"
+    return 0
+}
+
+cmd_forget() {
+    ensure_db
+    local mac cnt
+    mac="$(norm_mac "${1:-}")" || return 1
+    cnt="$(db "SELECT COUNT(*) FROM devices WHERE mac='$mac';")"
+    [ "${cnt:-0}" -gt 0 ] || return 1
+    db "DELETE FROM devices WHERE mac='$mac'; DELETE FROM events WHERE mac='$mac';
+        INSERT OR REPLACE INTO hidden(mac,ts) VALUES('$mac',$(now_ts));" >/dev/null
+    log device "删除 $mac（已记入忽略名单，自动收录不会再加回来）"
+    return 0
+}
+
+cmd_toggle() {
+    ensure_db
+    local mac enabled
+    mac="$(norm_mac "${1:-}")" || return 1
+    enabled="${2:-}"
+    case "$enabled" in 0|1) ;; *) return 1 ;; esac
+    [ -n "$(db "SELECT mac FROM devices WHERE mac='$mac';")" ] || return 1
+    db "UPDATE devices SET enabled=$enabled WHERE mac='$mac';" >/dev/null
+    return 0
+}
+
+cmd_scan() {
+    ensure_db
+    local tmpdir
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/devmon.XXXXXX" 2>/dev/null)" || return 1
+    parse_arp "$ARP_FILE" > "$tmpdir/arp.tsv" 2>/dev/null
+    load_term "$tmpdir/term.tsv"
+
+    local -A C_IP=() C_HOST=() C_VENDOR=() C_MODEL=() C_TYPEID=() C_TYPE=() C_COMMENT=() C_NATIVE=() SEEN=() MANAGED=() C_CAT=()
+    local -a macs=()
+    local mac ip host vendor model type typeid comment ap ssid sig
+    while IFS=$'\x1f' read -r mac ip host vendor model type typeid comment ap ssid sig; do
+        mac="$(norm_mac "$mac" 2>/dev/null)" || continue
+        [ -n "${SEEN[$mac]:-}" ] && continue
+        SEEN["$mac"]=1
+        C_NATIVE["$mac"]=1
+        C_IP["$mac"]="$(clean_ip "$ip" 2>/dev/null)" || C_IP["$mac"]=""
+        C_HOST["$mac"]="$(clean_name "$host")"
+        C_VENDOR["$mac"]="$(clean_name "$vendor")"
+        C_MODEL["$mac"]="$(clean_name "$model")"
+        C_TYPEID["$mac"]="$(clean_token "$typeid")"
+        C_TYPE["$mac"]="$(clean_name "$type")"
+        C_COMMENT["$mac"]="$(clean_name "$comment")"
+        macs+=("$mac")
+    done < "$tmpdir/term.tsv"
+
+    while IFS=$'\t' read -r ip mac; do
+        mac="$(norm_mac "$mac" 2>/dev/null)" || continue
+        [ -n "${SEEN[$mac]:-}" ] && { [ -z "${C_IP[$mac]:-}" ] && C_IP["$mac"]="$ip"; continue; }
+        SEEN["$mac"]=1
+        C_IP["$mac"]="$ip"
+        macs+=("$mac")
+    done < "$tmpdir/arp.tsv"
+
+    while IFS='|' read -r mac cat; do
+        [ -n "$mac" ] || continue
+        MANAGED["$mac"]=1
+        C_CAT["$mac"]="$cat"
+    done < <(db -separator '|' "SELECT mac,category FROM devices;")
+
+    : > "$tmpdir/ping.txt"
+    for mac in "${macs[@]}"; do
+        ip="${C_IP[$mac]:-}"
+        valid_ip "$ip" && printf '%s\n' "$ip" >> "$tmpdir/ping.txt"
+    done
+    sort -u "$tmpdir/ping.txt" > "$tmpdir/ping.sorted" 2>/dev/null && mv "$tmpdir/ping.sorted" "$tmpdir/ping.txt"
+    ping_many "$tmpdir/ping.txt" "$tmpdir/up.txt"
+
+    : > "$tmpdir/cand.tsv"
+    local online managed
+    for mac in "${macs[@]}"; do
+        ip="${C_IP[$mac]:-}"
+        online=0
+        [ -n "${C_NATIVE[$mac]:-}" ] && online=1
+        if [ -n "$ip" ] && grep -qx "$ip" "$tmpdir/up.txt" 2>/dev/null; then online=1; fi
+        managed=0
+        [ -n "${MANAGED[$mac]:-}" ] && managed=1
+        printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+            "$mac" "$ip" "${C_HOST[$mac]:-}" "${C_VENDOR[$mac]:-}" "${C_MODEL[$mac]:-}" \
+            "${C_TYPEID[$mac]:-}" "${C_TYPE[$mac]:-}" "${C_COMMENT[$mac]:-}" \
+            "$online" "$managed" "${C_CAT[$mac]:-}" >> "$tmpdir/cand.tsv"
+    done
+    printf '%s' "$(cat "$tmpdir/cand.tsv" 2>/dev/null)" | jq -R -s 'split("\n") | map(select(length > 0) | split("\u001f") | {
+        mac: .[0], ip: .[1], hostname: .[2], vendor: .[3], model: .[4],
+        typeid: .[5], type: .[6], comment: .[7],
+        online: (.[8] == "1"), managed: (.[9] == "1"), category: .[10]
+    })'
+    rm -rf "$tmpdir"
+    return 0
+}
+
+# observe_auto_add <sql文件> <终端tsv>
+# 终端列表里没在清单中的 MAC -> 作为「周边设备」入库（auto_add=1 时）；
+# 已在清单里的，只补空着的品牌/型号/hostname/名称，不覆盖用户改过的值。
+# 被删除过的 MAC 记在 hidden 表里，永远不会被自动收录复活。
+observe_auto_add() {
+    local sql="$1" tsv="$2"
+    local auto_add added=0 now mac ip host vendor model type typeid comment ap ssid sig
+    local km kname kvendor kmodel khost hm n_name need
+    auto_add="$(cfg_int auto_add 1)"
+    now="$(now_ts)"
+
+    declare -A KNOWN=() K_NAME=() K_VENDOR=() K_MODEL=() K_HOST=() HID=()
+    while IFS=$'\x1f' read -r km kname kvendor kmodel khost; do
+        [ -n "$km" ] || continue
+        KNOWN["$km"]=1
+        K_NAME["$km"]="$kname"; K_VENDOR["$km"]="$kvendor"
+        K_MODEL["$km"]="$kmodel"; K_HOST["$km"]="$khost"
+    done < <(db -separator $'\x1f' "SELECT mac,name,vendor,model,hostname FROM devices;")
+    while read -r hm; do
+        [ -n "$hm" ] && HID["$hm"]=1
+    done < <(db "SELECT mac FROM hidden;")
+
+    [ -s "$tsv" ] || return 0
+    while IFS=$'\x1f' read -r mac ip host vendor model type typeid comment ap ssid sig; do
+        mac="$(norm_mac "$mac" 2>/dev/null)" || continue
+        [ -n "${HID[$mac]:-}" ] && continue
+
+        n_name="$(clean_name "${comment:-}")"
+        [ -n "$n_name" ] || n_name="$(clean_name "${model:-}")"
+        [ -n "$n_name" ] || n_name="$(clean_name "${host:-}")"
+        [ -n "$n_name" ] || n_name="$mac"
+        ip="$(clean_ip "${ip:-}" 2>/dev/null)" || ip=""
+
+        if [ -z "${KNOWN[$mac]:-}" ]; then
+            [ "$auto_add" = "1" ] || continue
+            printf "INSERT INTO devices(mac,ip,name,category,vendor,model,hostname,enabled,online,miss,source,first_seen,last_seen,last_online) VALUES('%s','%s','%s','peripheral','%s','%s','%s',1,1,0,'auto',%s,%s,%s);\n" \
+                "$mac" "$ip" "$n_name" "$(clean_name "${vendor:-}")" "$(clean_name "${model:-}")" \
+                "$(clean_name "${host:-}")" "$now" "$now" "$now" >> "$sql"
+            printf "INSERT INTO events(ts,mac,type,detail) VALUES(%s,'%s','new','auto');\n" \
+                "$now" "$mac" >> "$sql"
+            added=$((added + 1))
+            continue
+        fi
+
+        need=0
+        [ -z "${K_VENDOR[$mac]:-}" ] && [ -n "${vendor// /}" ] && need=1
+        [ -z "${K_MODEL[$mac]:-}" ] && [ -n "${model// /}" ] && need=1
+        [ -z "${K_HOST[$mac]:-}" ] && [ -n "${host// /}" ] && need=1
+        case "${K_NAME[$mac]:-}" in ''|"$mac") need=1 ;; esac
+        [ "$need" = "1" ] || continue
+        printf "UPDATE devices SET vendor=CASE WHEN vendor='' THEN '%s' ELSE vendor END, model=CASE WHEN model='' THEN '%s' ELSE model END, hostname=CASE WHEN hostname='' THEN '%s' ELSE hostname END, name=CASE WHEN name='' OR name='%s' THEN '%s' ELSE name END WHERE mac='%s';\n" \
+            "$(clean_name "${vendor:-}")" "$(clean_name "${model:-}")" "$(clean_name "${host:-}")" \
+            "$mac" "$n_name" "$mac" >> "$sql"
+    done < "$tsv"
+
+    [ "$added" -gt 0 ] && log observe "自动收录 $added 台新设备为周边设备"
+    return 0
+}
+
+observe_inner() {
+    ensure_db
+    local tmpdir
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/devmon.XXXXXX" 2>/dev/null)" || return 1
+    load_term "$tmpdir/term.tsv"
+
+    local -A NATIVE=() NATIVE_IP=()
+    local mac ip host vendor model type typeid comment ap ssid sig
+    while IFS=$'\x1f' read -r mac ip host vendor model type typeid comment ap ssid sig; do
+        mac="$(norm_mac "$mac" 2>/dev/null)" || continue
+        NATIVE["$mac"]=1
+        NATIVE_IP["$mac"]="$(clean_ip "$ip" 2>/dev/null)" || NATIVE_IP["$mac"]=""
+    done < "$tmpdir/term.tsv"
+
+    local -A D_IP=() D_ONLINE=() D_MISS=()
+    local -a dmacs=()
+    while IFS='|' read -r mac ip online miss; do
+        [ -n "$mac" ] || continue
+        D_IP["$mac"]="$ip"
+        D_ONLINE["$mac"]="$online"
+        D_MISS["$mac"]="$miss"
+        dmacs+=("$mac")
+    done < <(db -separator '|' "SELECT mac,ip,online,miss FROM devices WHERE enabled=1;")
+
+    : > "$tmpdir/ping.txt"
+    for mac in "${dmacs[@]}"; do
+        ip="${NATIVE_IP[$mac]:-${D_IP[$mac]:-}}"
+        valid_ip "$ip" && printf '%s\n' "$ip" >> "$tmpdir/ping.txt"
+    done
+    sort -u "$tmpdir/ping.txt" > "$tmpdir/ping.sorted" 2>/dev/null && mv "$tmpdir/ping.sorted" "$tmpdir/ping.txt"
+    ping_many "$tmpdir/ping.txt" "$tmpdir/up.txt"
+
+    local now offline_after retain_events sql
+    now="$(now_ts)"
+    offline_after="$(cfg_int offline_after 3)"
+    retain_events="$(cfg_int retain_events 300)"
+    sql="$tmpdir/apply.sql"
+    : > "$sql"
+    printf 'BEGIN;\n' >> "$sql"
+
+    observe_auto_add "$sql" "$tmpdir/term.tsv"
+
+    local seen src ip2 miss
+    for mac in "${dmacs[@]}"; do
+        seen=0
+        src=""
+        ip2="${NATIVE_IP[$mac]:-${D_IP[$mac]:-}}"
+        if [ -n "${NATIVE[$mac]:-}" ]; then
+            seen=1; src="ikuai"
+            [ -n "${NATIVE_IP[$mac]:-}" ] && ip2="${NATIVE_IP[$mac]}"
+        elif [ -n "$ip2" ] && grep -qx "$ip2" "$tmpdir/up.txt" 2>/dev/null; then
+            seen=1; src="ping"
+        fi
+
+        if [ "$seen" = "1" ]; then
+            # source 记录的是「怎么进清单的」(manual/auto)，这里不能覆盖；
+            # 本轮靠什么信号判定在线，写进 events.detail
+            printf "UPDATE devices SET ip='%s', last_seen=%s, miss=0, online=1, last_online=%s WHERE mac='%s';\n" \
+                "$ip2" "$now" "$now" "$mac" >> "$sql"
+            if [ "${D_ONLINE[$mac]:-0}" != "1" ]; then
+                printf "INSERT INTO events(ts,mac,type,detail) VALUES(%s,'%s','online','%s');\n" "$now" "$mac" "$src" >> "$sql"
+            fi
+        else
+            miss=$(( ${D_MISS[$mac]:-0} + 1 ))
+            [ "$miss" -gt 999 ] && miss=999
+            if [ "${D_ONLINE[$mac]:-0}" = "1" ] && [ "$miss" -ge "$offline_after" ]; then
+                printf "UPDATE devices SET miss=%s, online=0, last_offline=%s WHERE mac='%s';\n" "$miss" "$now" "$mac" >> "$sql"
+                printf "INSERT INTO events(ts,mac,type,detail) VALUES(%s,'%s','offline','连续%s次无响应');\n" "$now" "$mac" "$offline_after" >> "$sql"
+            else
+                printf "UPDATE devices SET miss=%s WHERE mac='%s';\n" "$miss" "$mac" >> "$sql"
+            fi
+        fi
+    done
+    printf "INSERT OR REPLACE INTO config(key,value) VALUES('last_scan','%s');\n" "$now" >> "$sql"
+    printf "INSERT OR REPLACE INTO config(key,value) VALUES('last_error','');\n" >> "$sql"
+    printf "DELETE FROM events WHERE id <= (SELECT MAX(id) - %s FROM events);\n" "$retain_events" >> "$sql"
+    printf 'COMMIT;\n' >> "$sql"
+    sqlite3 -cmd ".timeout 3000" "$DB" < "$sql" 2>>"$LOG" || { log observe "写入失败"; rm -rf "$tmpdir"; return 1; }
+
+    local counts ct=0 co=0
+    counts="$(db -separator '|' "SELECT COUNT(*),COALESCE(SUM(CASE WHEN enabled=1 AND online=1 THEN 1 ELSE 0 END),0) FROM devices;")"
+    [ -n "$counts" ] && IFS='|' read -r ct co <<< "$counts"
+    log observe "设备=${ct:-0} 在线=${co:-0}"
+    rm -rf "$tmpdir"
+    return 0
+}
+
+cmd_observe() {
+    ensure_db
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -n 9 || { printf '{"ok":true,"skipped":"busy"}\n'; exit 0; }
+            observe_inner
+        ) 9>"$DATA/observe.lock"
+        return $?
+    fi
+    observe_inner
+}
+
+cmd_daemon() {
+    trap 'rm -f "$PIDFILE"; log daemon "退出 pid=$$"; exit 0' TERM INT HUP
+    echo $$ > "$PIDFILE"
+    log daemon "启动 pid=$$"
+    ensure_db
+    local itv
+    while :; do
+        cmd_observe >/dev/null 2>&1
+        itv="$(cfg_int interval 60)"
+        [ "$itv" -ge 10 ] || itv=10
+        sleep "$itv"
+    done
+}
+
+cmd_daemon_start() {
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "守护进程已在运行 pid=$(cat "$PIDFILE")"
+        return 0
+    fi
+    mkdir -p "$DATA" "$(dirname "$LOG")" 2>/dev/null
+    ( trap '' HUP; exec "$SELF" daemon >> "$LOG" 2>&1 ) &
+    sleep 1
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        echo "守护进程已启动 pid=$(cat "$PIDFILE")"
+        return 0
+    fi
+    echo "守护进程启动失败" >&2
+    return 1
+}
+
+cmd_daemon_stop() {
+    local pid i
+    if [ -f "$PIDFILE" ]; then
+        pid="$(cat "$PIDFILE" 2>/dev/null)"
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        i=0
+        while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$i" -lt 5 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+        [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+    return 0
+}
+
+case "${1:-}" in
+    init)          cmd_init ;;
+    status)        cmd_status ;;
+    devices|list)  shift; cmd_devices "${1:-all}" ;;
+    events)        shift; cmd_events "${1:-40}" ;;
+    scan)          cmd_scan ;;
+    observe|refresh) cmd_observe ;;
+    save|upsert)   shift; cmd_upsert "$@" ;;
+    forget)        shift; cmd_forget "${1:-}" ;;
+    toggle)        shift; cmd_toggle "${1:-}" "${2:-}" ;;
+    set)           shift; cmd_set "${1:-}" "${2:-}" ;;
+    daemon)        cmd_daemon ;;
+    daemon-start)  cmd_daemon_start ;;
+    daemon-stop)   cmd_daemon_stop ;;
+    *)
+        sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
+        exit 1
+        ;;
+esac
