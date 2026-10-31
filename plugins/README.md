@@ -19,7 +19,7 @@
 | [frpc](frpc/) | 0.71.1.1 | FRP 客户端：服务端地址/token、多条 tcp/udp/http/https 代理规则增删、启停、日志 | 后端 + 页面 | ✅ |
 | [frps](frps/) | 0.71.1.1 | FRP 服务端：通信端口、仪表盘端口、认证 Token 自动生成、启停、日志 | 后端 + 页面 | ✅ |
 | [gecoos](gecoos/) | 2.2.20251015.1 | 集客 AC：集中管理集客 AP、管理端口、AP 通信端口、公网访问开关（默认仅内网）、Web 密码 | 后端 + 页面 | ✅ |
-| [miot-panel](miot-panel/) | 1.1.2 | 米家墙面板（设备控制/摄像头/音乐中心）：启停、端口、日志、一键打开面板 | 后端 + 页面 | ✅ |
+| [miot-panel](miot-panel/) | 1.1.3 | 米家墙面板（设备控制/摄像头/音乐中心）：启停、端口、日志、一键打开面板 | 后端 + 页面 | ✅ |
 | [npc](npc/) | 0.26.39.2 | NPC 内网穿透客户端：装好即自启，卡片直达其自身管理界面 | 启动器 + 页面 | ✅ |
 | [nps](nps/) | 0.26.39.3 | NPS 内网穿透服务端：默认端口 81，自启，卡片直达 Web 管理 | 启动器 + 页面 | ✅ |
 | [openclash](openclash/) | 0.48.003 | mihomo(Meta) 内核 + 订阅导入/转换 + 透明代理（redirect/tproxy/tun）+ 原生 Web 控制台：配置/订阅/规则/节点/延迟/旁路/自检/日志 | 后端 + 页面 | ✅ |
@@ -64,3 +64,6 @@ gh release upload <tag> ttyd-v1.7.7-plugin.zip
   菜单锚点都依赖这个固件版本，换版本可能要重新适配。
 * 安装会**替换整个插件目录**，只保留 `data/`（证书 / 配置 / 数据库）；升级前别手改插件目录里的文件。
 * 发布包**不含 `data/`**：那里有证书、token、清单和数据库，不随包分发。
+* miot-panel 的 Python 运行时是 **x86_64** 的，并且依赖插件自带的 `runtime/lib/ld-linux-x86-64.so.2`：
+  iKuai 是 uClibc，系统里没有 glibc 的 `/lib64/ld-linux-x86-64.so.2`，所以启动必须用自带 loader 显式引导
+  （1.1.3 起已改成这样；1.1.2 及更早会在日志里报 `env: can't execute ...: No such file or directory`）。

@@ -53,7 +53,17 @@ cmd_status() {
         online="$(printf '%s' "$api" | jq -r '.supported_count // empty' 2>/dev/null)"
         [ -n "$v" ] || v="$(printf '%s' "$api" | jq -r '.version // empty' 2>/dev/null)"
     fi
-    [ -x "$PY" ] && rt=true
+    # 光看 -x 不够：python 可能因为缺 glibc loader 根本执行不了，
+    # 所以停着的时候真跑一次 -V 再报「就绪」。
+    if [ -x "$PY" ]; then
+        if [ "$running" = "true" ]; then
+            rt=true
+        elif [ -x "$LD" ]; then
+            "$LD" --library-path "$RT/lib" "$PY" -V >/dev/null 2>&1 && rt=true
+        else
+            "$PY" -V >/dev/null 2>&1 && rt=true
+        fi
+    fi
     [ -f "$RT/lib/libc.so.6" ] && glibc=true
     printf '{"running":%s,"pid":"%s","port":%s,"version":"%s","devices":"%s","online":"%s","runtime":%s,"glibc":%s,"ip":"%s"}\n' \
         "$running" "${pid:-}" "$p" "${v:-}" "${devices:-}" "${online:-}" "$rt" "$glibc" "$(lan_ip)"
@@ -67,11 +77,21 @@ cmd_start() {
     if is_running; then echo "已在运行 pid=$(cat "$PIDFILE")"; return 0; fi
     if [ ! -x "$PY" ]; then echo "缺少 Python 运行时，请重新安装插件"; return 1; fi
     local p; p="$(port)"
+    # 爱快是 uClibc，系统里没有 glibc 的 /lib64/ld-linux-x86-64.so.2，而 python 的 ELF
+    # 里 PT_INTERP 写死了这个路径：直接 exec 会在内核加载解释器那一步 ENOENT
+    # （env 报 "can't execute ...: No such file or directory"），LD_LIBRARY_PATH 不起作用。
+    # 所以有自带 loader 时用它显式引导，没有才退回直接执行。
+    local -a run
+    if [ -x "$LD" ]; then
+        run=("$LD" --library-path "$RT/lib" "$PY")
+    else
+        run=("$PY")
+    fi
     ( trap '' HUP
       exec env LD_LIBRARY_PATH="$RT/lib" PYTHONPATH="$SITE" \
         MIOT_ROOT="$DATA" MIOT_APP_DIR="$APP" MIOT_PORT="$p" \
         MIOT_LOG_FILE="$LOG" MIOT_DISCOVERY_PORT=37020 \
-        "$PY" "$APP/miot-cloud.py" >> "$LOG" 2>&1 ) &
+        "${run[@]}" "$APP/miot-cloud.py" >> "$LOG" 2>&1 ) &
     echo $! > "$PIDFILE"
     local i
     for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
