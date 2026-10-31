@@ -27,7 +27,7 @@
 从 [Releases](releases) 下载 zip，在 iKuai「高级应用 → 插件管理」里上传安装；或 SSH：
 
 ```bash
-ikplugin install /root/devmon.zip
+ikplugin install /root/devmon-v1.1.0-plugin.zip
 devmon status            # 或 /usr/ikuai/function/devmon show TYPE=data
 ```
 
@@ -39,15 +39,38 @@ devmon status            # 或 /usr/ikuai/function/devmon show TYPE=data
 > 浏览器侧还要关掉后台标签页重开 + Ctrl+F5，否则看到的是缓存的旧菜单。
 > 自行评估风险；重启设备本身也会让根分区还原成固件原始状态。
 
-## 构建
+## 构建与打包命名（ikupd 在线升级）
+
+所有包都按 **`<插件名>-v<版本>-plugin.zip`** 命名——这是「插件在线升级」(ikupd) 的硬约定：
+
+* 它只扫 release 里的 `.zip` 资源，用 `-v` 前后解析出插件名和版本；
+* 更新判断不看版本号，而是拿 **release 资源自带的 sha256**（GitHub API 的 `digest`）
+  和**本地归档的 sha256** 比对，所以**发布哪个包就必须装哪个包**，改包名会永远显示有更新；
+* 本地哈希来自 ikupd 自己的安装记录 `ikupd/data/installed.conf`，其次
+  `/etc/mnt/plugins/.installed/<插件名>*.zip`；两者都没有时只能按版本号比（显示「同版本」）。
 
 ```bash
-cd devmon && bash build.sh      # => dist/devmon.zip（需要 zip，或 PYTHON=/path/to/python3）
+bash build-all.sh                 # 只打 devmon => dist/devmon-v1.1.0-plugin.zip
+bash build-all.sh --all           # 连 plugins/ 一起打（仅集成层，见 plugins/README）
+cd devmon && bash build.sh        # 同上，单插件版
+
+# plugins/ 下那 15 个要打「能装的完整包」，在路由器上执行（会带上二进制、排除 data/）：
+bash tools/pack-on-device.sh ttyd        # => /tmp/ttyd-v1.7.7-plugin.zip + sha256
+gh release upload v1.1.0 ttyd-v1.7.7-plugin.zip
+```
+
+要发新版本：改 `Release` 里的 `version=` → 重新打包 → 传同名规则的新资源（或新建 tag）。
+ikupd 页面里建议在「代理」里填一个 **GitHub Token**（只读 public 仓库即可），
+否则匿名 API 每小时 60 次，很快会显示 `API rate limit exceeded`。
+
+## 测试
+
+```bash
 cd devmon && bash tests/smoke.sh   # 需要 jq + sqlite3；假 ARP/终端列表/ping，不碰系统路径
 ```
 
-`devmon/tools/mp_test.sh` 用来在**隔离副本**上验证前端菜单补丁（三入口→单入口→幂等→完全还原），
-需要把 `menu_patch.sh` 和它传到设备上跑，不会动真实前端。
+`devmon/tools/mp_test.sh` 用来在**隔离副本**上验证前端菜单补丁（单入口→幂等→完全还原），
+把它和 `menu_patch.sh` 传到设备上跑，不会动真实前端。
 
 ## 已知平台约束（踩坑记录）
 

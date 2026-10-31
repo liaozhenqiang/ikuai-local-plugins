@@ -61,10 +61,10 @@ iKuai 的菜单由 `funcore.lua` 在 openresty 启动时缓存，所以补丁后
 
 ## 安装
 
-把 `dist/devmon.zip` 上传到 iKuai「高级应用 → 插件管理」，或 SSH：
+把 `dist/devmon-v<version>-plugin.zip` 上传到 iKuai「高级应用 → 插件管理」，或 SSH：
 
 ```bash
-ikplugin install /root/devmon.zip
+ikplugin install /root/devmon-v1.1.0-plugin.zip
 ikplugin list
 ```
 
@@ -158,7 +158,7 @@ bash tests/smoke.sh        # 34 项：清单、发现、导入、在线/离线�
 
 ```bash
 bash build.sh
-# => dist/devmon.zip
+# => dist/devmon-v<version>-plugin.zip（ikupd 认这个命名）
 ```
 
 有 `zip` 时直接用；没有时用 Python 兜底（保留 install.sh/bin/function 的执行位）：
