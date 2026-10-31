@@ -1,5 +1,8 @@
 # mimon —— 小米设备接入
 
+> 基于 [deadash/ikuai-plugins](https://github.com/deadash/ikuai-plugins) 的插件模板与开发技能开发；
+> 归属与授权范围见[仓库根 README](../README.md)。
+
 > **已废弃（archived）**：这个插件是按当时的一个误解开发的（以为要的是「小米设备清单」），
 > 实际需求后来变成了别的东西，插件已从设备上完整卸载、前端恢复原状，**当前没有任何设备在安装它，
 > 也不会再更新**。源码留在这里只作 miIO 发现 / OUI 识别 / iKuai 终端列表取型号这几段实现的参考。

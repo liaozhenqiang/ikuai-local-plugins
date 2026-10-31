@@ -1,5 +1,9 @@
 # devmon —— 本地设备监控
 
+> 基于 [deadash/ikuai-plugins](https://github.com/deadash/ikuai-plugins) 的插件模板与开发技能
+> （v0.0.9 那批 [Releases](https://github.com/deadash/ikuai-plugins/releases) 里的示例插件包 +
+> `.codebuddy/skills/ikuai-plugin-dev/assets/template/`）开发；归属与授权范围见[仓库根 README](../README.md)。
+
 iKuai「状态监控」下的 **摄像头监控 / 交换机监控 / 周边设备监控** 三个页面原本被云平台绑定拦住，
 本插件把它们**合并成一个本地「周边设备监控」入口**（菜单位置不变，另两项从菜单里去掉）：
 一个页面看全部设备，类别（摄像头/交换机/周边设备）作为页内筛选和每台设备的属性保留。

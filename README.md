@@ -54,17 +54,33 @@ cd devmon && bash tests/smoke.sh   # 需要 jq + sqlite3；假 ARP/终端列表/
 * `json_append __json_result__ key:json` 读的是**同名 shell 变量**。
 * 详见 [devmon/README.md](devmon/README.md)。
 
+## 基于 / 致谢
+
+本仓库的插件是**基于 [deadash/ikuai-plugins](https://github.com/deadash/ikuai-plugins) 开发**的。
+具体的模板与开发技能来自它的 [Releases](https://github.com/deadash/ikuai-plugins/releases)
+（v0.0.9 那批示例插件包）以及仓库内的
+`.codebuddy/skills/ikuai-plugin-dev/`（技能文档 + `assets/template/` 模板插件）。
+沿用/改写的部分：
+
+* 插件包结构与生命周期脚本：`Release` / `install.sh` / `boot.sh` / `uninstall.sh`，
+  `bin/*`、`function/*` 挂到 `/usr/ikuai` 的安装方式，卸载即清理
+* `function/<name>` 后端接口写法（`#!/bin/bash /etc/ikcommon`、`show` / `json_append` 约定）
+* 改前端菜单/路由的思路与 `app.<hash>.js.gz` 解压-原地插入-重压-校验的做法
+* `build.sh` + `tools/zip_pkg.py` 打包脚本骨架（保留 exec 位、`create_system=3`）
+
+设备侧框架（`ikcommon`、`funcore`、插件管理器）属于 iKuai 固件本身，与上述两方无关。
+
+> 上游仓库**没有附开源许可证**（版权归其作者）。因此：本仓库**只对自己编写/改写的那部分代码**
+> 按 [MIT](LICENSE) 授权；从上游模板沿用或衍生的部分仍归原作者，若你要单独再分发这部分，
+> 请先联系上游作者获得许可。感谢 deadash 把插件通道、接口约定和踩坑记录整理成技能。
+
 ## 隐私
 
 两个插件都只在路由器本地运行：不上传任何数据、不请求外部服务、**不采集米家设备 token**、
 不需要爱快云账号。设备清单存在 `/etc/mnt/plugins/devmon/data/devmon.db`。
 
-## 来源
-
-插件包结构、`ikcommon` 后端约定和前端补丁思路来自
-[deadash/ikuai-plugins](https://github.com/deadash/ikuai-plugins) 的开发技能与模板；
-本仓库的代码为在其基础上重写。
-
 ## License
 
-MIT，见 [LICENSE](LICENSE)。
+本仓库自行编写的代码按 MIT 授权，见 [LICENSE](LICENSE)；
+从 [deadash/ikuai-plugins](https://github.com/deadash/ikuai-plugins) 模板沿用/衍生的部分
+不在此授权范围内（上游未附许可证），详见上面「基于 / 致谢」。
