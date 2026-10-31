@@ -29,12 +29,18 @@ def release_field(text: str, key: str) -> str:
 
 
 def is_exec(rel: str) -> bool:
-    return (
+    if (
         rel in EXEC_NAMES
         or rel.endswith(".sh")
         or rel.startswith("bin/")
         or rel.startswith("function/")
-    )
+    ):
+        return True
+    if rel.startswith("runtime/python/bin/") or rel == "runtime/lib/ld-linux-x86-64.so.2":
+        return True
+    if rel.startswith("payload/panel/music-stack/"):
+        return rel.rsplit("/", 1)[-1] in {"songloft", "music-dl", "ffmpeg", "ffprobe"}
+    return False
 
 
 def main() -> int:

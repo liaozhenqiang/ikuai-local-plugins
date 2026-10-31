@@ -33,6 +33,10 @@ mkdir -p "$DATA" "$LOGDIR" "$RT" "$SITE" 2>/dev/null
 echo "$(date '+%F %T') [install] version=${PLUGIN_VERSION:-?} action=${PLUGIN_ACTION:-?} root=$ROOT" >> "$LOG"
 
 # ---------------------------------------------------------------- Python 运行时
+# 完整包自带运行时；先恢复执行位，避免误判成“缺 Python”又去联网下载。
+if [ -f "$PY" ]; then
+    chmod +x "$PY" "$RT/lib/ld-linux-x86-64.so.2" 2>/dev/null
+fi
 if [ ! -x "$PY" ]; then
     echo "$(date '+%F %T') [install] 准备 Python ${PY_VER} 运行时" >> "$LOG"
     TARBALL=""
