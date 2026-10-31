@@ -1,0 +1,572 @@
+#!/bin/bash
+#
+# adgctl —— AdGuard Home 控制器(纯 shell)
+#
+# 框架会把 pkg/bin/* 软链到 /usr/sbin/ 并去掉 .sh 后缀, 设备上直接 `adgctl <命令>`。
+#
+# 命令:
+#   start [nowait] | stop | restart    启停(幂等)
+#   status | status-json               人类可读 / JSON 状态
+#   dnsport <1-65535>                  DNS 监听端口(默认 53)
+#   webport <1-65535>                  Web 管理端口(默认 3000)
+#   hijack <0|1>                       DNS 劫持: 把局域网 53 流量重定向到本机(默认 1)
+#   autostart <0|1>                    开机自启(默认 1)
+#   upstream [auto|doh|oc|custom <addr>]  上游 DNS 模式(默认 auto)
+#                                       auto=自动检测 OpenClash(有则串联 7874, 无则公共 DoH)
+#                                       doh=公共 DoH(阿里), oc=OpenClash 7874, custom=自定义
+#   init                               生成初始配置(幂等; 优先用安装接口随机密码, 失败回退模板)
+#   log [行数]                         查看运行日志
+#   logclear                          清空运行日志
+#   version                            版本
+#
+# 真机实测结论(改之前先看):
+#   * AdGuardHome v0.107.79 是 Go **静态 ELF**, uClibc 直接跑; 二进制 36MB, RSS 约 60~90MB。
+#   * 配置文件是 **YAML**(schema_version 34)。本机没有 --hash-password, 初次配置走
+#     安装接口 POST /control/install/configure(不包裹 data, 密码≥8位)由官方二进制自己算 bcrypt。
+#   * iKuai 的 DNS 由 iptables 在 PREROUTING 里劫持(OpenClash/ikadblock 都在抢 53),
+#     端口 53 本身空闲, 所以 AdGuardHome 可以直接绑 53。
+#   * DNS 劫持用 PREROUTING REDIRECT 即可: 该链只作用于"转发/进来"的流量, 路由器本机
+#     出去的 DNS 走 OUTPUT 链, 不会被自己重定向 → 不会回环, 无需 owner 模块(本机也没有)。
+#   * 改 DNS 端口后必须同步更新 REDIRECT 的 --to-ports。
+#   * 二进制不写 pid 文件, 控制器自己维护 PIDF(并校验 /proc/$pid/cmdline 防复用)。
+#   * 没有 nohup/setsid: 子 shell + trap HUP + exec, 让 $! 即最终进程 pid。
+#
+set -u
+
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+ROOT="${PLUGIN_DIR:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+BIN="$ROOT/share/AdGuardHome"             # 大二进制放 share/ —— 框架不软链这个目录
+DATA="$ROOT/data"
+PIDF="$DATA/adg.pid"
+STARTF="$DATA/adg.start"
+CTLCONF="$DATA/adgctl.conf"               # 我们自己的开关, 不写进 AdGuardHome.yaml
+CFG="$DATA/AdGuardHome.yaml"
+DEFTPL="$ROOT/share/AdGuardHome.yaml.default"
+LOG=/etc/log/adguardhome/adguardhome.log
+DEF_DNSPORT=53
+DEF_WEBPORT=3000
+DEF_VER="0.107.79"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+oc_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null; }
+
+ensure_dirs() {
+    mkdir -p "$DATA" "$(dirname "$LOG")" 2>/dev/null
+    return 0
+}
+
+cfg_get() { sed -n "s/^$1=//p" "$CTLCONF" 2>/dev/null | head -n1; }
+cfg_set() {
+    local k="$1" v="$2"
+    test -f "$CTLCONF" || : > "$CTLCONF" 2>/dev/null
+    if grep -q "^$k=" "$CTLCONF" 2>/dev/null; then
+        sed -i "s|^$k=.*|$k=$v|" "$CTLCONF" 2>/dev/null
+    else
+        printf '%s=%s\n' "$k" "$v" >> "$CTLCONF" 2>/dev/null
+    fi
+}
+
+num_get() {
+    local v
+    v="$(cfg_get "$1")"
+    case "$v" in ''|*[!0-9]*) v="$2" ;; esac
+    printf '%s' "$v"
+}
+dnsport_get() { num_get dnsport "$DEF_DNSPORT"; }
+webport_get() { num_get webport "$DEF_WEBPORT"; }
+
+hijack_get() {
+    case "$(cfg_get hijack)" in
+        0) printf '0' ;;
+        *) printf '1' ;;
+    esac
+}
+autostart_get() {
+    case "$(cfg_get autostart)" in
+        0) printf '0' ;;
+        *) printf '1' ;;
+    esac
+}
+
+ver_get() {
+    local v
+    v="$("$BIN" --version 2>/dev/null | head -n1 | sed -E 's/.*version[[:space:]]*v?//I; s/,.*//')"
+    printf '%s' "${v:-$DEF_VER}"
+}
+
+# 随机 12 位十六进制串(作初始密码, ≥8 位即可)
+rand_pass() {
+    head -c 9 /dev/urandom 2>/dev/null | hexdump -C 2>/dev/null | \
+        awk '{sub(/\|.*/,"");sub(/^[^ ]+ */,"");gsub(/ /,"");printf "%s",$0}'
+}
+
+lan_ip() {
+    local i
+    i="$(ip -o -4 addr show 2>/dev/null | \
+         awk '$4 ~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ {sub(/\/.*/,"",$4); print $4; exit}')"
+    printf '%s' "${i:-127.0.0.1}"
+}
+
+# 日志超过 1MB 只留最后 1000 行
+log_trim() {
+    local kb
+    kb="$(du -k "$LOG" 2>/dev/null | awk '{print $1}')"
+    case "$kb" in ''|*[!0-9]*) return 0 ;; esac
+    if test "$kb" -gt 1024; then
+        tail -n 1000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG" 2>/dev/null
+    fi
+    return 0
+}
+
+# 存活 = pid 文件在 + 进程在 + cmdline 里确实是我们的二进制(防 pid 复用)
+pid_alive() {
+    local p
+    test -f "$PIDF" || return 1
+    p="$(cat "$PIDF" 2>/dev/null)"
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$p" 2>/dev/null || return 1
+    if test -r "/proc/$p/cmdline"; then
+        case "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" in
+            *"$BIN"*) : ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+# 端口是否已被"别的进程"占用(自己占用不算)
+port_busy_others() {
+    local p="$1" self line pid
+    have netstat || return 1
+    self="$(cat "$PIDF" 2>/dev/null)"
+    line="$(netstat -tlnp 2>/dev/null | awk -v pt=":$p\$" '$4 ~ pt {print $NF; exit}')"
+    case "$line" in ''|'-'*) return 1 ;; esac
+    pid="${line%%/*}"
+    case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+    test "$pid" = "$self" && return 1
+    return 0
+}
+
+# 端口是否在监听(IPv4/IPv6, /proc 解析, 避开 netstat 漏报 IPv6 的坑)
+port_listen() {
+    local p="$1" f pf
+    pf="$(printf '%04X' "$p")"
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [ -f "$f" ] || continue
+        awk -v P="$pf" '$2 ~ ":"P"$" && $4=="0A"{found=1} END{exit !found}' "$f" && return 0
+    done
+    return 1
+}
+
+# 进程活着 != Web 在听: 本地探一次
+port_ready() {
+    local p="$1" i=0
+    if ! have curl; then return 0; fi
+    while test "$i" -lt 30; do
+        if ! pid_alive; then
+            oc_log "[start] 进程已退出, 启动失败"
+            return 1
+        fi
+        if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$p/" 2>/dev/null; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    return 1
+}
+
+plain() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' 2>/dev/null; }
+tailerr() { tail -n 3 "$LOG" 2>/dev/null | plain | tr '\n' ' ' | cut -c1-200; }
+
+# ------------------------------------------------------------------ DNS 劫持(iptables)
+hijack_add() {
+    local dp
+    dp="$(dnsport_get)"
+    # 先去重, 避免重复插入
+    iptables -t nat -D PREROUTING -p udp -m udp --dport 53 -j REDIRECT --to-ports "$dp" 2>/dev/null
+    iptables -t nat -D PREROUTING -p tcp -m tcp --dport 53 -j REDIRECT --to-ports "$dp" 2>/dev/null
+    # 插到 PREROUTING 顶部, 优先级高于 OpenClash / iKuai 自带的 DNS 劫持链
+    iptables -t nat -I PREROUTING 1 -p udp -m udp --dport 53 -j REDIRECT --to-ports "$dp" 2>/dev/null
+    iptables -t nat -I PREROUTING 1 -p tcp -m tcp --dport 53 -j REDIRECT --to-ports "$dp" 2>/dev/null
+    oc_log "[hijack] 已插入重定向 53->$dp"
+}
+hijack_del() {
+    local dp="${1:-$(dnsport_get)}"
+    iptables -t nat -D PREROUTING -p udp -m udp --dport 53 -j REDIRECT --to-ports "$dp" 2>/dev/null
+    iptables -t nat -D PREROUTING -p tcp -m tcp --dport 53 -j REDIRECT --to-ports "$dp" 2>/dev/null
+    oc_log "[hijack] 已移除重定向 53->$dp"
+}
+
+# ------------------------------------------------------------------ 配置生成
+# 优先用官方安装接口生成带随机密码的配置; 失败则回退到随包模板(密码 admin123)。
+gen_conf() {
+    local pass wp dp body code apid i ok=0
+    wp="$(webport_get)"; dp="$(dnsport_get)"
+    if [ -s "$CFG" ]; then
+        return 0
+    fi
+    pass="$(rand_pass)"
+    [ -n "$pass" ] || pass="adg$(date +%s | tail -c 8)"
+
+    # 起一个临时实例进入 setup 模式(无配置即 setup), 通过 HTTP 接口写配置
+    ( trap '' HUP; cd "$DATA" || exit 1; exec "$BIN" --config "$CFG" --work-dir "$DATA" --no-check-update --no-permcheck ) >> "$LOG" 2>&1 &
+    apid=$!
+    i=0
+    while test "$i" -lt 20; do
+        if ! kill -0 "$apid" 2>/dev/null; then
+            oc_log "[init] 临时实例启动即退出, 安装接口不可用"; break
+        fi
+        if curl -s -o /dev/null -m 2 "http://127.0.0.1:$wp/" 2>/dev/null; then
+            break
+        fi
+        i=$((i + 1)); sleep 1
+    done
+    if kill -0 "$apid" 2>/dev/null; then
+        body="{\"web\":{\"ip\":\"0.0.0.0\",\"port\":$wp},\"dns\":{\"ip\":\"0.0.0.0\",\"port\":$dp},\"username\":\"admin\",\"password\":\"$pass\",\"protection_enabled\":true}"
+        code="$(curl -s -m 15 -o "$DATA/.init.resp" -w '%{http_code}' -X POST "http://127.0.0.1:$wp/control/install/configure" -H "Content-Type: application/json" -d "$body" 2>/dev/null)"
+        if [ "$code" = "200" ] && [ -s "$CFG" ]; then
+            ok=1
+        fi
+    fi
+    kill "$apid" 2>/dev/null
+    i=0; while kill -0 "$apid" 2>/dev/null && test "$i" -lt 10; do sleep 1; i=$((i + 1)); done
+    rm -f "$PIDF" "$STARTF" 2>/dev/null
+
+    if test "$ok" = 1; then
+        printf '%s' "$pass" > "$DATA/adg_password.txt" 2>/dev/null
+        chmod 600 "$DATA/adg_password.txt" 2>/dev/null
+        oc_log "[init] 安装接口生成配置(web=$wp dns=$dp 密码随机)"
+        return 0
+    fi
+
+    # 回退: 用模板(密码 admin123)
+    if [ -s "$DEFTPL" ]; then
+        cp "$DEFTPL" "$CFG" 2>/dev/null
+        printf '%s' "admin123" > "$DATA/adg_password.txt" 2>/dev/null
+        chmod 600 "$DATA/adg_password.txt" 2>/dev/null
+        oc_log "[init] 安装接口失败, 回退到模板配置(密码 admin123)"
+        return 0
+    fi
+    oc_log "[init] 初始化失败: $(cat "$DATA/.init.resp" 2>/dev/null | head -c 200)"
+    return 1
+}
+
+cmd_init() {
+    ensure_dirs
+    log_trim
+    chmod +x "$SELF" "$BIN" 2>/dev/null
+    if [ -s "$CFG" ]; then
+        # 配置已存在但仍补一次密码文件(老版本可能缺失)
+        test -s "$DATA/adg_password.txt" || printf '%s' "admin123" > "$DATA/adg_password.txt" 2>/dev/null
+        apply_upstream
+        return 0
+    fi
+    gen_conf
+    apply_upstream
+    return $?
+}
+
+# 改 YAML 里的 Web 端口(http.address: 0.0.0.0:PORT)
+cfg_set_webport() {
+    sed -i -E "s|^(  address: 0\.0\.0\.0:)[0-9]+|\1$1|" "$CFG" 2>/dev/null
+}
+# 改 YAML 里的 DNS 端口(dns 段下的 "  port: N")
+cfg_set_dnsport() {
+    sed -i -E "s|^  port: [0-9]+|  port: $1|" "$CFG" 2>/dev/null
+}
+
+# ------------------------------------------------------------------ 上游 DNS
+# 检测 OpenClash 的 mihomo DNS(7874) 是否在监听 —— 作为"是否自动串联"的依据
+oc_dns_alive() {
+    port_listen 7874
+}
+
+# 上游模式(存 adgctl.conf, 默认 auto)。取值: auto / doh / oc / custom
+upstream_get() {
+    local m
+    m="$(cfg_get upstream)"
+    case "$m" in doh|oc|custom) printf '%s' "$m" ;;
+    *) printf 'auto' ;;
+    esac
+}
+
+upstream_addr_get() {
+    cfg_get upstream_addr
+}
+
+# 把 auto 解析成实际模式: 检测到 openclash DNS 在监听就串联(oc), 否则独立公共 DoH(doh)
+resolve_upstream() {
+    local m
+    m="$(upstream_get)"
+    if test "$m" = "auto"; then
+        if oc_dns_alive; then printf 'oc'; else printf 'doh'; fi
+    else
+        printf '%s' "$m"
+    fi
+}
+
+# 把上游模式写进 AdGuardHome.yaml(幂等): upstream_dns 单条 + bootstrap 固定国内两条。
+# oc=127.0.0.1:7874(OpenClash DNS); doh=阿里 DoH; custom=adgctl.conf 里的 upstream_addr。
+apply_upstream() {
+    local mode up b1 b2
+    mode="$(resolve_upstream)"
+    case "$mode" in
+        oc)     up="127.0.0.1:7874" ;;
+        doh)    up="https://223.5.5.5/dns-query" ;;
+        custom) up="$(upstream_addr_get)"; [ -n "$up" ] || up="https://223.5.5.5/dns-query" ;;
+        *)      up="https://223.5.5.5/dns-query" ;;
+    esac
+    b1="223.5.5.5"; b2="119.29.29.29"
+    [ -s "$CFG" ] || return 0
+    awk -v UP="$up" -v B1="$b1" -v B2="$b2" '
+        /^  upstream_dns:/ { print; print "    - " UP; in_up=1; next }
+        in_up && /^    - / { next }
+        in_up && !/^    - / { in_up=0 }
+        /^  bootstrap_dns:/ { print; print "    - " B1; print "    - " B2; in_boot=1; next }
+        in_boot && /^    - / { next }
+        in_boot && !/^    - / { in_boot=0 }
+        { print }
+    ' "$CFG" > "$CFG.tmp" 2>/dev/null && mv -f "$CFG.tmp" "$CFG" 2>/dev/null
+}
+
+cmd_upstream() {
+    local arg="${1:-}" addr="${2:-}"
+    case "$arg" in
+        '')
+            printf '模式=%s 实际=%s\n' "$(upstream_get)" "$(resolve_upstream)"
+            return 0 ;;
+        auto|doh|oc)
+            cfg_set upstream "$arg"
+            apply_upstream
+            if pid_alive; then cmd_restart wait >/dev/null 2>&1; fi
+            printf '上游已设为 %s(实际 %s)\n' "$arg" "$(resolve_upstream)"
+            return 0 ;;
+        custom)
+            if [ -z "$addr" ] || printf '%s' "$addr" | grep -q '[^0-9a-zA-Z.:/_?=&-]'; then
+                echo "自定义上游地址含非法字符"; return 1
+            fi
+            cfg_set upstream custom
+            cfg_set upstream_addr "$addr"
+            apply_upstream
+            if pid_alive; then cmd_restart wait >/dev/null 2>&1; fi
+            printf '上游已设为自定义 %s\n' "$addr"
+            return 0 ;;
+        *)
+            echo "用法: adgctl upstream [auto|doh|oc|custom <addr>]"
+            return 1 ;;
+    esac
+}
+
+# ------------------------------------------------------------------ 启停
+cmd_start() {
+    test -x "$BIN" || { echo "缺少 AdGuardHome 程序: $BIN"; return 1; }
+    cmd_init || { echo "初始化配置失败, 无法启动(见 $LOG)"; return 1; }
+    if pid_alive; then
+        echo "AdGuardHome 已在运行 pid=$(cat "$PIDF")"
+        return 0
+    fi
+    if port_busy_others "$(dnsport_get)"; then
+        echo "DNS 端口 $(dnsport_get) 已被其它进程占用, 请换一个"; return 1
+    fi
+    if port_busy_others "$(webport_get)"; then
+        echo "Web 端口 $(webport_get) 已被其它进程占用, 请换一个"; return 1
+    fi
+    ( trap '' HUP; cd "$DATA" || exit 1; exec "$BIN" --config "$CFG" --work-dir "$DATA" --no-check-update --no-permcheck ) >> "$LOG" 2>&1 &
+    printf '%s' "$!" > "$PIDF" 2>/dev/null
+    date +%s > "$STARTF" 2>/dev/null
+    oc_log "[start] pid=$(cat "$PIDF" 2>/dev/null) dns=$(dnsport_get) web=$(webport_get)"
+    if test "${1:-}" = "nowait"; then
+        [ "$(hijack_get)" = "1" ] && hijack_add
+        echo "AdGuardHome 已启动 pid=$(cat "$PIDF")"
+        return 0
+    fi
+    if port_ready "$(webport_get)"; then
+        [ "$(hijack_get)" = "1" ] && hijack_add
+        echo "AdGuardHome 已启动 pid=$(cat "$PIDF") DNS=$(dnsport_get) Web=$(webport_get)"
+        return 0
+    fi
+    echo "AdGuardHome 启动失败(Web $(webport_get) 未就绪): $(tailerr)"
+    return 1
+}
+
+cmd_stop() {
+    local p i=0 main_pid=""
+    if test -f "$PIDF"; then
+        main_pid="$(cat "$PIDF" 2>/dev/null)"
+        kill "$main_pid" 2>/dev/null
+    fi
+    # 清理 pidfile 之外的残留进程; 主 pid 刚 kill 过, 跳过以免重复发 SIGTERM
+    # (AdGuardHome 关闭中再次收到 TERM 会触发 "close of closed channel" 并被 recover,
+    #  虽不致命但会在日志里刷 error/panic 噪音)
+    for p in $(ps 2>/dev/null | grep -- "$BIN" | grep -v grep | awk '{print $1}'); do
+        if [ -n "$main_pid" ] && [ "$p" = "$main_pid" ]; then continue; fi
+        kill "$p" 2>/dev/null
+    done
+    while test "$i" -lt 15; do
+        test -z "$(ps 2>/dev/null | grep -- "$BIN" | grep -v grep)" && break
+        i=$((i + 1))
+        sleep 1
+    done
+    if [ "$(hijack_get)" = "1" ]; then hijack_del; fi
+    rm -f "$PIDF" "$STARTF" 2>/dev/null
+    oc_log "[stop] 已停止"
+    echo "AdGuardHome 已停止"
+    return 0
+}
+
+cmd_restart() {
+    cmd_stop >/dev/null 2>&1
+    sleep 1
+    cmd_start "${1:-wait}"
+}
+
+# ------------------------------------------------------------------ 状态
+json_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+cmd_status_json() {
+    test -x "$BIN" || {
+        printf '{"installed":false,"running":false,"error":"缺少 AdGuardHome 程序, 请重新安装插件"}\n'
+        return 0
+    }
+    ensure_dirs
+    local dp wp running=false pid=0 up=0 ver="" wcode="" dns_listen=0 pass="" upm="" upeff="" upaddr=""
+    dp="$(dnsport_get)"; wp="$(webport_get)"
+    upm="$(upstream_get)"; upeff="$(resolve_upstream)"; upaddr="$(upstream_addr_get)"
+    if pid_alive; then
+        running=true
+        pid="$(cat "$PIDF" 2>/dev/null)"
+        if test -f "$STARTF"; then
+            up=$(( $(date +%s) - "$(cat "$STARTF" 2>/dev/null)" ))
+        fi
+        case "$up" in ''|*[!0-9]*) up=0 ;; esac
+        test "$up" -lt 0 && up=0
+    fi
+    ver="$(ver_get)"
+    if test "$running" = true && have curl; then
+        wcode="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$wp/" 2>/dev/null)"
+        port_listen "$dp" && dns_listen=1
+    fi
+    pass="$(cat "$DATA/adg_password.txt" 2>/dev/null)"
+    printf '{"installed":true,"running":%s,"pid":%s,"uptime":%s,"dnsport":%s,"webport":%s,' \
+        "$running" "${pid:-0}" "${up:-0}" "$dp" "$wp"
+    printf '"web_code":"%s","dns_listen":%s,"version":"%s","hijack":%s,"autostart":%s,"upstream":"%s","upstream_eff":"%s","upstream_addr":"%s","web_url":"http://%s:%s/","password":"%s"}\n' \
+        "$wcode" "$dns_listen" "$(json_esc "$ver")" "$(hijack_get)" "$(autostart_get)" "$(json_esc "$upm")" "$(json_esc "$upeff")" "$(json_esc "$upaddr")" "$(lan_ip)" "$wp" "$(json_esc "$pass")"
+    return 0
+}
+
+cmd_status() { cmd_status_json; }
+
+# ------------------------------------------------------------------ 改配置
+_setport() {
+    local key="$1" val="$2" def="$3" label="$4" old was_running=no
+    case "$val" in ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;; esac
+    if test "$val" -lt 1 || test "$val" -gt 65535; then
+        echo "端口需在 1~65535 之间"; return 1
+    fi
+    # 80/443 是 iKuai 控制台端口, 不能占; 53 是 DNS 默认端口, 允许。
+    case "$val" in 80|443) echo "80/443 为 iKuai 控制台端口, 请换端口"; return 1 ;; esac
+    ensure_dirs
+    if test "$key" = "dnsport"; then old="$(dnsport_get)"; else old="$(webport_get)"; fi
+    pid_alive && was_running=yes
+    if test "$val" = "$old"; then
+        echo "端口未变化($val)"; return 0
+    fi
+    if port_busy_others "$val"; then
+        echo "端口 $val 已被其它进程占用, 请换一个"; return 1
+    fi
+    if test "$was_running" = yes; then cmd_stop >/dev/null 2>&1; fi
+    # DNS 劫持开着, 先撤掉旧端口的规则
+    if test "$key" = "dnsport" && test "$(hijack_get)" = "1"; then hijack_del "$old"; fi
+    cfg_set "$key" "$val"
+    if test -s "$CFG"; then
+        if test "$key" = "dnsport"; then cfg_set_dnsport "$val"; else cfg_set_webport "$val"; fi
+    fi
+    if test "$was_running" = yes; then
+        if cmd_start wait >/dev/null 2>&1; then
+            oc_log "[$key] $old -> $val"
+            echo "$label已改为 $val 并重启"
+            return 0
+        fi
+        cfg_set "$key" "$old"
+        if test -s "$CFG"; then
+            if test "$key" = "dnsport"; then cfg_set_dnsport "$old"; else cfg_set_webport "$old"; fi
+        fi
+        cmd_start wait >/dev/null 2>&1
+        oc_log "[$key] $old -> $val 失败, 已回滚到 $old"
+        echo "端口 $val 启动失败, 已回滚到 $old: $(tailerr)"
+        return 1
+    fi
+    oc_log "[$key] $old -> $val (未运行, 下次启动生效)"
+    echo "$label已设为 $val(服务未运行, 下次启动生效)"
+    return 0
+}
+
+cmd_dnsport() { _setport dnsport "${1:-}" "$DEF_DNSPORT" "DNS 端口"; }
+cmd_webport() { _setport webport "${1:-}" "$DEF_WEBPORT" "Web 端口"; }
+
+cmd_hijack() {
+    case "${1:-}" in
+        0|1) : ;;
+        '')  hijack_get; return 0 ;;          # 查询(给 boot.sh 用)
+        *)   echo "用法: adgctl hijack <0|1>"; return 1 ;;
+    esac
+    if test "$1" = 1; then
+        cfg_set hijack 1
+        if pid_alive; then
+            hijack_add
+        else
+            cmd_start wait || { echo "启动失败, 未开启劫持"; return 1; }
+        fi
+        echo "DNS 劫持已开启(53->$(dnsport_get))"
+        return 0
+    else
+        hijack_del
+        cfg_set hijack 0
+        echo "DNS 劫持已关闭"
+        return 0
+    fi
+}
+
+cmd_autostart() {
+    case "${1:-}" in
+        0|1) cfg_set autostart "$1"
+             echo "开机自启: $(test "$1" = 1 && echo 开启 || echo 关闭)"; return 0 ;;
+        '')  autostart_get; return 0 ;;
+        *)   echo "用法: adgctl autostart <0|1>"; return 1 ;;
+    esac
+}
+
+cmd_log() {
+    local n="${1:-60}"
+    case "$n" in ''|*[!0-9]*) n=60 ;; esac
+    log_trim
+    tail -n "$n" "$LOG" 2>/dev/null || echo "(暂无日志)"
+}
+
+cmd_version() { ver_get; }
+
+cmd_logclear() {
+    : > "$LOG" 2>/dev/null
+    oc_log "[log] 日志已清空"
+    echo "已清空"
+}
+
+case "${1:-}" in
+    init)         cmd_init ;;
+    start)        shift; cmd_start "${1:-wait}" ;;
+    start-nowait) cmd_start nowait ;;
+    stop)         cmd_stop ;;
+    restart)      shift; cmd_restart "${1:-wait}" ;;
+    status)       cmd_status ;;
+    status-json)  cmd_status_json ;;
+    dnsport)      shift; cmd_dnsport "${1:-}" ;;
+    webport)      shift; cmd_webport "${1:-}" ;;
+    hijack)       shift; cmd_hijack "${1:-}" ;;
+    autostart)    shift; cmd_autostart "${1:-}" ;;
+    upstream)     shift; cmd_upstream "${1:-}" "${2:-}" ;;
+    log)          shift; cmd_log "${1:-60}" ;;
+    logclear)     cmd_logclear ;;
+    version)      cmd_version ;;
+    *)             sed -n '3,31p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

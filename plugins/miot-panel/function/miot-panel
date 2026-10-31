@@ -1,0 +1,70 @@
+#!/bin/bash /etc/ikcommon
+#
+# function/miot-panel —— 插件页面的后端接口。
+#
+# 约定：动作名必须是 name() 形式；show 类把数据塞进 __json_result__ 由 Show 包装。
+#
+ROOT="/etc/mnt/plugins/miot-panel"
+BIN="$ROOT/bin/miot-panel"
+
+__show_data() {
+    if [ ! -x "$BIN" ]; then
+        error='插件未正确安装，请重新安装'
+        json_append __json_result__ error:str
+        return 0
+    fi
+    status="$("$BIN" status 2>/dev/null)"
+    [ -n "$status" ] || status='{}'
+    json_append __json_result__ status:json
+}
+
+show()
+{
+    # TYPE=data 时 Show 会自动调用 __show_data()，这里不要再手动调一次
+    Show __json_result__
+}
+
+start()
+{
+    "$BIN" start 2>&1
+    return 0
+}
+
+stop()
+{
+    "$BIN" stop 2>&1
+    return 0
+}
+
+restart()
+{
+    "$BIN" restart 2>&1
+    return 0
+}
+
+setport()
+{
+    case "$value" in ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;; esac
+    [ "$value" -ge 1024 ] && [ "$value" -le 65535 ] || { echo "端口需在 1024~65535 之间"; return 1; }
+    "$BIN" setport "$value" >/dev/null 2>&1 || { echo "保存失败"; return 1; }
+    "$BIN" restart >/dev/null 2>&1
+    echo "端口已改为 $value"
+    return 0
+}
+
+logshow()
+{
+    # logquote 输出的是 JSON 字符串字面量，直接按 json 类型塞进去，
+    # 换行/引号都已经被正确转义（用 :str 会把换行压成空格）。
+    text="$("$BIN" logquote 100 2>/dev/null)"
+    [ -n "$text" ] || text='"（暂无日志）"'
+    json_append __json_result__ text:json
+    Show __json_result__
+}
+
+logclear()
+{
+    "$BIN" logclear >/dev/null 2>&1 && { echo "日志已清空"; return 0; }
+    echo "清空失败"
+    return 1
+}

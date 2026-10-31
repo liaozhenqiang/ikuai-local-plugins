@@ -1,0 +1,494 @@
+#!/bin/bash
+#
+# frpsctl —— frp 服务端(frps) 控制器(纯 shell)
+#
+# 框架会把 pkg/bin/* 软链到 /usr/sbin/ 并去掉 .sh 后缀, 设备上直接 `frpsctl <命令>`。
+#
+# 命令:
+#   start [nowait] | stop | restart    启停(幂等; nowait 给开机用)
+#   status | status-json               人类可读 / JSON 状态
+#   bindport <1-65535>                 客户端连过来的通信端口(默认 7000)
+#   webport <1-65535>                  仪表盘端口(默认 7500)
+#   token <新token>                    认证 Token(留空=重新随机生成)
+#   webuser <用户名>                   仪表盘登录名
+#   webpass <新密码>                   仪表盘密码
+#   autostart <0|1>                    开机自启
+#   extra <附加配置>                   原样追加到 frps.toml(高级用法)
+#   log [行数]                         查看运行日志
+#   logclear                          清空运行日志
+#   ensure                             确保目录与配置就位(不启动)
+#   version                            版本
+#
+# 真机实测结论(改之前先看):
+#   * frp v0.71.1 的 frps 是 Go **静态 ELF**(无 PT_INTERP / 无 PT_DYNAMIC),
+#     uClibc 1.0.40 设备直接跑, 启动 <1 秒, RSS 约 28MB。
+#   * 配置是 **TOML**(v0.71 起), 且 `--strict-config` 默认开启 —— 未知字段直接
+#     报错退出。实测可用的段: 顶层 bindAddr/bindPort、[auth] token、
+#     [webServer] addr/port/user/**password**(不是 pwd)、[log] to/level/maxDays。
+#     扁平点号写法(dashboard.addr)不认, 必须用段。
+#   * frps **不写 pid 文件**, 所以控制器自己维护(见 pid_alive 的 cmdline 校验)。
+#   * 改任何配置都要"先停 -> 写配置 -> 再起": frps 启动时会绑定端口, 直接改文件
+#     不重启不生效; 而 LevelDB/端口冲突会让第二个实例起不来。
+#
+set -u
+
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+ROOT="${PLUGIN_DIR:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+BIN="$ROOT/share/frps"                 # 大二进制放 share/ —— 框架不软链这个目录
+DATA="$ROOT/data"
+PIDF="$DATA/frps.pid"
+STARTF="$DATA/frps.start"
+CTLCONF="$DATA/frpsctl.conf"           # 我们自己的开关, 不写进 frps.toml
+CONF="$DATA/frps.toml"
+LOG=/etc/log/frps/frps.log
+DEF_BINDPORT=7000                      # 客户端连过来的通信端口
+DEF_WEBPORT=7500                       # 仪表盘端口
+DEF_VER="0.71.1"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+oc_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null; }
+
+ensure_dirs() {
+    mkdir -p "$DATA" "$(dirname "$LOG")" 2>/dev/null
+    return 0
+}
+
+cfg_get() { sed -n "s/^$1=//p" "$CTLCONF" 2>/dev/null | head -n1; }
+cfg_set() {
+    local k="$1" v="$2"
+    test -f "$CTLCONF" || : > "$CTLCONF" 2>/dev/null
+    if grep -q "^$k=" "$CTLCONF" 2>/dev/null; then
+        sed -i "s|^$k=.*|$k=$v|" "$CTLCONF" 2>/dev/null
+    else
+        printf '%s=%s\n' "$k" "$v" >> "$CTLCONF" 2>/dev/null
+    fi
+}
+
+num_get() {  # num_get <键> <默认值>
+    local v
+    v="$(cfg_get "$1")"
+    case "$v" in ''|*[!0-9]*) v="$2" ;; esac
+    printf '%s' "$v"
+}
+bindport_get() { num_get bindport "$DEF_BINDPORT"; }
+webport_get()  { num_get webport  "$DEF_WEBPORT"; }
+
+# 随机串: 6 字节 /dev/urandom 的十六进制(设备上没有 od/xxd, 用 hexdump -C 再抠)
+rand_hex() {
+    head -c 6 /dev/urandom 2>/dev/null | hexdump -C 2>/dev/null | \
+        awk '{sub(/\|.*/,"");sub(/^[^ ]+ */,"");gsub(/ /,"");printf "%s",$0}'
+}
+
+# Token: 首次使用自动生成(16 位), 之后以配置为准 —— frpc 要用它连进来
+token_get() {
+    local v
+    v="$(cfg_get token)"
+    if [ -z "$v" ]; then
+        v="$(rand_hex)"
+        [ -n "$v" ] || v="frp$(date +%s | tail -c 6)"
+        cfg_set token "$v"
+    fi
+    printf '%s' "$v"
+}
+
+# 仪表盘账号: 默认 admin; 密码首次使用随机生成(避免弱口令暴露在公网)
+webuser_get() {
+    local v
+    v="$(cfg_get webuser)"
+    printf '%s' "${v:-admin}"
+}
+webpass_get() {
+    local v
+    v="$(cfg_get webpass)"
+    if [ -z "$v" ]; then
+        v="$(rand_hex)"
+        [ -n "$v" ] || v="frp$(date +%s | tail -c 6)"
+        cfg_set webpass "$v"
+    fi
+    printf '%s' "$v"
+}
+
+# 只认 0/1, 默认开 —— 装完就该能用
+autostart_get() {
+    case "$(cfg_get autostart)" in
+        0) printf '0' ;;
+        *) printf '1' ;;
+    esac
+}
+
+# 版本: 优先取二进制自带的, 取不到用随包二进制的已知版本
+ver_get() {
+    local v
+    v="$("$BIN" -v 2>/dev/null | head -n1 | awk '{print $1}')"
+    printf '%s' "${v:-$DEF_VER}"
+}
+
+# 日志超过 1MB 只留最后 1000 行
+log_trim() {
+    local kb
+    kb="$(du -k "$LOG" 2>/dev/null | awk '{print $1}')"
+    case "$kb" in ''|*[!0-9]*) return 0 ;; esac
+    if test "$kb" -gt 1024; then
+        tail -n 1000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG" 2>/dev/null
+        oc_log "[log] 日志过大($kb KB), 已裁剪"
+    fi
+    return 0
+}
+
+# 存活 = pid 文件在 + 进程在 + cmdline 里确实是我们的二进制(防 pid 复用)
+pid_alive() {
+    local p
+    test -f "$PIDF" || return 1
+    p="$(cat "$PIDF" 2>/dev/null)"
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$p" 2>/dev/null || return 1
+    if test -r "/proc/$p/cmdline"; then
+        case "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" in
+            *"$BIN"*) : ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+# 端口是否已被"别的进程"占用(自己占用不算)
+port_busy_others() {
+    local p="$1" self line pid
+    have netstat || return 1
+    self="$(cat "$PIDF" 2>/dev/null)"
+    line="$(netstat -tlnp 2>/dev/null | awk -v pt=":$p\$" '$4 ~ pt {print $NF; exit}')"
+    case "$line" in ''|'-'*) return 1 ;; esac
+    pid="${line%%/*}"
+    case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+    test "$pid" = "$self" && return 1
+    return 0
+}
+
+# 端口真的在应答了才算"就绪"(进程死了立即返回, 不傻等)
+port_ready() {
+    local p="$1" i=0
+    if ! have curl; then return 0; fi
+    while test "$i" -lt 30; do
+        if ! pid_alive; then
+            oc_log "[start] 进程已退出, 启动失败"
+            return 1
+        fi
+        if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$p/" 2>/dev/null; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    return 1
+}
+
+plain() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' 2>/dev/null; }
+tailerr() { tail -n 3 "$LOG" 2>/dev/null | plain | tr '\n' ' ' | cut -c1-180; }
+
+# ------------------------------------------------------------------ 配置生成
+
+# 由当前设置生成 frps.toml。v0.71 是 TOML 且严格模式, 段名/字段名写错会起不来。
+gen_conf() {
+    local bp wp tok wu wpx extra
+    bp="$(bindport_get)"
+    wp="$(webport_get)"
+    tok="$(token_get)"
+    wu="$(webuser_get)"
+    wpx="$(webpass_get)"
+    {
+        printf 'bindAddr = "0.0.0.0"\n'
+        printf 'bindPort = %s\n' "$bp"
+        printf '\n[auth]\n'
+        printf 'token = "%s"\n' "$tok"
+        printf '\n[webServer]\n'
+        printf 'addr = "0.0.0.0"\n'
+        printf 'port = %s\n' "$wp"
+        printf 'user = "%s"\n' "$wu"
+        printf 'password = "%s"\n' "$wpx"
+        printf '\n[log]\n'
+        printf 'to = "%s"\n' "$LOG"
+        printf 'level = "info"\n'
+        printf 'maxDays = 3\n'
+        extra="$(cfg_get extra)"
+        if [ -n "$extra" ]; then
+            printf '\n# --- 附加配置(用户自定义, 原样追加) ---\n'
+            printf '%s\n' "$extra"
+        fi
+    } > "$CONF.tmp" 2>/dev/null && mv -f "$CONF.tmp" "$CONF" 2>/dev/null
+    chmod 600 "$CONF" 2>/dev/null
+    return 0
+}
+
+cmd_init() {
+    ensure_dirs
+    log_trim
+    # 自愈: 补回自身与真实二进制的执行位(框架只 chmod function/, 不管 bin/ 与 share/)
+    chmod +x "$SELF" "$BIN" 2>/dev/null
+    test -s "$CONF" || gen_conf
+    return 0
+}
+
+# ------------------------------------------------------------------ 启停
+
+cmd_start() {
+    local bp wp
+    test -x "$BIN" || { echo "缺少 frps 程序: $BIN"; return 1; }
+    cmd_init
+    if pid_alive; then
+        echo "frps 已在运行 pid=$(cat "$PIDF")"
+        return 0
+    fi
+    bp="$(bindport_get)"
+    wp="$(webport_get)"
+    if port_busy_others "$bp"; then
+        echo "通信端口 $bp 已被其它进程占用, 请换一个"; return 1
+    fi
+    if port_busy_others "$wp"; then
+        echo "仪表盘端口 $wp 已被其它进程占用, 请换一个"; return 1
+    fi
+    # 没有 nohup/setsid: 子 shell + 忽略 HUP; exec 让 $! 就是最终进程 pid
+    ( trap '' HUP; cd "$DATA" || exit 1; exec "$BIN" -c "$CONF" ) >> "$LOG" 2>&1 &
+    printf '%s' "$!" > "$PIDF" 2>/dev/null
+    date +%s > "$STARTF" 2>/dev/null
+    oc_log "[start] pid=$(cat "$PIDF" 2>/dev/null) bind=$bp web=$wp"
+    if test "${1:-}" = "nowait"; then
+        echo "frps 已启动 pid=$(cat "$PIDF")"
+        return 0
+    fi
+    if port_ready "$wp"; then
+        echo "frps 已启动 pid=$(cat "$PIDF") 通信端口=$bp 仪表盘=$wp"
+        return 0
+    fi
+    echo "frps 启动失败(仪表盘 $wp 未就绪): $(tailerr)"
+    return 1
+}
+
+cmd_stop() {
+    local p i=0
+    if test -f "$PIDF"; then
+        p="$(cat "$PIDF" 2>/dev/null)"
+        kill "$p" 2>/dev/null
+    fi
+    # 兜底: pid 文件丢了也要按二进制路径把残留进程清掉
+    for p in $(ps 2>/dev/null | grep -- "$BIN" | grep -v grep | awk '{print $1}'); do
+        kill "$p" 2>/dev/null
+    done
+    while test "$i" -lt 15; do
+        test -z "$(ps 2>/dev/null | grep -- "$BIN" | grep -v grep)" && break
+        i=$((i + 1))
+        sleep 1
+    done
+    rm -f "$PIDF" "$STARTF" 2>/dev/null
+    oc_log "[stop] 已停止"
+    echo "frps 已停止"
+    return 0
+}
+
+cmd_restart() {
+    cmd_stop >/dev/null 2>&1
+    sleep 1
+    cmd_start "${1:-wait}"
+}
+
+# ------------------------------------------------------------------ 状态
+
+json_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+lan_ip() {
+    local i
+    i="$(ip -o -4 addr show 2>/dev/null | \
+         awk '$4 ~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ {sub(/\/.*/,"",$4); print $4; exit}')"
+    printf '%s' "${i:-127.0.0.1}"
+}
+
+cmd_status_json() {
+    local bp wp tok wu wpx running=false pid=0 up=0 ver="" ip wcode=""
+    test -x "$BIN" || {
+        printf '{"installed":false,"running":false,"error":"缺少 frps 程序, 请重新安装插件"}\n'
+        return 0
+    }
+    ensure_dirs
+    bp="$(bindport_get)"
+    wp="$(webport_get)"
+    tok="$(token_get)"
+    wu="$(webuser_get)"
+    wpx="$(webpass_get)"
+    if pid_alive; then
+        running=true
+        pid="$(cat "$PIDF" 2>/dev/null)"
+        if test -f "$STARTF"; then
+            up=$(( $(date +%s) - "$(cat "$STARTF" 2>/dev/null)" ))
+        fi
+        case "$up" in ''|*[!0-9]*) up=0 ;; esac
+        test "$up" -lt 0 && up=0
+    fi
+    ver="$(ver_get)"
+    ip="$(lan_ip)"
+    # 进程活着 != 仪表盘在听: 本地探一次, 401 说明在(要登录), 000 表示没监听
+    if test "$running" = true && have curl; then
+        wcode="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$wp/" 2>/dev/null)"
+    fi
+    printf '{"installed":true,"running":%s,"pid":%s,"uptime":%s,"bindport":%s,"webport":%s,' \
+        "$running" "${pid:-0}" "${up:-0}" "$bp" "$wp"
+    printf '"web_code":"%s","version":"%s","web_url":"http://%s:%s/","web_user":"%s","web_pass":"%s",' \
+        "$wcode" "$(json_esc "$ver")" "$ip" "$wp" "$(json_esc "$wu")" "$(json_esc "$wpx")"
+    printf '"token":"%s","autostart":%s}\n' "$(json_esc "$tok")" "$(autostart_get)"
+    return 0
+}
+
+cmd_status() { cmd_status_json; }
+
+# ------------------------------------------------------------------ 改配置
+
+# 改端口通用逻辑: 先停 -> 写 conf -> 重新生成 -> 再起 -> 失败回滚
+_setport() {
+    local key="$1" val="$2" def="$3" label="$4" old was_running=no
+    case "$val" in
+        ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;;
+    esac
+    if test "$val" -lt 1 || test "$val" -gt 65535; then
+        echo "端口需在 1~65535 之间"; return 1
+    fi
+    case "$val" in 80|443) echo "80/443 被 iKuai 控制台占用, 请换端口"; return 1 ;; esac
+    ensure_dirs
+    if test "$key" = "bindport"; then old="$(bindport_get)"; else old="$(webport_get)"; fi
+    pid_alive && was_running=yes
+    if test "$val" = "$old"; then
+        echo "端口未变化($val)"; return 0
+    fi
+    if port_busy_others "$val"; then
+        echo "端口 $val 已被其它进程占用, 请换一个"; return 1
+    fi
+    if test "$was_running" = yes; then
+        cmd_stop >/dev/null 2>&1
+    fi
+    cfg_set "$key" "$val"
+    gen_conf
+    if test "$was_running" = yes; then
+        if cmd_start wait >/dev/null 2>&1; then
+            oc_log "[$key] $old -> $val"
+            echo "$label已改为 $val 并重启"
+            return 0
+        fi
+        cfg_set "$key" "$old"
+        gen_conf
+        cmd_start wait >/dev/null 2>&1
+        oc_log "[$key] $old -> $val 失败, 已回滚到 $old"
+        echo "端口 $val 启动失败, 已回滚到 $old: $(tailerr)"
+        return 1
+    fi
+    oc_log "[$key] $old -> $val (未运行, 下次启动生效)"
+    echo "$label已设为 $val(服务未运行, 下次启动生效)"
+    return 0
+}
+
+cmd_bindport() { _setport bindport "${1:-}" "$DEF_BINDPORT" "通信端口"; }
+cmd_webport()  { _setport webport  "${1:-}" "$DEF_WEBPORT"  "仪表盘端口"; }
+
+# 改 token: 留空则重新随机生成(frpc 那边要同步改, 否则全掉线)
+cmd_token() {
+    local v="${1:-}"
+    if [ -z "$v" ]; then
+        v="$(rand_hex)"
+        [ -n "$v" ] || v="frp$(date +%s | tail -c 6)"
+    fi
+    _setstr token "$v" "认证 Token"
+}
+
+cmd_webuser() { _setstr webuser "${1:-}" "仪表盘用户名"; }
+cmd_webpass() { _setstr webpass "${1:-}" "仪表盘密码"; }
+
+# 附加配置: 原样追加到 frps.toml 末尾(高级用法, 自己负责语法)
+cmd_extra() {
+    local v="${1:-}"
+    if [ -z "$v" ]; then
+        cfg_set extra ""
+        gen_conf
+        echo "附加配置已清空"; return 0
+    fi
+    case "$v" in *'"'*|*'\'*) echo "不能含引号或反斜杠"; return 1 ;; esac
+    cfg_set extra "$v"
+    gen_conf
+    echo "附加配置已保存"
+    return 0
+}
+
+cmd_autostart() {
+    case "${1:-}" in
+        0|1) cfg_set autostart "$1"
+             echo "开机自启: $(test "$1" = 1 && echo 开启 || echo 关闭)"; return 0 ;;
+        # 不带参数 = 查询。boot.sh 依赖它判断要不要拉起, 别改成打印用法
+        '')  autostart_get; return 0 ;;
+        *)   echo "用法: frpsctl autostart <0|1>"; return 1 ;;
+    esac
+}
+
+# 改 token / 仪表盘账号密码: 同样要先停再起(配置是启动时读的)
+_setstr() {
+    local key="$1" val="$2" label="$3" old was_running=no
+    test -n "$val" || { echo "$label 不能为空"; return 1; }
+    case "$val" in -*|*' '*) echo "$label 不能以 - 开头、不能含空格"; return 1 ;; esac
+    if printf '%s\n' "$val" | grep -q '[^0-9A-Za-z!@#$%^*()_+.,:;<>?/~{}-]'; then
+        echo "$label 含不允许的字符(不能有引号、反斜杠、方括号)"; return 1
+    fi
+    ensure_dirs
+    old="$(cfg_get "$key")"
+    pid_alive && was_running=yes
+    if test "$was_running" = yes; then
+        cmd_stop >/dev/null 2>&1
+    fi
+    cfg_set "$key" "$val"
+    gen_conf
+    if test "$was_running" = yes; then
+        if cmd_start wait >/dev/null 2>&1; then
+            oc_log "[$key] 已修改"
+            echo "$label 已修改并重启"
+            return 0
+        fi
+        cfg_set "$key" "$old"
+        gen_conf
+        cmd_start wait >/dev/null 2>&1
+        echo "重启失败, 已恢复原值: $(tailerr)"
+        return 1
+    fi
+    oc_log "[$key] 已修改(未运行, 下次启动生效)"
+    echo "$label 已修改(下次启动生效)"
+    return 0
+}
+
+cmd_log() {
+    local n="${1:-60}"
+    case "$n" in ''|*[!0-9]*) n=60 ;; esac
+    log_trim
+    tail -n "$n" "$LOG" 2>/dev/null || echo "(暂无日志)"
+}
+
+cmd_version() { ver_get; }
+
+cmd_logclear() {
+    : > "$LOG" 2>/dev/null
+    oc_log "[log] 日志已清空"
+    echo "已清空"
+}
+
+case "${1:-}" in
+    init)         cmd_init ;;
+    start)        shift; cmd_start "${1:-wait}" ;;
+    start-nowait) cmd_start nowait ;;
+    stop)         cmd_stop ;;
+    restart)      shift; cmd_restart "${1:-wait}" ;;
+    status)       cmd_status ;;
+    status-json)  cmd_status_json ;;
+    bindport)     shift; cmd_bindport "${1:-}" ;;
+    webport)      shift; cmd_webport "${1:-}" ;;
+    token)        shift; cmd_token "${1:-}" ;;
+    webuser)      shift; cmd_webuser "${1:-}" ;;
+    webpass)      shift; cmd_webpass "${1:-}" ;;
+    extra)        shift; cmd_extra "${1:-}" ;;
+    autostart)    shift; cmd_autostart "${1:-}" ;;
+    log)          shift; cmd_log "${1:-60}" ;;
+    logclear)     cmd_logclear ;;
+    ensure)       ensure_dirs; log_trim; echo "目录与配置已就位" ;;
+    version)      cmd_version ;;
+    *)             sed -n '3,31p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

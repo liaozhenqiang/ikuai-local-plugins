@@ -1,0 +1,1 @@
+{"name":"frpc","manufacturer":"fatedier","version":"0.71.1.1","title":"FRP 内网穿透(客户端)","author":"fatedier","description":"frp 客户端 V0.71.1：填服务端地址与 Token 即可穿透，支持 tcp/udp/http/https 多条代理规则增删、本地管理界面与开机自启，静态 Go 二进制无需依赖。"}

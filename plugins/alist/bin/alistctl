@@ -1,0 +1,422 @@
+#!/bin/bash
+#
+# alistctl —— AList for iKuai 控制器(纯 shell)
+#
+# 框架会把 pkg/bin/* 软链到 /usr/sbin/ 并去掉 .sh 后缀, 所以设备上直接 `alistctl <命令>`。
+#
+# 命令:
+#   start [nowait] | stop | restart   启停(幂等; nowait 不等端口就绪, 给开机用)
+#   status | status-json              人类可读状态 / JSON 状态(给后端接口用)
+#   port <1-65535>                    改 Web 端口(写 AList 自己的 config.json 后重启)
+#   autostart <0|1>                   是否开机自启
+#   passwd <新密码>                    设置管理员密码
+#   log [行数]                        查看运行日志
+#   ensure                            确保目录/配置/初始密码就位(不启动)
+#   version                           版本信息
+#
+# 这些都是真机实测得来的结论, 改之前先看懂:
+#   * AList 的端口**只能**改它自己的 config.json —— 实测环境变量 ALIST_SCHEME_HTTP_PORT 不生效。
+#     **改端口必须先停进程再写 config.json**: AList 退出时会把内存配置回写文件, 先写后停会被覆盖
+#     (表现: 提示改成功, 实际还跑在旧端口)。
+#   * 设备上的 jq 是 1.4, **不支持 --arg/--argjson**, 值只能拼进 filter 字符串(统一走 jq_do)。
+#   * config.json 不存在时用 `alist storage list --data <dir>` 生成, 顺便把 data.db 也建好
+#     (比起服务再关快得多, 且不会往控制台喷启动日志)。
+#   * `alist admin set <pw> --data <dir>` 在**服务没启动时也能用**, 实测登录后 API 返回 200。
+#     所以初始密码在"首次启动前"就设好, 不靠抓日志 —— 实测 v3.65.0 日志里根本没有
+#     initial password 那一行, 抓日志的方案会直接拿到空值。
+#     (admin set 会打一条连不上自己 API 的 WARN, 那是清缓存失败, 无害。)
+#   * 设备没有 od, 取十六进制只能用 hexdump -C 再解析(busybox 的 hexdump 不支持 -e)。
+#   * 设备没有 nohup/setsid, 后台常驻只能 `( trap '' HUP; exec ... ) &`。
+#
+set -u
+
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+ROOT="${PLUGIN_DIR:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+ALIST="$ROOT/share/alist"               # 大二进制放 share/ —— 框架不软链这个目录
+DATA="$ROOT/data/alist"                 # AList 自己的数据目录(config.json / data.db)
+CONF="$DATA/config.json"
+PIDF="$ROOT/data/alist.pid"
+STARTF="$ROOT/data/alist.start"         # 启动时刻的 epoch, 用来算运行时长
+INITPWD="$ROOT/data/.initpwd"           # 我们生成的初始密码(用户改过密码后删除)
+CTLCONF="$ROOT/data/alistctl.conf"
+LOG=/etc/log/alist/alist.log
+DEF_PORT=5244
+
+have() { command -v "$1" >/dev/null 2>/dev/null; }
+oc_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null; }
+
+# 设备上的 jq 是 1.4 —— **不支持 --argjson / --arg**(实测报 Unknown option),
+# 老代码用了它导致改端口静默失败。这里统一: 值先校验成纯数字, 再拼进 filter 字符串。
+jq_do() {
+    local f="$1" filter="$2" out
+    test -f "$f" || return 1
+    out="$(jq "$filter" "$f" 2>/dev/null)"
+    test -n "$out" || return 1
+    printf '%s\n' "$out" > "$f.tmp" 2>/dev/null || return 1
+    mv -f "$f.tmp" "$f" 2>/dev/null
+}
+
+# 日志里带 ANSI 颜色转义, 摘出来给用户看之前要剥掉(剥不干净会污染接口的 JSON)
+plain() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' 2>/dev/null; }
+
+# 随机十六进制串(取 6 字节 -> 12 个字符)
+hexstr() {
+    head -c 6 /dev/urandom 2>/dev/null | \
+        hexdump -C 2>/dev/null | \
+        awk '{ sub(/\|.*/,""); sub(/^[^ ]+ */,""); gsub(/ /,""); printf "%s", $0 }'
+}
+
+ensure_dirs() {
+    mkdir -p "$ROOT/data" "$DATA" "$(dirname "$LOG")" 2>/dev/null
+    return 0
+}
+
+cfg_get() { sed -n "s/^$1=//p" "$CTLCONF" 2>/dev/null | head -n1; }
+cfg_set() {
+    local k="$1" v="$2"
+    test -f "$CTLCONF" || : > "$CTLCONF" 2>/dev/null
+    if grep -q "^$k=" "$CTLCONF" 2>/dev/null; then
+        sed -i "s|^$k=.*|$k=$v|" "$CTLCONF" 2>/dev/null
+    else
+        printf '%s=%s\n' "$k" "$v" >> "$CTLCONF" 2>/dev/null
+    fi
+}
+
+# 只认 0/1, 默认开 —— 用户装完就希望它一直跑着
+autostart_get() {
+    case "$(cfg_get autostart)" in
+        0) printf '0' ;;
+        *) printf '1' ;;
+    esac
+}
+
+# 端口以 AList 的 config.json 为准; 还没有配置时用我们记的 / 默认值
+port_get() {
+    local p=""
+    if test -f "$CONF" && have jq; then
+        p="$(jq -r '.scheme.http_port // empty' "$CONF" 2>/dev/null)"
+    fi
+    case "$p" in ''|*[!0-9]*) p="$(cfg_get port)" ;; esac
+    case "$p" in ''|*[!0-9]*) p="$DEF_PORT" ;; esac
+    printf '%s' "$p"
+}
+
+# 生成/修正 AList 配置: 顺手关掉它自己的文件日志(否则日志会往插件目录里长)
+ensure_conf() {
+    if test ! -f "$CONF"; then
+        "$ALIST" storage list --data "$DATA" >/dev/null 2>&1
+        test -f "$CONF" || return 1
+    fi
+    if have jq; then
+        jq_do "$CONF" '.log.enable = false'
+    fi
+    return 0
+}
+
+# 首次使用时主动设一个随机初始密码。
+# 为什么必须这样: AList 只在"首次启动"时才随机生成管理员密码, 而且实测没有打到日志里,
+# 用户根本无从得知 —— 装完会卡在登录页。这里提前设好并存盘, 页面就能直接显示。
+#
+# 注意顺序: ensure_conf 会把 data.db 也建出来, 所以"没有 data.db"这个判断必须在
+# ensure_conf 之前做。调用方也必须先调本函数再调 ensure_conf(ensure/start 都已如此)。
+ensure_password() {
+    local p
+    test -f "$INITPWD" && return 0            # 已经设过且用户没改过
+    test -f "$DATA/data.db" && return 0       # 已有数据: 密码不由我们掌握, 别乱覆盖
+    ensure_conf || return 1
+    p="$(hexstr)"
+    case "$p" in '') return 1 ;; esac
+    # admin set 会把明文密码打到 stdout, 必须丢掉, 否则会漏进日志
+    "$ALIST" admin set "$p" --data "$DATA" >/dev/null 2>&1 || return 1
+    printf '%s' "$p" > "$INITPWD" 2>/dev/null
+    return 0
+}
+
+# 日志超过 2MB 就只留最后 2000 行, 防止 AList 的访问日志把持久分区吃满
+log_trim() {
+    local kb
+    kb="$(du -k "$LOG" 2>/dev/null | awk '{print $1}')"
+    case "$kb" in ''|*[!0-9]*) return 0 ;; esac
+    if test "$kb" -gt 2048; then
+        tail -n 2000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG" 2>/dev/null
+        oc_log "[log] 日志过大($kb KB), 已裁剪"
+    fi
+    return 0
+}
+
+apply_port() {
+    local p
+    p="$(cfg_get port)"
+    case "$p" in ''|*[!0-9]*) return 0 ;; esac        # 没自定义过就用 AList 默认的
+    test -f "$CONF" || return 0
+    if have jq; then
+        jq_do "$CONF" ".scheme.http_port = $p"
+    fi
+    return 0
+}
+
+pid_alive() {
+    local p
+    test -f "$PIDF" || return 1
+    p="$(cat "$PIDF" 2>/dev/null)"
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$p" 2>/dev/null || return 1
+    # 防 pid 复用: 必须是"我们的 AList"(cmdline 里有自己的数据目录)才算活着
+    if test -r "/proc/$p/cmdline"; then
+        case "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" in
+            *"server --data $DATA"*) : ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+# 端口是否已被"别的进程"占用(自己占用不算)。没有 netstat 就放弃预判,
+# 启动时还有"进程秒退"检测兜底。
+port_busy_others() {
+    local p="$1" self line pid
+    have netstat || return 1
+    self="$(cat "$PIDF" 2>/dev/null)"
+    line="$(netstat -tlnp 2>/dev/null | awk -v pt=":$p\$" '$4 ~ pt {print $NF; exit}')"
+    case "$line" in ''|'-'*) return 1 ;; esac
+    pid="${line%%/*}"
+    case "$pid" in ''|*[!0-9]*) return 0 ;; esac      # 认不出 PID, 宁可当占用
+    test "$pid" = "$self" && return 1
+    return 0
+}
+
+# 端口真的在应答了才算"就绪"(AList 启动要几秒, 光有进程不代表能用)
+port_ready() {
+    local p="$1" i=0
+    if ! have curl; then return 0; fi
+    while test "$i" -lt 30; do
+        # 进程已经死了就别干等: 端口冲突/配置出错都是秒退,
+        # 傻等到 30 秒只会让用户以为"卡死了", 还得猜原因
+        if ! pid_alive; then
+            oc_log "[start] 进程已退出, 启动失败"
+            return 1
+        fi
+        if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$p/api/public/settings" 2>/dev/null; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    return 1
+}
+
+cmd_start() {
+    local port
+    test -x "$ALIST" || { echo "缺少 AList 二进制: $ALIST"; return 1; }
+    ensure_dirs
+    log_trim
+    if pid_alive; then
+        echo "AList 已在运行 pid=$(cat "$PIDF")"
+        return 0
+    fi
+    ensure_password || oc_log "[start] 警告: 初始密码未能预设"
+    ensure_conf  || { echo "初始化 AList 配置失败"; return 1; }
+    apply_port
+    # 设备没有 nohup/setsid: 子 shell 忽略 HUP + exec, 让进程活过安装脚本/SSH 会话。
+    # exec 之后子 shell 就是 AList 本身, 所以 $! 直接就是它的 pid。
+    ( trap '' HUP; exec "$ALIST" server --data "$DATA" >> "$LOG" 2>&1 ) &
+    printf '%s' "$!" > "$PIDF" 2>/dev/null
+    date +%s > "$STARTF" 2>/dev/null
+    port="$(port_get)"
+    # 开机路径绝不能等: boot.sh 串在开机流程里, 卡住会拖慢整机启动
+    if test "${1:-}" = "nowait"; then
+        oc_log "[start] 已拉起 pid=$(cat "$PIDF" 2>/dev/null) port=$port (开机路径, 不等待就绪)"
+        echo "AList 已启动 pid=$(cat "$PIDF")"
+        return 0
+    fi
+    if port_ready "$port"; then
+        echo "AList 已启动 pid=$(cat "$PIDF") 端口=$port"
+        oc_log "[start] pid=$(cat "$PIDF" 2>/dev/null) port=$port"
+        return 0
+    fi
+    oc_log "[start] 端口 $port 未就绪"
+    echo "AList 启动失败(端口 $port 未就绪): $(tail -n 3 "$LOG" 2>/dev/null | plain | tr '\n' ' ' | cut -c1-180)"
+    return 1
+}
+
+cmd_stop() {
+    local p i=0
+    if test -f "$PIDF"; then
+        p="$(cat "$PIDF" 2>/dev/null)"
+        kill "$p" 2>/dev/null
+    fi
+    # 兜底: pid 文件丢了也要按路径把残留进程清掉
+    for p in $(ps 2>/dev/null | grep "[s]erver --data $DATA" | awk '{print $1}'); do
+        kill "$p" 2>/dev/null
+    done
+    # 等它真的退出 —— 不退就立刻重启的话, 旧进程还占着端口, 新的会绑不上
+    while test "$i" -lt 10; do
+        test -z "$(ps 2>/dev/null | grep "[s]erver --data $DATA")" && break
+        i=$((i + 1))
+        sleep 1
+    done
+    rm -f "$PIDF" "$STARTF" 2>/dev/null
+    oc_log "[stop] 已停止"
+    echo "AList 已停止"
+    return 0
+}
+
+cmd_restart() {
+    cmd_stop >/dev/null 2>&1
+    sleep 1
+    cmd_start "${1:-}"
+}
+
+json_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+lan_ip() {
+    local i
+    i="$(ip -o -4 addr show 2>/dev/null | \
+         awk '$4 ~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ {sub(/\/.*/,"",$4); print $4; exit}')"
+    printf '%s' "${i:-127.0.0.1}"
+}
+
+cmd_status_json() {
+    local port running=false pid=0 up=0 ver="" pwd_state=unknown initpwd="" ip
+    test -x "$ALIST" || {
+        printf '{"installed":false,"running":false,"error":"缺少 AList 二进制, 请重新安装插件"}\n'
+        return 0
+    }
+    port="$(port_get)"
+    if pid_alive; then
+        running=true
+        pid="$(cat "$PIDF" 2>/dev/null)"
+        # 运行时长用"启动时刻"换算 —— /proc/<pid>/stat 第 22 字段在 busybox awk
+        # 下实测取不到(得到 0), 别用
+        if test -f "$STARTF"; then
+            up=$(( $(date +%s) - "$(cat "$STARTF" 2>/dev/null)" ))
+        fi
+        case "$up" in ''|*[!0-9]*) up=0 ;; esac
+        test "$up" -lt 0 && up=0
+    fi
+    ver="$("$ALIST" version 2>/dev/null | sed -n 's/^Version: //p' | head -n1)"
+    if test -f "$INITPWD"; then
+        initpwd="$(cat "$INITPWD" 2>/dev/null)"
+        pwd_state=initial
+    elif test -f "$DATA/data.db"; then
+        pwd_state=changed
+    fi
+    ip="$(lan_ip)"
+    printf '{"installed":true,"running":%s,"pid":%s,"uptime":%s,"port":%s,"version":"%s",' \
+        "$running" "${pid:-0}" "${up:-0}" "$port" "$(json_esc "${ver:-}")"
+    printf '"web_url":"%s","webdav_url":"%s","admin_user":"admin",' \
+        "$(json_esc "http://$ip:$port/")" "$(json_esc "http://$ip:$port/dav")"
+    printf '"pwd_state":"%s","init_pwd":"%s","autostart":%s}\n' \
+        "$pwd_state" "$(json_esc "$initpwd")" "$(autostart_get)"
+    return 0
+}
+
+cmd_status() {
+    cmd_status_json
+}
+
+cmd_port() {
+    local p="${1:-}" old was_running=no
+    case "$p" in
+        ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;;
+    esac
+    if test "$p" -lt 1 || test "$p" -gt 65535; then
+        echo "端口需在 1~65535 之间"; return 1
+    fi
+    ensure_dirs
+    ensure_password || oc_log "[port] 警告: 初始密码未能预设"
+    ensure_conf || { echo "初始化 AList 配置失败"; return 1; }
+    old="$(port_get)"
+    pid_alive && was_running=yes
+    if test "$p" = "$old"; then
+        echo "端口未变化($p)"
+        return 0
+    fi
+    # 被别人占着就直接拒, 别让用户在"启动失败"里猜原因
+    if port_busy_others "$p"; then
+        echo "端口 $p 已被其它进程占用, 请换一个"
+        return 1
+    fi
+    cfg_set port "$p"
+    # 关键顺序: 先停进程, 再写配置。
+    # AList 退出时会把内存里的配置回写 config.json —— 先写后停的话改动会被它覆盖,
+    # 表现就是"提示改成功了, 实际还跑在旧端口"(老版本就是这个 bug)。
+    if test "$was_running" = yes; then
+        cmd_stop >/dev/null 2>&1
+    fi
+    jq_do "$CONF" ".scheme.http_port = $p" || { echo "写入端口配置失败"; return 1; }
+    if test "$was_running" = yes; then
+        if cmd_start wait >/dev/null 2>&1; then
+            oc_log "[port] $old -> $p"
+            echo "端口已改为 $p 并重启"
+            return 0
+        fi
+        # 起不来就回滚: 留一个能用的旧端口, 比留个坏配置强
+        cfg_set port "$old"
+        jq_do "$CONF" ".scheme.http_port = $old"
+        cmd_start wait >/dev/null 2>&1
+        oc_log "[port] $old -> $p 失败, 已回滚到 $old"
+        echo "端口 $p 启动失败, 已回滚到 $old: $(tail -n 3 "$LOG" 2>/dev/null | plain | tr '\n' ' ' | cut -c1-160)"
+        return 1
+    fi
+    oc_log "[port] $old -> $p (未运行, 下次启动生效)"
+    echo "端口已设为 $p(服务未运行, 下次启动生效)"
+    return 0
+}
+
+cmd_autostart() {
+    case "${1:-}" in
+        0|1) cfg_set autostart "$1"
+             echo "开机自启: $(test "$1" = 1 && echo 开启 || echo 关闭)"; return 0 ;;
+        *)   echo "用法: alistctl autostart <0|1>"; return 1 ;;
+    esac
+}
+
+cmd_passwd_set() {
+    local p="${1:-}" n
+    test -n "$p" || { echo "密码不能为空"; return 1; }
+    # 参数值不能含空格/引号(lua 侧会拒)。用 grep 做白名单校验:
+    # case 模式里写不开 & 这种字符(bash 会当控制符切词)。
+    if printf '%s\n' "$p" | grep -q '[^0-9A-Za-z!@#$%^*()_+.,:;<>?/~{}-]'; then
+        echo "密码含不允许的字符(不能有空格、引号、反斜杠、方括号)"; return 1
+    fi
+    n="${#p}"
+    if test "$n" -lt 4; then echo "密码至少 4 位"; return 1; fi
+    if test "$n" -gt 64; then echo "密码最多 64 位"; return 1; fi
+    ensure_dirs
+    ensure_conf || { echo "初始化 AList 配置失败"; return 1; }
+    # 明文密码会打到 stdout, 必须丢掉
+    "$ALIST" admin set "$p" --data "$DATA" >/dev/null 2>&1 || { echo "修改密码失败"; return 1; }
+    rm -f "$INITPWD" 2>/dev/null
+    oc_log "[passwd] 管理员密码已修改"
+    echo "管理员密码已修改"
+    return 0
+}
+
+cmd_log() {
+    local n="${1:-60}"
+    case "$n" in ''|*[!0-9]*) n=60 ;; esac
+    # 每次看日志都顺手裁一次: 只读的话日志可以涨到很大
+    log_trim
+    tail -n "$n" "$LOG" 2>/dev/null || echo "(暂无日志)"
+}
+
+cmd_version() {
+    "$ALIST" version 2>/dev/null | sed -n 's/^Version: //p' | head -n1
+}
+
+case "${1:-}" in
+    start)         shift; cmd_start "${1:-wait}" ;;
+    start-nowait)  cmd_start nowait ;;
+    stop)          cmd_stop ;;
+    restart)       cmd_restart wait ;;
+    status)        cmd_status ;;
+    status-json)   cmd_status_json ;;
+    port)          shift; cmd_port "${1:-}" ;;
+    autostart)     shift; cmd_autostart "${1:-}" ;;
+    passwd)        shift; cmd_passwd_set "${1:-}" ;;
+    log)           shift; cmd_log "${1:-60}" ;;
+    ensure)        ensure_dirs; ensure_password; ensure_conf; log_trim; echo "目录、配置与初始密码已就位" ;;
+    version)       cmd_version ;;
+    *)             sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

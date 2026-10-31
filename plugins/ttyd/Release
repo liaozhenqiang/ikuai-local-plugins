@@ -1,0 +1,5 @@
+plugin=ttyd
+version=1.7.7
+author=WorkBuddy
+title=TTYD 网页终端
+description=在浏览器里直接打开路由器的 root 终端(ttyd 1.7.7 静态构建)，支持启停、自定义端口、访问口令与开机自启。

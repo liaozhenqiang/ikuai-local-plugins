@@ -1,0 +1,142 @@
+# iKuai 远端控制台的交互 shell 配置（bash）
+#
+# 位置说明：放在 pkg/bin/ 而不是 pkg/agent/ —— build.sh 每次都会
+# `rm -rf agent/` 再重建，放在那儿会被清掉。
+#
+# 单独做成文件而不是在 start-xterm.sh 里 heredoc 生成：彩色提示符里全是
+# 反斜杠和方括号，套两层引号写极易出错（第一版就是把 \[\e..\] 放进变量，
+# 结果提示符原样打出了 \[ 和 \e）。
+
+case $- in
+    *i*) ;;
+    *) return ;;
+esac
+
+# 我们打包的现代工具目录（可能为空，用存在性判断即可）
+TOOLS=${TOOLS:-/etc/log/awesun/tools}
+
+# ---- locale ----
+# 这一句**只在 locale 真的不可用时**才退回 C。
+#
+# 不能用无条件 `export LC_ALL=C`：那样 bash 就不把中文当多字节字符，
+# 输入的中文会被显示成 \344\270\255 这种八进制转义、退格也会错位（踩过）。
+# 我们现在用的是自己打包的 glibc 版 bash，配 x11 payload 里的 C.utf8 是好的。
+# 只有退回到固件自带的 uClibc bash 时才需要降级。
+if [ "$(printf '\xc3\xa9' 2>/dev/null)" = "é" ] 2>/dev/null; then
+    : # 当前 locale 能正确处理多字节，不用动
+else
+    export LC_ALL=C LANG=C
+fi
+
+# ---- 彩色提示符 ----
+# \[\e..\] 里的 \[ \] 是给 readline 看的"零宽"标记，必须**直接写在 PS1 里**；
+# 放进中间变量再展开的话，bash 不会把它们当转义处理。
+if [ "$(id -u)" = "0" ]; then
+    PS1='\[\e[38;5;203m\]\u\[\e[0m\]@\[\e[38;5;79m\]\h\[\e[0m\]:\[\e[38;5;214m\]\w\[\e[0m\]# '
+else
+    PS1='\[\e[38;5;39m\]\u\[\e[0m\]@\[\e[38;5;79m\]\h\[\e[0m\]:\[\e[38;5;214m\]\w\[\e[0m\]$ '
+fi
+PS2='\[\e[38;5;244m\]> \[\e[0m\]'
+
+# ---- 别名 ----
+#
+# 这里**不能**写 `alias ls='ls --color=auto || ls -F'` 这种回退。
+# 别名展开后整行变成 `ls --color=auto || ls -F /path`，参数会被吞给第二条命令，
+# 而第一条（不带参数 = 列当前目录）通常都能成功，于是 || 短路、
+# 第二条永远不执行 —— 表现就是 `ls /` 列出来的其实是当前目录。
+# （踩过：用户反馈"ls 看不到别的文件，vi 新建的倒能看到"。）
+#
+# 改成按实际存在的实现决定用哪条，别名里不留分支。
+if [ -x "$TOOLS/usr/bin/ls" ]; then
+    alias ls='ls --color=auto -F'
+else
+    alias ls='ls -F'
+fi
+alias ll='ls -alhF'
+alias la='ls -AhF'
+alias l='ls -CF'
+if [ -x "$TOOLS/usr/bin/grep" ]; then
+    alias grep='grep --color=auto'
+fi
+alias df='df -h'
+alias du='du -sh'
+alias ..='cd ..'
+alias ...='cd ../..'
+
+# ---- 历史和编辑 ----
+HISTSIZE=5000
+HISTFILESIZE=10000
+HISTCONTROL=ignoreboth
+HISTTIMEFORMAT='%F %T '
+shopt -s checkwinsize 2>/dev/null
+shopt -s cdspell 2>/dev/null
+shopt -s histappend 2>/dev/null
+
+# ---- 欢迎信息 ----
+#
+# 只报**系统自身**的信息（跟 Ubuntu 的 motd / landscape-sysinfo 一个路子）：
+# 内核、运行时长、负载、内存、磁盘、IP、时间。
+#
+# 这里**不显示向日葵的识别码/账号**：
+#   - 那是被控端的身份，登录终端的人本来就该在插件页面上看，终端里重复一遍没意义；
+#   - 更关键的是，终端画面会被远控对端看到，把识别码摆在开屏第一屏等于白送。
+# 所以 banner 里只留"这台机器现在什么状态"。
+
+__ik_banner() {
+    local k v mem_t mem_a mem_pct disk_pct ip up load
+
+    # 内核版本
+    k="$(uname -r 2>/dev/null)"
+    v="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' /etc/openwrt_release 2>/dev/null)"
+    [ -n "$v" ] || v="$(cat /etc/version 2>/dev/null)"
+    [ -n "$v" ] || v="iKuai"
+
+    # 运行时长（/proc/uptime 第一列是秒）
+    up="$(awk '{print int($1)}' /proc/uptime 2>/dev/null)"
+    if [ -n "$up" ]; then
+        local d=$((up / 86400)) h=$(((up % 86400) / 3600)) m=$(((up % 3600) / 60))
+        if [ "$d" -gt 0 ]; then up="${d}天 ${h}小时 ${m}分"
+        elif [ "$h" -gt 0 ]; then up="${h}小时 ${m}分"
+        else up="${m}分"; fi
+    else
+        up="未知"
+    fi
+
+    # 负载（1/5/15 分钟）
+    load="$(awk '{printf "%s %s %s", $1, $2, $3}' /proc/loadavg 2>/dev/null)"
+
+    # 内存：MemTotal/MemAvailable 都是 kB
+    mem_t="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
+    mem_a="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)"
+    [ -n "$mem_a" ] || mem_a="$(awk '/^MemFree:/{print $2}' /proc/meminfo 2>/dev/null)"
+    if [ -n "$mem_t" ] && [ -n "$mem_a" ] && [ "$mem_t" -gt 0 ] 2>/dev/null; then
+        mem_pct=$(( (mem_t - mem_a) * 100 / mem_t ))
+        mem="$(( (mem_t - mem_a) / 1024 ))MB / $(( mem_t / 1024 ))MB（${mem_pct}%）"
+    else
+        mem="未知"
+    fi
+
+    # 根分区使用率
+    disk_pct="$(df -k / 2>/dev/null | awk 'NR==2{print $5}')"
+    [ -n "$disk_pct" ] || disk_pct="?"
+
+    # 默认路由所在网卡的 IP（拿不到就退回本机所有非 lo 地址里的第一个）
+    ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+    [ -n "$ip" ] || ip="$(ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | grep -v '^127\.' | head -1)"
+    [ -n "$ip" ] || ip="未知"
+
+    printf '\n'
+    printf '  \e[1m欢迎使用 iKuai 远程控制台\e[0m  \e[2m(%s, Linux %s)\e[0m\n' "$v" "$k"
+    printf '\n'
+    printf '  \e[38;5;79m运行时长\e[0m  %s\n' "$up"
+    printf '  \e[38;5;79m系统负载\e[0m  %s\n' "${load:-未知}"
+    printf '  \e[38;5;79m内存占用\e[0m  %s\n' "$mem"
+    printf '  \e[38;5;79m根分区\e[0m    %s \e[2m(已用)\e[0m\n' "$disk_pct"
+    printf '  \e[38;5;79m本机 IP\e[0m   %s\n' "$ip"
+    printf '  \e[38;5;79m当前时间\e[0m  %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+    printf '\n'
+    printf '  \e[2mTab 补全 · Ctrl-R 搜历史 · Ctrl-L 清屏\e[0m\n'
+    printf '\n'
+}
+__ik_banner
+unset -f __ik_banner

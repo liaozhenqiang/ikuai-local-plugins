@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AdGuard Home 广告拦截</title>
+<style>
+  :root { --bd:#e4e7ed; --fg:#303133; --mut:#909399; --pri:#409eff; --ok:#67c23a; --warn:#e6a23c; --err:#f56c6c; --bg:#f5f7fa; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:14px; font:13px/1.6 "Microsoft YaHei",Helvetica,Arial,sans-serif; color:var(--fg); background:#fff; }
+  h3 { margin:0 0 10px; font-size:15px; }
+  h4 { margin:16px 0 6px; font-size:13px; color:#606266; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; }
+  .card { flex:1 1 150px; min-width:140px; border:1px solid var(--bd); border-radius:6px; padding:10px 12px; background:var(--bg); }
+  .card .k { color:var(--mut); font-size:12px; }
+  .card .v { font-size:16px; font-weight:700; margin-top:2px; word-break:break-all; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .err { color:var(--err); } .mut { color:var(--mut); }
+  pre { margin:0; padding:10px; background:#1e1e1e; color:#d4d4d4; border-radius:5px; max-height:260px; overflow:auto; font:12px/1.5 Consolas,Monaco,monospace; white-space:pre-wrap; }
+  button { cursor:pointer; border:1px solid var(--bd); background:#fff; border-radius:4px; padding:5px 12px; font-size:12px; }
+  button:hover:not(:disabled) { border-color:var(--pri); color:var(--pri); }
+  button.pri { background:var(--pri); border-color:var(--pri); color:#fff; }
+  button.pri:hover:not(:disabled) { background:#66b1ff; color:#fff; }
+  button.dgr { color:var(--err); border-color:#fbc4c4; }
+  button.dgr:hover:not(:disabled) { background:var(--err); border-color:var(--err); color:#fff; }
+  button:disabled { cursor:not-allowed; opacity:.5; }
+  .bar { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  .msg { min-height:18px; font-size:12px; color:var(--mut); }
+  .tag { display:inline-block; padding:1px 8px; border-radius:9px; font-size:11px; color:#fff; background:var(--mut); }
+  .tag.run { background:var(--ok); } .tag.stp { background:var(--err); }
+  .tip { color:var(--mut); font-size:12px; line-height:1.8; }
+  input { border:1px solid var(--bd); border-radius:4px; padding:4px 8px; font-size:12px; }
+  input:focus { outline:none; border-color:var(--pri); }
+  code { background:#f2f3f5; padding:0 4px; border-radius:3px; }
+  .linkbox { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+  .linkbox a { color:var(--pri); text-decoration:none; word-break:break-all; }
+  .linkbox a:hover { text-decoration:underline; }
+  .warnbox { background:#fdf6ec; border:1px solid #faecd8; border-radius:6px; padding:10px 12px; }
+  .cred { background:#fdf6ec; border:1px solid #faecd8; border-radius:6px; padding:10px 12px; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h3 style="margin:0">AdGuard Home 广告拦截</h3>
+  <span class="tag stp" id="tag">检测中…</span>
+  <span style="flex:1"></span>
+  <span class="msg" id="msg"></span>
+  <button onclick="load()">刷新</button>
+</div>
+
+<div class="row" id="cards"></div>
+
+<h4>Web 管理入口</h4>
+<div class="linkbox">
+  <span class="mut">管理地址:</span><a id="webUrl" href="#" target="_blank">—</a>
+  <button id="bOpen" class="pri" onclick="openWeb()">打开管理页</button>
+  <button onclick="copyText(el('webUrl').href)">复制</button>
+</div>
+<div class="cred">
+  <div class="bar" style="margin-bottom:4px">
+    <span>初始登录用户名 <b>admin</b></span>
+    <span style="margin-left:10px">初始密码 <b id="webPass" style="user-select:all"></b></span>
+    <button onclick="copyText(el('webPass').textContent)">复制密码</button>
+  </div>
+  <div class="tip" style="margin:0">
+    密码是插件首次安装时随机生成（兜底为 <code>admin123</code>），请登录后到「设置 → 用户」自行修改。如忘记密码，停止插件后删除
+    <code>/etc/mnt/plugins/adguardhome/data/adg_password.txt</code> 并重启无效——需在管理页「用户」里重置。
+  </div>
+</div>
+
+<h4>服务</h4>
+<div class="bar">
+  <button id="bStart" class="pri" onclick="ctl('start')">启动</button>
+  <button id="bStop"  class="dgr" onclick="ctl('stop')">停止</button>
+  <button id="bRestart" onclick="ctl('restart')">重启</button>
+  <span class="tip">改端口会自动重启生效</span>
+</div>
+
+<h4>设置</h4>
+<div class="bar">
+  DNS 端口 <input id="dnsport" size="6" maxlength="5" placeholder="53">
+  <button class="pri" onclick="savePort('dnsport')">保存</button>
+  <span class="tip">默认 <b>53</b> —— 接管局域网的 DNS 查询；改了之后「DNS 劫持」规则会自动跟随新端口</span>
+</div>
+<div class="bar">
+  Web 端口 <input id="webport" size="6" maxlength="5" placeholder="3000">
+  <button class="pri" onclick="savePort('webport')">保存</button>
+  <span class="tip">默认 <b>3000</b>；占用时会自动保留旧端口</span>
+</div>
+<div class="bar">
+  DNS 劫持（重定向全局 53）
+  <button id="bHijack1" onclick="saveHijack(1)">开启</button>
+  <button id="bHijack0" onclick="saveHijack(0)">关闭</button>
+  <span class="tip">开启后把所有发往 53 端口的 DNS 流量重定向到本插件，实现整网广告拦截</span>
+</div>
+<div class="bar">
+  开机自启
+  <button id="bAuto1" onclick="saveAuto(1)">开启</button>
+  <button id="bAuto0" onclick="saveAuto(0)">关闭</button>
+</div>
+<div class="bar">
+  上游 DNS
+  <button id="bUpAuto" onclick="saveUp('auto')">自动</button>
+  <button id="bUpDoh" onclick="saveUp('doh')">公共 DoH</button>
+  <button id="bUpOc" onclick="saveUp('oc')">OpenClash 串联</button>
+  <span style="width:6px"></span>
+  <input id="upAddr" size="24" maxlength="80" placeholder="自定义上游，如 127.0.0.1:7874">
+  <button class="pri" onclick="saveUpCustom()">保存自定义</button>
+</div>
+<div class="tip" id="upTip" style="margin:2px 0 10px">—</div>
+
+<p class="tip">
+  AdGuard Home 是在 <b>DNS 层</b>做广告 / 追踪 / 钓鱼拦截，不依赖浏览器插件。<br>
+  <b>与 OpenClash 共存：</b>「上游 DNS」选 <b>自动</b> 时，插件会检测是否装了 OpenClash——有则自动把上游指向它的 DNS(7874)，
+  实现「先去广告 → 再防污染/域名分流」的串联，两插件互不干扰、无需手动改配置；没装 OpenClash 时自动退回公共 DoH 独立运行。
+  想强制独立走公共 DoH 就点「公共 DoH」，想强制串联就点「OpenClash 串联」。<br>
+  过滤规则、客户端管理、统计都在 <b>Web 管理页</b>里配置；插件只负责把它跑起来并管好端口、劫持与上游。
+</p>
+
+<h4>运行日志 <button onclick="loadLog()">刷新日志</button> <button class="dgr" onclick="clearLog()">清空日志</button></h4>
+<pre id="log">（点「刷新日志」查看）</pre>
+
+<script>
+function el(id){ return document.getElementById(id); }
+function tip(t, cls){
+  var m = el('msg'); m.textContent = t || ''; m.className = (cls || 'msg');
+  if (t) { setTimeout(function(){ if (m.textContent===t) m.textContent=''; }, 6000); }
+}
+function copyText(t){
+  t = String(t || '');
+  if (!t || t === '—') return;
+  var done = function(){ tip('已复制', 'msg ok'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(done, function(){ fallback(); });
+  } else { fallback(); }
+  function fallback(){
+    var ta = document.createElement('textarea');
+    ta.value = t; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch(e){}
+    document.body.removeChild(ta);
+  }
+}
+function fmtUp(s){
+  s = Number(s || 0);
+  var d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d > 0) return d + '天' + h + '时';
+  if (h > 0) return h + '时' + m + '分';
+  return m + '分';
+}
+function api(action, param, opt){
+  opt = opt || {};
+  var ms = opt.timeout || 20000;
+  var ab = (typeof AbortController === 'function') ? new AbortController() : null;
+  var timer = null;
+  var init = { method:'POST', headers:{'Content-Type':'application/json'},
+               body: JSON.stringify({ func_name:'adguardhome', action:action, param:param||{} }) };
+  if (ab) { init.signal = ab.signal; timer = setTimeout(function(){ ab.abort(); }, ms); }
+  return fetch('/Action/call', init).then(function(r){ return r.json(); }).then(function(j){
+    if (timer) clearTimeout(timer);
+    if (j.Result !== 30000) throw new Error(j.ErrMsg || ('错误码 ' + j.Result));
+    return j.Data || {};
+  }).catch(function(e){
+    if (timer) clearTimeout(timer);
+    if (e.name === 'AbortError') throw new Error('后端 ' + Math.round(ms/1000) + ' 秒无响应(action=' + action + ')');
+    throw e;
+  });
+}
+
+var S = null;
+
+function load(){ return api('show', {TYPE:'status'}).then(render).catch(function(e){ tip('加载失败: '+e.message, 'msg err'); }); }
+
+function card(k, v, cls){
+  return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';
+}
+function esc(t){
+  return String(t == null ? '' : t).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+function setSegUI(base, v){
+  var on = (v == 1 || v === '1' || v === true);
+  el(base+'1').className = on ? 'pri' : '';
+  el(base+'0').className = on ? '' : 'dgr';
+}
+
+function render(d){
+  var s = d && d.status;
+  if (!s || typeof s !== 'object') { tip('后端没有返回状态数据', 'msg err'); return; }
+  S = s;
+  var run = s.running === true;
+  var tag = el('tag');
+  tag.textContent = run ? '运行中' : '未运行';
+  tag.className = 'tag ' + (run ? 'run' : 'stp');
+
+  var host = (typeof location !== 'undefined' && location && location.hostname) ? location.hostname : '';
+  var url = host ? ('http://' + host + ':' + (s.webport || 3000) + '/') : (s.web_url || '#');
+  el('webUrl').textContent = url; el('webUrl').href = url;
+  el('bOpen').disabled = !run;
+
+  el('bStart').disabled = run; el('bStop').disabled = !run; el('bRestart').disabled = !run;
+
+  if (document.activeElement.id !== 'dnsport') el('dnsport').value = s.dnsport || '';
+  if (document.activeElement.id !== 'webport') el('webport').value = s.webport || '';
+  el('webPass').textContent = s.password || '';
+  setSegUI('bHijack', s.hijack);
+  setSegUI('bAuto', s.autostart);
+
+  var up = s.upstream || 'auto';
+  var upeff = s.upstream_eff || up;
+  upSeg(up);
+  el('upTip').textContent = '当前：' + upLabel(up) + '（' + upEffText(upeff) + '）';
+  if (up === 'custom' && document.activeElement.id !== 'upAddr') el('upAddr').value = s.upstream_addr || '';
+
+  var wc = String(s.web_code == null ? '' : s.web_code);
+  var webTxt = '未运行', webCls = 'err';
+  if (run) {
+    if (wc === '200' || wc === '302' || wc === '307' || wc === '401') { webTxt = '正常 (' + wc + ')'; webCls = 'ok'; }
+    else if (wc === '' || wc === '000') { webTxt = '端口无响应'; webCls = 'err'; }
+    else { webTxt = 'HTTP ' + wc; webCls = 'warn'; }
+  }
+  var dl = (s.dns_listen === 1 || s.dns_listen === true);
+  var dnsTxt = run ? (dl ? '监听中' : '未监听') : '—';
+  var dnsCls = run ? (dl ? 'ok' : 'err') : 'err';
+
+  var html = '';
+  html += card('运行状态', run ? '运行中' : '未运行', run ? 'ok' : 'err');
+  html += card('DNS 端口', (s.dnsport || '-') + ' / ' + dnsTxt, dnsCls);
+  html += card('Web 端口', webTxt, webCls);
+  html += card('运行时长', run ? fmtUp(s.uptime) : '—');
+  html += card('版本', 'v' + (s.version || '-'));
+  el('cards').innerHTML = html;
+
+  if (!run) {
+    tip('服务未运行 —— 请先点上面的「启动」。', 'warnbox');
+  } else if (webCls === 'err') {
+    tip('进程在运行，但 Web ' + (s.webport || 3000) + ' 端口没有响应（curl 返回 ' + (wc || '空') + '）。多半是端口被占用，请换一个 Web 端口。', 'warnbox');
+  } else if (!dl) {
+    tip('Web 正常但 DNS ' + (s.dnsport || 53) + ' 未监听，客户端 DNS 解析会失败，请检查端口冲突。', 'warnbox');
+  } else {
+    tip('AdGuard Home 已就绪，管理页：' + url);
+  }
+}
+
+function ctl(op){
+  tip('执行中 …');
+  return api(op, {}).then(function(){ tip('已' + ({start:'启动',stop:'停止',restart:'重启'}[op]||op), 'msg ok'); return load(); })
+    .catch(function(e){ tip('操作失败: ' + e.message, 'msg err'); });
+}
+
+function savePort(k){
+  var v = String(el(k).value || '').replace(/^\s+|\s+$/g, '');
+  if (!/^\d+$/.test(v)) { tip('端口必须是数字', 'msg err'); return; }
+  if (Number(v) < 1 || Number(v) > 65535) { tip('端口需在 1~65535', 'msg err'); return; }
+  if (v === '80' || v === '443') { tip('80/443 为 iKuai 控制台端口, 请换端口', 'msg err'); return; }
+  tip('保存中(会重启服务) …');
+  api('seting', {key:k, value:v}).then(function(){ tip('已保存并重启', 'msg ok'); return load(); })
+    .catch(function(e){ tip('保存失败: ' + e.message, 'msg err'); });
+}
+
+function saveHijack(v){
+  api('seting', {key:'hijack', value:String(v)}).then(function(){
+    tip(v ? 'DNS 劫持已开启' : 'DNS 劫持已关闭', 'msg ok');
+    setSegUI('bHijack', v);
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+
+function saveAuto(v){
+  api('seting', {key:'autostart', value:String(v)}).then(function(){
+    tip(v ? '开机自启已开启' : '开机自启已关闭', 'msg ok');
+    setSegUI('bAuto', v);
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+
+function upLabel(m){ return {auto:'自动', doh:'公共 DoH', oc:'OpenClash 串联', custom:'自定义'}[m] || m; }
+function upEffText(eff){
+  return {oc:'已检测到 OpenClash，串联其 DNS(7874)', doh:'独立运行，走公共 DoH', custom:'自定义上游'}[eff] || eff;
+}
+function upSeg(v){
+  el('bUpAuto').className = (v === 'auto') ? 'pri' : '';
+  el('bUpDoh').className = (v === 'doh') ? 'pri' : '';
+  el('bUpOc').className = (v === 'oc') ? 'pri' : '';
+}
+function saveUp(mode){
+  api('seting', {key:'upstream', value:mode}).then(function(){
+    tip('上游已设为 ' + upLabel(mode), 'msg ok');
+    return load();
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+function saveUpCustom(){
+  var a = String(el('upAddr').value || '').replace(/^\s+|\s+$/g, '');
+  if (!a) { tip('请输入自定义上游地址', 'msg err'); return; }
+  api('seting', {key:'upstream', value:'custom:'+a}).then(function(){
+    tip('上游已设为自定义 ' + a, 'msg ok');
+    return load();
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+
+function openWeb(){ var u = el('webUrl').href; if (u && u !== '#') window.open(u, '_blank'); }
+
+function loadLog(){
+  el('log').textContent = '读取中 …';
+  return api('show', {TYPE:'log'}).then(function(d){
+    el('log').textContent = d.log || '(无日志)';
+  }).catch(function(e){ el('log').textContent = '读取失败: ' + e.message; });
+}
+function clearLog(){
+  if (!confirm('确定清空运行日志吗？')) return;
+  api('logclear', {}).then(function(){ tip('日志已清空', 'msg ok'); return loadLog(); })
+    .catch(function(e){ tip('清空失败: ' + e.message, 'msg err'); });
+}
+
+
+load();
+</script>
+</body>
+</html>

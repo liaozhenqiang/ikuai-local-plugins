@@ -1,0 +1,1315 @@
+#!/bin/bash
+# awesunctl —— 向日葵（awesuncli）+ 虚拟桌面 插件控制脚本
+#
+#   awesunctl setup            解包 runtime（插件包内自带）并布置环境（安装时调）
+#   awesunctl boot             开机：还原身份 -> 重建软链 -> 拉进程
+#   awesunctl start | stop     手动起停
+#   awesunctl status           现状
+#   awesunctl ident-save       把当前身份凭证存到 data/identity/
+#   awesunctl ident-show       看凭证内容
+#   awesunctl ident-restore    从凭证还原身份
+#   awesunctl code             读当前本机验证码
+#   awesunctl console          进 awesuncli 交互 shell
+#
+# 目录约定：
+#   插件本体     /etc/mnt/plugins/awesun
+#   运行环境     /etc/log/awesun            （15.5G 持久分区）
+#   身份凭证     /etc/mnt/plugins/awesun/data/identity/
+#
+# 运行环境全部随插件包分发（pkg/payload/*.tar.gz），setup 只解包 + 建软链，
+# 不做任何网络访问。
+set -u
+
+# ---------- 路径 ----------
+SELF="$0"
+case "$SELF" in
+    */*) : ;;
+    *)   SELF="$(command -v "$SELF" 2>/dev/null || echo "$SELF")" ;;
+esac
+SELF="$(readlink -f "$SELF" 2>/dev/null || echo "$SELF")"
+PLUGIN_DIR="${PLUGIN_DIR:-$(dirname "$(dirname "$SELF")")}"
+
+DATA="$PLUGIN_DIR/data"
+# 身份凭证目录。放 /etc/log/awesun（持久分区）而不是插件 data/，
+# 原因：插件重新安装/升级会重建 data/，而身份是"设备自己的东西"，
+# 不该跟着插件版本走。这里也跟早期已经存下的那份保持一致。
+IDENT_DIR="${AWESUN_IDENT_DIR:-/etc/log/awesun/identity}"
+
+RT=/etc/log/awesun            # runtime 根
+RT_APP="$RT/app"              # 向日葵本体（自带 glibc）
+RT_X11="$RT/x11"              # Xvfb + xterm + 字体 + locale
+RT_BIN="$RT/bin"              # 我们自己的二进制（每次开机从插件目录布置过来）
+RT_TOOLS="$RT/tools"          # 现代命令行工具（bash/coreutils…）
+RT_WEBKIT="$RT/webkit"        # WebKit 运行时（渲染 iKuai 网页后台；软链到插件包里那份）
+RT_FILES="$RT/files"          # 向日葵收发文件落盘的地方（根分区太小，挪过来）
+# 各类缓存的落点。**必须挪到数据盘**：WebKit 那套 GL（gallium/mesa）默认把着色器
+# 缓存写到 $HOME/.cache —— 也就是根分区。而根分区只有 113MB、长期 100% 占满，
+# 实测被它写进去 1MB 之后连一个目录都建不出来（`mkdir: No space left on device`），
+# 直接导致框架铺不出插件卡片（"装了插件但插件管理里看不到"）。
+# 由 start_web_screen 通过 XDG_CACHE_HOME / MESA_SHADER_CACHE_DIR 指过来。
+RT_CACHE="$RT/cache"
+# 注意：**不要**把进程的 TMPDIR 指到这里。踩过两次 ——
+#   一次是目录没建出来（TMPDIR 指向不存在的路径，需要临时文件的程序直接退出），
+#   一次是向日葵本体拿到陌生的 HOME/TMPDIR 后行为异常。
+# 系统自带的 /tmp 是 tmpfs（1.7GB 可用、重启即清），本来就该用它；
+# 我们只在需要"跨重启留存"的东西上才用 $RT。
+RT_TMP="$RT/tmp"
+AGENT_SRC="$PLUGIN_DIR/agent" # 自研二进制随插件包走：升级插件即升级它们
+RT_LOG="$RT/log"
+PIDDIR="$RT/pid"
+
+DISPLAY_NUM=:99
+# 屏幕分辨率由我们决定（这正是接管 OpenFb 的意义）：
+# 设备 fb0 只有 800x600，向日葵默认播这个分辨率，一个终端窗口装不下几行。
+# 这里用 1280x720，xterm 按实测字符单元算出来是 105x32，底部/右侧都不溢出。
+SCREEN_SIZE="${AWESUN_SCREEN:-1280x720}"
+IDENT_IF=slid0                # 老版本建的辅助网卡（现在只用来清理它）
+
+# 虚拟屏幕配置。**一行一屏**，按顺序对应 Xvfb 的 -screen 0/1/2...
+#   <类型> <宽>x<高> <目标>
+#     web   <网址|->  用 WebKit 打开网页；- 表示爱快自己的页面
+#     shell <程序|->  跑终端；程序留空/- 是交互式 shell，也可以写 top 之类
+#     blank -         空屏，只铺底色
+# 文件不存在时按默认来（一块 1280x720 的爱快页面）。
+# 每块屏的分辨率独立（Xvfb 支持 -screen N WxHxD），屏数也由它决定。
+SCREENS_CONF="$DATA/screens.conf"
+SCREEN_MAX=8
+
+# glibc 库的落点。**放在数据盘上，然后 bind 挂到 /lib/x86_64-linux-gnu**：
+#
+# 根分区只有 111MB 且常年 100% 满（连 ext4 保留块都吃光）。实测在那种状态下
+# 往 /lib 里**新建**任何条目都会 ENOSPC，表现是 bash/top/Xvfb 报
+#   "libtinfo.so.6: cannot open shared object file"
+# —— 因为"不带版本号"的那个 .so 名还没建出来（带版本号的建好了）。
+# 挂到 15.5G 的 /etc/log 上就彻底没有这个问题，而且**不需要在根分区新建任何条目**
+# （挂载点 /lib/x86_64-linux-gnu 本来就在）。
+SYSLIB="$RT/syslib"
+
+# 运行环境包就在插件目录里
+PAYLOAD_DIR="$PLUGIN_DIR/payload"
+
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+die() { echo "!! $*" >&2; exit 1; }
+
+# ---------- 通用 ----------
+kill_pat() {
+    for p in $(ps 2>/dev/null | grep -E "$1" | grep -v grep | awk '{print $1}'); do
+        kill -9 "$p" 2>/dev/null
+    done
+}
+
+pidfile_alive() {
+    [ -f "$1" ] || return 1
+    kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null
+}
+
+fb_size() {
+    local s=""
+    [ -r /sys/class/graphics/fb0/virtual_size ] && s=$(cat /sys/class/graphics/fb0/virtual_size)
+    case "$s" in
+        [0-9]*,[0-9]*) echo "${s%,*}x${s#*,}" ;;
+        *) echo "800x600" ;;
+    esac
+}
+
+# ================= 身份凭证 =================
+# 事实（本仓库 docs/reverse-engineering.md 有实验记录）：
+#   向日葵的全部身份只存在两个文件里：
+#     /etc/orayentconfig.conf   macaddress / hostname / ent_account ...
+#     /etc/sys_ent_config.conf  fastcode(识别码) / license / fastcodepsw / 验证码
+#   而**识别码 = f(本机某张网卡的 MAC)**，配置文件里的 fastcode 只是缓存，
+#   daemon 启动时会拿真实网卡校正 macaddress，对不上就重新生成身份。
+#   所以"换设备复用身份"的钥匙是 **MAC**，不是 fastcode：
+#   只要设备上存在一张 MAC 等于凭证里 macaddress 的网卡，身份就完整复现，
+#   连带 license 与账号绑定一起生效，**不需要保存账号密码**。
+
+ident_mac() {
+    grep -m1 '^macaddress=' "$IDENT_DIR/orayentconfig.conf" 2>/dev/null | cut -d= -f2- | tr -d ' \r'
+}
+
+ident_cur_mac() {
+    grep -m1 '^macaddress=' /etc/orayentconfig.conf 2>/dev/null | cut -d= -f2- | tr -d ' \r'
+}
+
+ident_cur_fastcode() {
+    grep -m1 '^fastcode=' /etc/sys_ent_config.conf 2>/dev/null | cut -d= -f2- | tr -d ' \r'
+}
+
+# 保证本机有一张 MAC == $1 的网卡（换机场景才需要造）
+# 让向日葵"看到"我们指定的 MAC。
+#
+# **不再真建网卡**。老做法是 `ip link add slid0 type dummy` + `set address`，
+# 那会在 iKuai 的网卡列表里凭空多出一张网卡（还会影响路由/网卡页）。
+# 现在改成由 LD_PRELOAD 钩子（`libawesun_hook.so` 里拦 `getifaddrs` 与
+# `ioctl(SIOCGIFHWADDR)`）**只对向日葵进程**伪装 MAC：
+# 实证过 awesuncli 里带着 `getifaddrs` / `getifaddrs err` / `SIOCGIFCONF`，
+# 拦 getifaddrs 就够（真机验证：删掉 slid0 后识别码保持不变）。
+#
+# 这里只做两件事：清掉老版本留下的辅助网卡（幂等）；确认钩子挂上了。
+# 钩子是 MAC 伪装的唯一依靠，没挂上就必须报出来 —— 那种情况下识别码会变。
+ident_mac_ensure() {
+    local mac="$1"
+    [ -n "$mac" ] || return 0
+
+    if ip link 2>/dev/null | grep -q "$IDENT_IF:"; then
+        ip link del "$IDENT_IF" 2>/dev/null && log "已清掉旧版留下的辅助网卡 $IDENT_IF"
+    fi
+
+    # 钩子在不在看 ELF 里有没有 DT_NEEDED，不看 /etc/ld.so.preload
+    if grep -qa 'libawesun_hook.so' "$RT_APP/bin/awesuncli" 2>/dev/null \
+       && [ -f "$RT_APP/lib/libawesun_hook.so" ]; then
+        log "MAC 由钩子伪装（$mac），不建辅助网卡"
+    else
+        log "!! 钩子没内建进 ELF（$RT_APP/bin/awesuncli / $RT_APP/lib/libawesun_hook.so）"
+        log "!! 这种状态下向日葵读到的是真 MAC，识别码会变"
+    fi
+}
+
+ident_save() {
+    [ -f /etc/sys_ent_config.conf ] || die "设备上没有 /etc/sys_ent_config.conf，向日葵还没起来？"
+    [ -f /etc/orayentconfig.conf ] || die "设备上没有 /etc/orayentconfig.conf"
+    mkdir -p "$IDENT_DIR"
+    cp -p /etc/orayentconfig.conf "$IDENT_DIR/"
+    cp -p /etc/sys_ent_config.conf "$IDENT_DIR/"
+    {
+        echo "saved_at=$(date '+%F %T')"
+        echo "macaddress=$(ident_cur_mac)"
+        echo "fastcode=$(ident_cur_fastcode)"
+        echo "account=$(grep -m1 '^account=' /etc/orayentconfig.conf 2>/dev/null | cut -d= -f2-)"
+        echo "license=$(grep -m1 '^license=' /etc/sys_ent_config.conf 2>/dev/null | cut -d= -f2-)"
+    } > "$IDENT_DIR/meta"
+    log "身份凭证已保存到 $IDENT_DIR"
+    ident_show
+}
+
+# （原 sed 身份锁 ident_lock_apply 已删除：改由 libawesun_hook.so 的函数钩子
+#   在落盘处拦截，见 src/hook/src/monitor.rs 的 conf_set_detour。
+#   那套 sed 做法的问题是：抢占式改写配置文件、和向日葵自己的写盘打架、
+#   而且每 5 秒一轮 —— 属于治标。现在钩子在**值落盘之前**就换掉了。）
+
+# 读"当前本机验证码"（明文）。
+#
+# 怎么来的：算法已完整还原（改造版 Blowfish，见 src/hook/src/monitor.rs 的 Blowfish 段）。
+# 钩子库跑在向日葵进程里，启动时就把 encry_pwd 解出来了；这里只是让它按需再算一次
+# 并把结果读回来 —— **纯本地计算**，不调客户端解密函数（那个会崩）、不发网络请求、
+# 不涉及绑定。
+#
+# 密钥规则：`sunlogincode`(葵码) + 默认串 "%^$^GHsgjdsad24dffgjkdhw4"；
+# 葵码为空时就是默认串。
+cmd_code() {
+    local RT=/etc/log/awesun
+    rm -f "$RT/access-code"
+    : > "$RT/refresh-code"
+    local i=0
+    while [ "$i" -lt 10 ]; do
+        sleep 1
+        if [ -s "$RT/access-code" ]; then
+            break
+        fi
+        i=$((i + 1))
+    done
+    local c
+    c="$(grep -m1 '^code=' "$RT/access-code" 2>/dev/null | cut -d= -f2-)"
+    if [ -n "$c" ]; then
+        echo "$c"
+    else
+        echo "取码失败（钩子没跑在向日葵进程里？看 $RT/hook.log 里的 [验证码] 行）" >&2
+        return 1
+    fi
+}
+
+ident_restore() {
+    [ -f "$IDENT_DIR/sys_ent_config.conf" ] || { log "没有身份凭证备份，跳过"; return 0; }
+
+    # ================= 第一件：固定网卡 MAC（**与绑定与否无关，无条件做**）=================
+    #
+    # 为什么必须无条件：**识别码 = f(本机某块网卡的真实 MAC)**（见 src/hook/src/mac.rs），
+    # 而钩子的 MAC 值就是从这个文件的 `macaddress=` 读的。这个文件一旦丢了/被客户端重写
+    # 掉 macaddress=，钩子就不干预了 —— 向日葵按**真 MAC** 算出**另一个识别码**。
+    # 所以"未绑定"绝不能把这一条也跳过（踩过：加了未绑定守卫后 MAC 一起不固定了）。
+    local mac
+    mac="$(ident_mac)"
+    if [ -n "$mac" ]; then
+        local cur
+        cur="$(ident_cur_mac)"
+        if [ "$cur" != "$mac" ]; then
+            if grep -q '^macaddress=' /etc/orayentconfig.conf 2>/dev/null; then
+                sed -i "s/^macaddress=.*/macaddress=$mac/" /etc/orayentconfig.conf
+            else
+                sed -i "/^\[base\]/a macaddress=$mac" /etc/orayentconfig.conf
+            fi
+            log "macaddress 纠正为 $mac（原 ${cur:-无}）—— 识别码按它算"
+        fi
+        log "固定网卡 MAC（mac=$mac）"
+        ident_mac_ensure "$mac"
+    else
+        log "!! 凭证里没有 MAC，无法固定网卡 MAC（识别码会随真 MAC 变）"
+    fi
+
+    # ================= 第二件：还原设备身份（含 fastcode/license）=================
+    #
+    # **备份是什么状态就还原成什么状态**（要不要绑定看备份里有没有 account=，
+    # 不在这里判）—— 目的是让**识别码固定**：
+    #   未绑定设备本身没有 license 口令（licensepsw 空），客户端用不了它那份 license，
+    #   于是**每次开机都重新注册**，fastcode/license 每次都换（实测连启两次拿到
+    #   k511188650 -> k511165174 -> k511191171 三个不同识别码）。
+    #   所以必须每次开机把存下来的那份身份抄回去，把它钉住。
+    #
+    # 踩过的两个极端（都错）：
+    #   - 无条件抄一份**绑定期**的备份 -> 未绑定设备被拉回绑定（account 又出现）
+    #   - "未绑定就不抄" -> 识别码每次重启都变（就是用户报的现象）
+    cp -p "$IDENT_DIR/orayentconfig.conf" /etc/orayentconfig.conf
+    cp -p "$IDENT_DIR/sys_ent_config.conf" /etc/sys_ent_config.conf
+    log "已还原身份：$(ident_cur_mac) / $(ident_cur_fastcode)"
+}
+
+ident_show() {
+    echo "--- 身份凭证 ---"
+    echo "凭证目录: $IDENT_DIR"
+    if [ -f "$IDENT_DIR/meta" ]; then
+        sed 's/^/  /' "$IDENT_DIR/meta"
+    else
+        echo "  （还没有凭证，登录成功后跑 awesunctl ident-save）"
+    fi
+    echo "--- 设备当前 ---"
+    echo "  macaddress = $(ident_cur_mac)"
+    echo "  fastcode   = $(ident_cur_fastcode)"
+    echo "  account    = $(grep -m1 '^account=' /etc/orayentconfig.conf 2>/dev/null | cut -d= -f2-)"
+    echo "  license    = $(grep -m1 '^license=' /etc/sys_ent_config.conf 2>/dev/null | cut -d= -f2-)"
+    echo "  /etc 里有配置文件: $([ -f /etc/sys_ent_config.conf ] && echo 是 || echo 否)"
+}
+
+# ================= runtime =================
+# 运行环境全部来自插件包自己的 payload/，不做任何网络访问。
+unpack_payload() {   # unpack_payload <文件名> <目标目录>
+    local name="$1" dest="$2"
+    [ -f "$PAYLOAD_DIR/$name" ] || die "插件包里没有 payload/$name"
+    rm -rf "$dest"; mkdir -p "$dest"
+    tar xzf "$PAYLOAD_DIR/$name" -C "$dest" || die "解包 $name 失败"
+}
+
+ensure_runtime() {
+    local have=1
+
+    [ -x "$RT_APP/bin/awesuncli_daemon" ] || have=0
+    [ -x "$RT_X11/bin/Xvfb" ] || have=0
+
+    if [ "$have" = 1 ]; then
+        log "runtime 已就绪"
+    else
+        ensure_runtime_dirs
+        if [ ! -x "$RT_APP/bin/awesuncli_daemon" ]; then
+            unpack_payload awesun-runtime.tar.gz "$RT_APP"
+            chmod +x "$RT_APP/awsrun" "$RT_APP/bin/"* 2>/dev/null
+            log "awesun-runtime 就绪"
+        fi
+        if [ ! -x "$RT_X11/bin/Xvfb" ]; then
+            unpack_payload x11-runtime.tar.gz "$RT_X11"
+            chmod +x "$RT_X11/bin/"* 2>/dev/null
+            log "x11-runtime 就绪"
+        fi
+        log "runtime 就绪"
+    fi
+
+    # WebKit 软链到插件包里那份，就地使用不复制
+    if [ -x "$PAYLOAD_DIR/webkit/run.sh" ]; then
+        local want="$PAYLOAD_DIR/webkit"
+        if [ ! -L "$RT_WEBKIT" ] || [ "$(readlink "$RT_WEBKIT")" != "$want" ]; then
+            rm -rf "$RT_WEBKIT"
+            ln -sfn "$want" "$RT_WEBKIT"
+            log "WebKit 运行时就绪"
+        fi
+        chmod +x "$RT_WEBKIT/run.sh" "$RT_WEBKIT/exec/"* 2>/dev/null || true
+    fi
+
+    # 界面/会话相关的默认配置。**不覆盖已有值**（用户改过的要留着）
+    mkdir -p "$DATA" 2>/dev/null
+    if [ ! -f "$DATA/webui.conf" ]; then
+        # 自动登录用：填了账号密码，网页屏打开 iKuai 后台时会自动登录
+        cat > "$DATA/webui.conf" <<'WCONF'
+# iKuai 后台的登录凭据，用于网页屏的自动登录。
+# 只对"本机 iKuai 后台"生效；指向外部网址时不会填。
+user=
+pass=
+# 1=开自动登录，0=关
+autologin=1
+WCONF
+        chmod 600 "$DATA/webui.conf" 2>/dev/null
+    fi
+
+    # 向日葵自己的日志目录（它写死了 /var/log/awesuncli）
+    mkdir -p "$RT_APP/var-log"
+}
+
+# 把插件目录里的自研二进制布置到 runtime/bin。
+# 放插件目录而不是 /etc/log/awesun/bin，是为了它们跟插件版本一起走：
+# 升级插件 = 升级钩子和画面生产者，不用另外分发。
+install_agent() {
+    [ -d "$AGENT_SRC" ] || { log "没有 $AGENT_SRC，跳过自研二进制布置"; return 0; }
+    mkdir -p "$RT_BIN"
+    # 清掉被淘汰的旧组件（早期"镜像 fb0 + uinput 垫片 + 自绘 TUI"那套），
+    # 不然它们会一直躺在 runtime/bin 里让人误以为还在用
+    rm -f "$RT_BIN/fbbridge" "$RT_BIN/ikuai-tui" "$RT_BIN/libuinput_shim.so" 2>/dev/null
+    local f
+    for f in "$AGENT_SRC"/*; do
+        [ -f "$f" ] || continue
+        cp -f "$f" "$RT_BIN/$(basename "$f")"
+    done
+    chmod +x "$RT_BIN/awescreen" 2>/dev/null
+    log "自研二进制: $(ls "$RT_BIN" 2>/dev/null | tr '\n' ' ')"
+}
+
+# 自带中文字体 + fontconfig 配置。
+#
+# 为什么要自带：设备上只有**文泉驿微米黑**一个中文字体（点阵时代的设计），
+# 而 X11 payload 里那份 fonts.conf 只有 184 字节，把 fontconfig 的默认渲染规则
+# 整个替换掉了 —— 结果 12~13px 的中文笔画糊、粗细不匀，在向日葵那种有损视频流
+# 里更容易糊成一片。这里换成 **Noto Sans CJK SC**（= Adobe 思源黑体，
+# SIL OFL 1.1，可商用），Regular + Bold 两个字重都带：
+# 只给 Regular 的话，页面里 font-weight:600/700 只能靠**合成加粗**，
+# 小字号会糊成一团，比不加粗还难看。
+#
+# 放在插件自己的目录（$RT/fonts + $RT/etc/fonts），**不走 X11 payload 那份**：
+# payload 重装、或者它自己重写，都不会把我这份冲掉。
+install_fonts() {
+    local src="$AGENT_SRC/fonts" fdst="$RT/fonts" cdst="$RT/etc/fonts" f n=0
+    mkdir -p "$fdst" "$cdst" 2>/dev/null
+
+    if [ -d "$src" ]; then
+        for f in "$src"/*.otf "$src"/*.ttf "$src"/*.ttc; do
+            [ -f "$f" ] || continue
+            # 大小一致就不重复拷（两个字重 20MB，每次开机搬一遍没必要）
+            if [ -f "$fdst/$(basename "$f")" ] && \
+               [ "$(stat -c%s "$f" 2>/dev/null)" = "$(stat -c%s "$fdst/$(basename "$f")" 2>/dev/null)" ]; then
+                n=$((n + 1)); continue
+            fi
+            cp -f "$f" "$fdst/" && n=$((n + 1))
+        done
+    fi
+
+    # 这个文件是**替换** fontconfig 默认配置的（FONTCONFIG_FILE 指向它），
+    # 所以渲染规则必须自己补全；不补就会又细又飘（X11 那份就是这么来的）。
+    cat > "$cdst/fonts.conf" <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <!-- 我们自带的中文字体（思源黑体） -->
+  <dir>$fdst</dir>
+  <!-- X11 payload 自带的兜底字体：DejaVu（拉丁/等宽）+ 文泉驿（生僻字） -->
+  <dir>$RT_X11/share/fonts</dir>
+  <cachedir>$RT/fontcache</cachedir>
+
+  <match target="font">
+    <edit name="antialias"      mode="assign"><bool>true</bool></edit>
+    <edit name="hinting"        mode="assign"><bool>true</bool></edit>
+    <edit name="hintstyle"      mode="assign"><const>hintfull</const></edit>
+    <edit name="rgba"           mode="assign"><const>none</const></edit>
+    <edit name="autohint"       mode="assign"><bool>false</bool></edit>
+    <edit name="embeddedbitmap" mode="assign"><bool>true</bool></edit>
+  </match>
+
+  <!-- CSS 里那些族名设备上都没有，统一指到自带的字体上；
+       中英同源还能避免"拉丁用一套、中文用另一套"导致的基线不齐 -->
+  <alias binding="strong">
+    <family>sans-serif</family>
+    <prefer><family>Noto Sans CJK SC</family><family>DejaVu Sans</family></prefer>
+  </alias>
+  <alias binding="strong">
+    <family>sans</family>
+    <prefer><family>Noto Sans CJK SC</family><family>DejaVu Sans</family></prefer>
+  </alias>
+  <alias binding="strong"><family>Helvetica</family>
+    <prefer><family>Noto Sans CJK SC</family><family>DejaVu Sans</family></prefer></alias>
+  <alias binding="strong"><family>Arial</family>
+    <prefer><family>Noto Sans CJK SC</family><family>DejaVu Sans</family></prefer></alias>
+  <alias binding="strong"><family>Segoe UI</family>
+    <prefer><family>Noto Sans CJK SC</family></prefer></alias>
+  <alias binding="strong"><family>PingFang SC</family>
+    <prefer><family>Noto Sans CJK SC</family></prefer></alias>
+  <alias binding="strong"><family>Hiragino Sans GB</family>
+    <prefer><family>Noto Sans CJK SC</family></prefer></alias>
+  <alias binding="strong"><family>Microsoft YaHei</family>
+    <prefer><family>Noto Sans CJK SC</family></prefer></alias>
+  <alias binding="strong"><family>WenQuanYi Micro Hei</family>
+    <prefer><family>Noto Sans CJK SC</family></prefer></alias>
+  <!-- 等宽仍用 DejaVu Sans Mono：识别码/葵码/代码块都是数字字母，它更清楚 -->
+  <alias binding="strong">
+    <family>monospace</family>
+    <prefer><family>DejaVu Sans Mono</family></prefer>
+  </alias>
+</fontconfig>
+EOF
+    log "字体: 自带中文字体 $n 个 -> $fdst；配置 $cdst/fonts.conf"
+}
+
+# 根分区每次开机还原，这些软链每次都要重建
+# 把数据盘上的 $SYSLIB 挂到 /lib/x86_64-linux-gnu。
+#
+# 挂上之后程序看到的还是那批软链，但**新建条目不再受根分区满的限制**。
+# 幂等：已经挂过就直接返回；挂不上退回老办法（在根分区上建软链），
+# 并明确报出来 —— 根分区满的时候那一步会失败，日志里要能看出来。
+link_syslib_mount() {
+    local dst=/lib/x86_64-linux-gnu
+    grep -q " $dst " /proc/mounts 2>/dev/null && return 0
+    mkdir -p "$dst" "$SYSLIB"
+    # 根分区上那份（以前留下的）先清掉，免得和挂上来的混着看
+    rm -f "$dst"/*.so* 2>/dev/null
+    if mount --bind "$SYSLIB" "$dst" 2>/dev/null; then
+        return 0
+    fi
+    log "!! bind 挂载 $SYSLIB -> $dst 失败，退回写根分区（根分区满时会缺库）"
+    local f
+    for f in "$SYSLIB"/*; do
+        [ -e "$f" ] || continue
+        ln -sf "$(readlink "$f" 2>/dev/null || echo "$f")" "$dst/$(basename "$f")" 2>/dev/null
+    done
+}
+
+link_rootfs() {
+    install_agent
+    install_fonts
+    mkdir -p /lib/x86_64-linux-gnu /usr/bin /usr/local
+
+    # 向日葵本体目录（它自己会拼 /usr/local/awesuncli/bin/...）
+    ln -sfn "$RT_APP" /usr/local/awesuncli
+    rm -rf /var/log/awesuncli
+    ln -sfn "$RT_APP/var-log" /var/log/awesuncli
+
+    # 自带 glibc（与设备的 uClibc 不冲突：uClibc 走 /lib/libc.so.0）
+    ln -sf "$RT_APP/lib/ld-linux-x86-64.so.2" /lib/ld-linux-x86-64.so.2
+
+    # 所有 glibc 库先软链到数据盘上的 $SYSLIB，最后整块 bind 挂到
+    # /lib/x86_64-linux-gnu（见文件头 SYSLIB 的说明）。
+    # 顺序很重要：app -> x11 -> tools 后面的覆盖前面的，跟以前一致。
+    mkdir -p "$SYSLIB"
+    local f
+    for f in "$RT_APP"/lib/*.so*; do
+        [ -e "$f" ] || continue
+        ln -sf "$f" "$SYSLIB/$(basename "$f")"
+    done
+    for f in "$RT_X11"/lib/*.so*; do
+        [ -e "$f" ] || continue
+        ln -sf "$f" "$SYSLIB/$(basename "$f")"
+    done
+
+    # 我们自己打包的现代命令行工具（bash/coreutils/grep…）的库。
+    # 铺进标准路径是为了**避免用 LD_LIBRARY_PATH** —— 那东西会毒到
+    # PATH 里 uClibc 的 busybox 软链，导致 /bin/* 全废。
+    for f in "$RT_TOOLS"/usr/lib/x86_64-linux-gnu/*; do
+        [ -e "$f" ] || continue
+        ln -sf "$f" "$SYSLIB/$(basename "$f")"
+    done
+    link_syslib_mount
+
+    # 向日葵收文件的目录。
+    #
+    # 它用的是 /var/awesunhost/transferfiles 和 /tmp/AweSunHost：
+    #   /var 在根分区上（只有 111MB，常年 99% 满）—— 稍大的文件直接写失败；
+    #   /tmp 是 tmpfs —— 重启就没了。
+    # 两个都指到持久分区（15.5G）下，重启后收到的文件也还在。
+    mkdir -p "$RT_FILES/awesunhost" "$RT_FILES/AweSunHost"
+    if [ -d /var/awesunhost ] && [ ! -L /var/awesunhost ]; then
+        cp -a /var/awesunhost/. "$RT_FILES/awesunhost/" 2>/dev/null || true
+        rm -rf /var/awesunhost
+    fi
+    ln -sfn "$RT_FILES/awesunhost" /var/awesunhost
+    if [ -d /tmp/AweSunHost ] && [ ! -L /tmp/AweSunHost ]; then
+        cp -a /tmp/AweSunHost/. "$RT_FILES/AweSunHost/" 2>/dev/null || true
+        rm -rf /tmp/AweSunHost
+    fi
+    ln -sfn "$RT_FILES/AweSunHost" /tmp/AweSunHost
+
+    # /dev/shm 必须挪走。
+    #
+    # iKuai 的 /dev 是 **512KB** 的 tmpfs，而 /dev/shm 只是它下面的普通目录
+    # （不是独立挂载点）。任何走 shm_open 的东西（winit/softbuffer 的画面缓冲、
+    # X 的 MIT-SHM 图像）都会落在那里，写超过 512KB 立刻 SIGBUS。
+    # 这正是当初给 awescreen 选 /tmp 当共享内存的原因，现在轮到 panel 了。
+    #
+    # 换成指向 /tmp 下（1.9G tmpfs）的软链即可，glibc 的 shm_open 会跟着走。
+    mkdir -p "$RT_FILES/shm"
+    if [ ! -L /dev/shm ]; then
+        rm -rf /dev/shm 2>/dev/null || true
+        ln -sfn "$RT_FILES/shm" /dev/shm
+    fi
+
+    # GLVND（libEGL 的分发层）的 Mesa 后端声明。
+    # 放标准位置 + **绝对路径**最稳：实测这一份（配合 payload 里带上
+    # libEGL_mesa.so.0）才是让设备上 EGL 可用的关键 ——
+    # 缺了它 libEGL 找不到后端，eglGetDisplay 直接 EGL_BAD_PARAMETER，
+    # WebKit 的渲染进程一启动就 abort。
+    mkdir -p /usr/share/glvnd/egl_vendor.d
+    printf '{\n  "file_format_version": "1.0.0",\n  "ICD": {"library_path": "%s/libEGL_mesa.so.0"}\n}\n' \
+        "$RT_WEBKIT/lib" > /usr/share/glvnd/egl_vendor.d/50_mesa.json
+
+    # WebKit 的辅助进程**必须**放在这个绝对路径：实测 Debian 的构建
+    # 忽略 WEBKIT_EXEC_PATH（把假进程放进它指向的目录，WebKit 根本不调用），
+    # 只会从编译进去的位置找。好在三个辅助进程各 14KB、加 injected-bundle
+    # 共约 62KB，根分区装得下。
+    mkdir -p /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1 2>/dev/null || true
+    local wf wfail=0
+    for wf in "$RT_WEBKIT/exec/"*; do
+        [ -e "$wf" ] || continue
+        # **每个软链自己兜住失败**：根分区长年接近满（实测有过
+        # "No space left on device"），一个软链建不出来不该把整个 setup 拖死
+        # —— 那会连带 Xvfb 都起不来（踩过）。失败只记一笔，继续往下走。
+        ln -sfn "$wf" "/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/$(basename "$wf")" 2>/dev/null \
+            || wfail=$((wfail + 1))
+    done
+    [ "$wfail" = 0 ] || log "!! $wfail 个 WebKit 辅助进程软链没建上（根分区满？）"
+
+    # Xvfb 硬编码调用 /usr/bin/xkbcomp
+    ln -sf "$RT_X11/bin/xkbcomp" /usr/bin/xkbcomp
+
+    # 真 libsystemd（含 sd_listen_fds/sd_notify 这些带版本号的符号）给 Xvfb 用，
+    # 必须放在上面那个 x11/lib 循环**之后**，否则会被 x11 里那份盖掉。
+    #
+    # 为什么不冲突：Xvfb 是**直接链接** libsystemd（DT_NEEDED），走这个系统路径；
+    # 向日葵是**dlopen("libsystemd-login.so.0"/"libsystemd.so.0")**，被
+    # libawesun_hook.so 拦下来换成它自己导出的 sd_* 兼容实现。
+    # 少了这一段的表现：向日葵能启动、日志里甚至写着 status: online，
+    # 但 `awesuncli info` 一直报 offline（本地状态查询那条路走的是真 systemd，
+    # 在非 systemd 设备上必然失败）。
+    rm -f /lib/x86_64-linux-gnu/libsystemd-login.so.0
+    local f
+    for f in "$RT_BIN/sdlibs/"*; do
+        [ -e "$f" ] || continue
+        ln -sf "$f" "/lib/x86_64-linux-gnu/$(basename "$f")"
+    done
+
+    # 钩子库由向日葵 ELF 的 DT_NEEDED 加载（落点 $RT_APP/lib），不走 ld.so.preload
+    if [ -f "$RT_BIN/libawesun_hook.so" ]; then
+        mkdir -p "$RT_APP/lib"
+        if cp -f "$RT_BIN/libawesun_hook.so" "$RT_APP/lib/libawesun_hook.so" 2>/dev/null; then
+            log "钩子已就位: $RT_APP/lib/libawesun_hook.so（由 ELF 的 DT_NEEDED 加载）"
+        else
+            log "!! 放钩子库到 $RT_APP/lib 失败"
+        fi
+    else
+        log "!! 缺 $RT_BIN/libawesun_hook.so，向日葵不会被接管"
+    fi
+    rm -f /etc/ld.so.preload
+
+    # 核一下三个二进制有没有那条 DT_NEEDED
+    local b miss=""
+    for b in awesuncli awesuncli_daemon awesuncli_desktop; do
+        [ -f "$RT_APP/bin/$b" ] || continue
+        grep -qa 'libawesun_hook.so' "$RT_APP/bin/$b" || miss="$miss $b"
+    done
+    if [ -n "$miss" ]; then
+        log "!! 这些二进制没有内建 DT_NEEDED（payload 是不是旧的？）:$miss"
+    fi
+}
+
+# ================= 虚拟屏幕 =================
+
+# 读屏幕配置，输出规范化的 "<类型>|<尺寸>|<目标>" 每行一条。
+# 读不到 / 全是非法行时给一条默认（爱快页面 1280x720）。
+screens_load() {
+    local n=0 type size target
+    if [ -f "$SCREENS_CONF" ]; then
+        while read -r type size target; do
+            case "$type" in ''|'#'*) continue ;; esac
+            case "$type" in web|shell|blank) ;; *) continue ;; esac
+            case "$size" in [0-9]*x[0-9]*) ;; *) continue ;; esac
+            [ -n "$target" ] || target="-"
+            echo "$type|$size|$target"
+            n=$((n+1))
+            [ "$n" -ge "$SCREEN_MAX" ] && break
+        done < "$SCREENS_CONF"
+    fi
+    [ "$n" -gt 0 ] || echo "web|1280x720|http://127.0.0.1/"
+}
+
+# 屏幕数量
+screens_count() { screens_load | wc -l | tr -d ' '; }
+
+# ===== 这两个是**顶层**函数，不要挪进 screen_start_web 里面 =====
+#
+# 踩过（用户报的"web 屏能开、但没有免登录"）：它们原本被嵌在 screen_start_web
+# 内部，而 screen_start_web 在更靠前的几行就要用 ikuai_admin_cred 取账号 ——
+# bash 顺序执行，调用发生那一刻函数还没定义 -> command not found ->
+# 账号恒为空（stderr 还被 2>/dev/null 吞了，一点线索都不留）。后果：
+#   AWESUN_WEB_USER 空 -> shell 侧不写 username cookie -> 路由守卫踢回登录页。
+# 而靠后那次调用（免密登录）在定义之后，所以只有账号这一路是坏的，
+# 免密建会话本身正常 —— 现象因此特别有迷惑性。
+
+    # 读 iKuai 自己的管理员口令摘要，用来**免密**登录它的后台。
+#
+# 依据（读服务端代码 + 本机实测，目标固件固定不升级，这条链路是稳定的）：
+#   /usr/openresty/lua/lib/webman.lua
+#       local user_conf = getUserConfig(json_auth["username"])
+#       if user_conf and user_conf["passwd"] == json_auth["passwd"] then   -- 直接等值比较
+#   凭据来自 sqlite 的 webuser 表（/etc/mnt/ikuai/config.db），存的 passwd 就是
+#   客户端平时发过去的那个值 —— **md5(明文密码)、不带盐**。
+#   实测：库里 admin 的 passwd = md5('Ikuai@2026')，把它原样 POST /Action/login
+#   就能拿到会话。所以插件不需要用户输入任何密码。
+#
+# 输出：`<账号> <口令摘要>`（取 group_id=1 的超级管理员）；读不到则输出空。
+ikuai_admin_cred() {
+    local db="${IKUAI_CONFDB:-/etc/mnt/ikuai/config.db}" out
+    [ -f "$db" ] || return 1
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    out="$(sqlite3 "$db" "select username || ' ' || passwd from webuser where group_id=1 limit 1" 2>/dev/null)"
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
+}
+
+# 用**已经算好的**口令值登录（免密路径传的是库里读出来的摘要，不要再 md5 一次）。
+# 成功则把会话 cookie 写进 $1（cookie 罐），并把 sess_key 打到 stdout。
+webui_do_login() {
+    local base="$1" jar="$2" user="$3" passval="$4" sess
+    rm -f "$jar"
+    # remember_password=1：让服务端给个更耐久的会话，下次开机还能直接复用
+    curl -s -o /dev/null --max-time 10 -c "$jar" \
+        -X POST "$base/Action/login" -H 'Content-Type: application/json' \
+        -d "{\"username\":\"$user\",\"passwd\":\"$passval\",\"remember_password\":1}" \
+        2>/dev/null
+    chmod 600 "$jar" 2>/dev/null
+    sess="$(grep -m1 'sess_key' "$jar" 2>/dev/null | awk '{print $7}')"
+    printf '%s' "$sess"
+}
+
+# 自动登录用的会话获取。返回 sess_key（stdout），日志走 log。
+#   1) 先复用已有会话
+#   2) 再**免密**：读设备自己的管理员摘要直接登录（用户什么都不用填）
+#   3) 最后才用 webui.conf 里配的账号密码（老配置，留着兜底）
+
+
+# 一屏一个 WebKit 浏览器
+# 所有网页 URL 由**一个** awesun-shell 进程承载，多个 URL 是 tab。
+# 已经在跑就不再起 —— 内容常驻，绝不允许重复启动。
+screen_start_web_all() {   # <index> <WxH> <url1;url2;...>
+    local idx="$1" size="$2" urls="$3"
+    [ -x "$RT_WEBKIT/run.sh" ] || { log "!! 要网页但没有 $RT_WEBKIT/run.sh"; return 0; }
+    if pidfile_alive "$PIDDIR/web.pid" || ps 2>/dev/null | grep -q '[a]wesun-shell'; then
+        log "awesun-shell 已在运行，不重复启动"
+        return 0
+    fi
+    local first="${urls%%;*}"
+    case "$first" in '-'|''|'ikuai') first="${WEBKIT_URL:-http://127.0.0.1/}" ;; esac
+
+    local au="" ap="" aon="0"
+    case "$first" in
+        http://127.0.0.1/*|http://localhost/*|https://127.0.0.1/*|http://192.168.*/*)
+            aon="$(ui_conf autologin 1)"
+            [ "$aon" = 1 ] && au="$(ikuai_admin_cred 2>/dev/null | awk '{print $1}')"
+            ap=""
+            ;;
+    esac
+
+    local sess="" base=""
+    case "$first" in
+        http://*|https://*) base="$(printf '%s' "$first" | sed -n 's|^\(https\?://[^/]*\).*|\1|p')" ;;
+    esac
+    if [ "$aon" = 1 ] && [ -n "$base" ]; then
+        local cj="$RT/webui.cookie"
+        if [ -s "$cj" ] && grep -q 'sess_key' "$cj" 2>/dev/null; then
+            local probe
+            probe="$(curl -s --max-time 6 -b "$cj" -X POST "$base/Action/call" \
+                -H 'Content-Type: application/json' \
+                -d '{"func_name":"plugins","action":"show","param":{"TYPE":"data"}}' 2>/dev/null)"
+            case "$probe" in
+                *'"Result":30000'*|*'"Result":10000'*)
+                    sess="$(grep -m1 'sess_key' "$cj" 2>/dev/null | awk '{print $7}')"
+                    [ -n "$sess" ] && log "复用已有会话" ;;
+                *) rm -f "$cj" ;;
+            esac
+        fi
+        if [ -z "$sess" ]; then
+            local cred cu cp
+            cred="$(ikuai_admin_cred)"
+            if [ -n "$cred" ]; then
+                cu="${cred%% *}"; cp="${cred#* }"
+                sess="$(webui_do_login "$base" "$cj" "$cu" "$cp")"
+                [ -n "$sess" ] && log "免密登录成功（账号 $cu）" || log "!! 免密登录没拿到会话（账号 $cu）"
+            else
+                log "读不到 iKuai 的管理员凭据，免密跳过"
+            fi
+        fi
+        [ -n "$sess" ] || log "没有可用会话，页面会停在登录页"
+    fi
+
+    local args="" u
+    local oldifs="$IFS"; IFS=';'
+    for u in $urls; do
+        case "$u" in ''|-|ikuai) u="${WEBKIT_URL:-http://127.0.0.1/}" ;; esac
+        args="$args --url $u"
+    done
+    IFS="$oldifs"
+    log "网页: X screen $idx 尺寸 $size，tab =$args"
+
+    # shellcheck disable=SC2086
+    ( trap '' HUP; exec env DISPLAY="$DISPLAY_NUM.$idx" \
+        AWESUN_AUTO_LOGIN="$aon" AWESUN_WEB_USER="$au" AWESUN_WEB_PASS="$ap" \
+        AWESUN_SESSION="${sess:+sess_key=$sess}" AWESUN_SESSION_HOST="${base:-}" \
+        AWESUN_CSS="$RT_BIN/webkit-patch.css" \
+        FONTCONFIG_FILE="$RT/etc/fonts/fonts.conf" \
+        XDG_CACHE_HOME="$RT/cache" \
+        MESA_SHADER_CACHE_DIR="$RT/cache/mesa" \
+        "$RT_WEBKIT/run.sh" $args --w "${size%x*}" --h "${size#*x}" \
+        --data-dir "$RT/webkit-data" \
+        > "$RT_LOG/web.log" 2>&1 ) &
+    echo $! > "$PIDDIR/web.pid"
+}
+
+
+# 一屏一个终端。目标是程序就先把程序跑起来，退出后再落到交互 shell
+screen_start_shell() {   # <index> <WxH> <程序|->
+    ensure_runtime_dirs
+    local idx="$1" prog="$3"
+    [ -x "$RT_BIN/start-xterm.sh" ] || { log "!! 第 $idx 屏要终端，但没有 start-xterm.sh"; return 0; }
+    # 已经在跑就不再起：一套屏幕只能有一套内容
+    if pidfile_alive "$PIDDIR/xterm$idx.pid"; then
+        log "第 $idx 屏的终端已在运行，不重复启动"
+        return 0
+    fi
+    case "$prog" in '-'|''|shell|bash|sh) prog="" ;; esac
+    ( trap '' HUP; exec env RT="$RT" DPY="$DISPLAY_NUM.$idx" PROG="$prog" \
+        XTERM_TAG="xterm$idx" sh "$RT_BIN/start-xterm.sh" \
+        > "$RT_LOG/xterm$idx.out" 2>&1 ) &
+    echo $! > "$PIDDIR/xterm$idx.pid"
+}
+
+# ================= 进程 =================
+stop_all() {
+    kill_pat '[a]wescreen'
+    kill_pat '[a]wesun-shell'
+    kill_pat '[a]wesun-panel'
+    kill_pat '[x]term'
+    kill_pat '[X]vfb'
+    kill_pat '[a]wesuncli'
+    sleep 1
+    # 每屏的共享内存也清掉，免得钩子读到上一轮的残留画面
+    rm -f /tmp/awesun-screen[0-9] /dev/shm/awesun-screen[0-9] 2>/dev/null
+    rm -f /etc/ld.so.preload "$RT/ikuai-input.sock" "$PIDDIR"/* 2>/dev/null
+    log "已停止"
+}
+
+start_x() {
+    [ -x "$RT_X11/bin/Xvfb" ] || { log "没有 Xvfb，跳过虚拟桌面"; return 0; }
+
+    # ---- 按配置拼 Xvfb 的 -screen 列表 ----
+    # 每块屏的分辨率独立（Xvfb 支持 -screen N WxHxD）。
+    local cfg; cfg="$(screens_load)"
+    local xargs="" sizes="" n=0 type size target
+    while IFS='|' read -r type size target; do
+        [ -n "$size" ] || continue
+        xargs="$xargs -screen $n ${size}x24"
+        sizes="${sizes}${sizes:+,}${size}"
+        n=$((n+1))
+    done <<EOF
+$cfg
+EOF
+    [ "$n" -gt 0 ] || { log "!! 屏幕配置解析出来是空的，跳过虚拟桌面"; return 1; }
+
+    if ! pidfile_alive "$PIDDIR/xvfb.pid"; then
+        rm -f /tmp/.X11-unix/X99 /tmp/.X99-lock 2>/dev/null
+        # $xargs 这里**故意不加引号**：要的就是按空格拆成一个个参数
+        # shellcheck disable=SC2086
+        ( trap '' HUP; exec "$RT_X11/bin/Xvfb" "$DISPLAY_NUM" $xargs \
+            -xkbdir "$RT_X11/share/X11/xkb" -nolisten tcp -noreset \
+            > "$RT_LOG/xvfb.log" 2>&1 ) &
+        echo $! > "$PIDDIR/xvfb.pid"
+        local i=0
+        while [ $i -lt 15 ]; do
+            sleep 1; i=$((i+1))
+            DISPLAY=$DISPLAY_NUM "$RT_X11/bin/xdpyinfo" >/dev/null 2>&1 && break
+        done
+    fi
+    DISPLAY=$DISPLAY_NUM "$RT_X11/bin/xdpyinfo" >/dev/null 2>&1 \
+        || { log "!! Xvfb 起不来，看 $RT_LOG/xvfb.log"; tail -3 "$RT_LOG/xvfb.log"; return 1; }
+
+    # 每块屏铺个底色，别让没内容的屏是花的
+    local k=0
+    while [ $k -lt "$n" ]; do
+        DISPLAY="$DISPLAY_NUM.$k" "$RT_X11/bin/xsetroot" -solid '#123a5c' 2>/dev/null
+        k=$((k+1))
+    done
+
+    # ---- 画面生产者：把每块 X screen 抓进各自的共享内存 ----
+    # 钩子接管 OpenFb / GetMonitorInfo 后，向日葵就把这些当成多台显示器。
+    if [ -x "$RT_BIN/awescreen" ] && ! pidfile_alive "$PIDDIR/awescreen.pid"; then
+        ( trap '' HUP; exec env DISPLAY=$DISPLAY_NUM "$RT_BIN/awescreen" \
+            --screens "$sizes" --fps "${FPS:-12}" \
+            > "$RT_LOG/screen.log" 2>&1 ) &
+        echo $! > "$PIDDIR/awescreen.pid"
+    fi
+
+    log "虚拟桌面就绪（$DISPLAY_NUM 共 $n 块屏: $sizes，画面走共享内存给钩子）"
+}
+
+# ================= 每屏内容（按需启停） =================
+#
+# Xvfb / awescreen / 向日葵这三个是"底子"，必须常驻：
+# 远端一连上来钩子就会 OpenFb，而它要映射的共享内存正是 awescreen 产的，
+# 生产者不在就会失败（钩子里那句"该屏画面生产者没起来？"）。所以它们不按需。
+#
+# 每屏内容开机起一次，常驻：远程一连上来就要立刻有画面。
+# 所有网页 URL 由同一个 awesun-shell 承载（多个 URL 是 tab）。
+
+# iKuai 后台自己的登录凭据（自动登录用）。存在插件 data 目录，权限 600。
+webui_conf() {   # webui_conf <键>
+    grep -m1 "^$1=" "$DATA/webui.conf" 2>/dev/null | cut -d= -f2-
+}
+
+ui_conf() {   # ui_conf <键> <默认值>
+    local v
+    v="$(grep -m1 "^$1=" "$DATA/ui.conf" 2>/dev/null | cut -d= -f2- | tr -d ' \r')"
+    [ -n "$v" ] || v="$2"
+    printf '%s' "$v"
+}
+
+# 所有**配置了的**屏都必须有活着的进程，少一块就算"没在运行"。
+#
+# 原来写成"任意一块活着就算在运行"，踩过：网页屏的进程死了/pid 文件没了，
+# 只剩 xterm 活着 -> content_start 直接提前返回，那块屏**永远不会被重建**，
+# 一直跑着早先那个进程。症状就是用户报的"web 屏能开、但没有免登录"
+# （旧进程的 AWESUN_WEB_USER 是空的）以及"shell 屏一直是空的"。
+# 内容常驻：开机起一次，之后不因会话起停，也绝不重复启动。
+# 所有网页 URL 由同一个 awesun-shell 承载（多个 URL 是 tab）。
+content_start() {
+    ensure_runtime_dirs
+    local cfg; cfg="$(screens_load)"
+    local idx=0 type size target
+    local web_urls="" web_idx="" web_size=""
+    while IFS='|' read -r type size target; do
+        [ -n "$size" ] || continue
+        case "$type" in
+            web)
+                if [ -z "$web_idx" ]; then web_idx="$idx"; web_size="$size"; fi
+                web_urls="${web_urls}${web_urls:+;}$target"
+                ;;
+            shell)
+                screen_start_shell "$idx" "$size" "$target"
+                ;;
+        esac
+        idx=$((idx+1))
+    done <<EOF
+$cfg
+EOF
+    if [ -n "$web_urls" ]; then
+        screen_start_web_all "${web_idx:-0}" "${web_size:-$SCREEN_SIZE}" "$web_urls"
+    fi
+    log "内容就绪（$idx 块屏）"
+}
+
+content_running() {
+    ps 2>/dev/null | grep -qE '[a]wesun-shell|[x]term'
+}
+
+# 会话标记由钩子写（OpenFb=active / CloseFb=closed），只作展示用
+session_state() {
+    local f="$RT/session"
+    [ -f "$f" ] || { echo "none"; return; }
+    grep -m1 '^state=' "$f" 2>/dev/null | cut -d= -f2- | tr -d ' \r'
+}
+
+
+start_sun() {
+    [ -x "$RT_APP/bin/awesuncli_daemon" ] || { log "没有 awesuncli，跳过"; return 0; }
+    if pidfile_alive "$PIDDIR/daemon.pid"; then
+        printf 'connect\n' | timeout_e /usr/local/awesuncli/bin/awesuncli >/dev/null 2>&1
+        return 0
+    fi
+    ( cd "$RT_APP" && trap '' HUP; exec env DISPLAY=$DISPLAY_NUM \
+        /usr/local/awesuncli/bin/awesuncli_daemon -m server -name awesuncli \
+        > "$RT_LOG/daemon.out" 2>&1 ) &
+    echo $! > "$PIDDIR/daemon.pid"
+    local i=0
+    while [ $i -lt 25 ]; do
+        sleep 1; i=$((i+1))
+        ps 2>/dev/null | grep -q '[a]wesuncli --mod=service' && break
+    done
+    printf 'connect\n' | /usr/local/awesuncli/bin/awesuncli >/dev/null 2>&1
+    log "向日葵已拉起并 connect"
+}
+
+# 设备没有 timeout，自己实现一个（避免 CLI 卡住）
+timeout_e() {
+    local t=20
+    "$@" &
+    local p=$!
+    ( sleep $t; kill -9 $p 2>/dev/null ) &
+    local w=$!
+    wait $p 2>/dev/null
+    kill -9 $w 2>/dev/null
+    return 0
+}
+
+# 运行时目录（缓存/临时）。**任何启动入口都要先调它** ——
+# 踩过：只在 ensure_runtime 里建，而 content-start/start 有路径不经过那里，
+# 结果 TMPDIR 指到一个不存在的目录，需要临时文件的程序直接报错甚至退出
+# （表现就是"一打开就退出"）。mkdir -p 是幂等的，多调几次没关系。
+ensure_runtime_dirs() {
+    mkdir -p "$RT" "$RT_LOG" "$RT_CACHE" "$RT_TMP" 2>/dev/null
+    return 0
+}
+
+start_all() {
+    ensure_runtime_dirs
+    # 身份钩子（只观测/只拦"去云端重新领号"）：默认开，钩子自己会判断本地有没有
+    # license。未绑定时向日葵本来就要重新领号，这里不会挡；绑定后才起作用。
+    : > "$RT/hook-identity" 2>/dev/null
+    # 会话状态不跨重启，开机归零
+    if [ -f "$RT/session" ]; then
+        log "开机清理残留会话标记（$(tr '\n' ' ' < "$RT/session" 2>/dev/null)）"
+        printf 'state=closed\nts=%s\n' "$(date +%s 2>/dev/null || echo 0)" > "$RT/session"
+    fi
+    ensure_runtime
+    link_rootfs
+    start_x
+    content_start
+    start_sun
+}
+
+# ================= 子命令 =================
+cmd_status() {
+    echo "--- 插件 ---"
+    echo "plugin_dir = $PLUGIN_DIR"
+    echo "runtime    = $RT"
+    echo "payload    = $PAYLOAD_DIR"
+    echo "--- runtime 是否就位 ---"
+    echo "awesuncli  : $([ -x "$RT_APP/bin/awesuncli_daemon" ] && echo 有 || echo 无)"
+    echo "Xvfb       : $([ -x "$RT_X11/bin/Xvfb" ] && echo 有 || echo 无)"
+    echo "自研二进制 : $(ls "$RT_BIN" 2>/dev/null | tr '\n' ' ')"
+    echo "--- 进程 ---"
+    ps 2>/dev/null | grep -E '[a]wesuncli|[X]vfb|[x]term|[a]wescreen|[a]wesun-panel' || echo "  (无)"
+    echo "--- 内容进程（每项都只该有 1 份）---"
+    echo "  awesun-shell: $(ps 2>/dev/null | grep -c '[a]wesun-shell')   Xvfb: $(ps 2>/dev/null | grep -c '[X]vfb')   awescreen: $(ps 2>/dev/null | grep -c '[a]wescreen')   xterm: $(ps 2>/dev/null | grep -c '[x]term')"
+    echo "  会话       : $(session_state)$( [ -f "$RT/session" ] && echo "（$(cat "$RT/session" | tr '\n' ' ')）" )"
+    echo "  当前验证码 : $(grep -m1 '^code=' "$RT/access-code" 2>/dev/null | cut -d= -f2- || echo '（还没解出来）')"
+    echo "  自动登录   : $(ui_conf autologin 1)（账号: $(webui_conf user)）"
+    echo "--- 虚拟屏幕（每行: 序号|类型|尺寸|目标）---"
+    cmd_screens show | sed 's/^/  /'
+    echo "  共享内存: $(ls -la /tmp/awesun-screen[0-9] 2>/dev/null | awk '{print $NF}' | tr '\n' ' ')"
+    echo "--- 屏幕链路 ---"
+    echo "fb0        : $(fb_size)  <- 向日葵抓这个"
+    DISPLAY=$DISPLAY_NUM "$RT_X11/bin/xdpyinfo" 2>/dev/null | grep -m1 dimensions | sed 's/^/Xvfb       : /'
+    echo "钩子加载   : $(grep -qa 'libawesun_hook.so' "$RT_APP/bin/awesuncli" 2>/dev/null && echo 'ELF 内建（DT_NEEDED，链接器自己加载）' || echo '!! 没内建')"
+    echo "钩子文件   : $RT_APP/lib/libawesun_hook.so $([ -f "$RT_APP/lib/libawesun_hook.so" ] && echo 在 || echo '!! 不在')"
+    echo "ld.so.preload: $(cat /etc/ld.so.preload 2>/dev/null || echo '(无，已改成 ELF 内建)')"
+    echo "辅助网卡   : $(ip link 2>/dev/null | grep -q "$IDENT_IF:" && echo '还在（应被清掉）' || echo '无（用钩子替代）')"
+    echo "--- 向日葵 ---"
+    if [ -x /usr/local/awesuncli/bin/awesuncli ]; then
+        printf 'info\n' | timeout_e /usr/local/awesuncli/bin/awesuncli 2>&1 \
+            | grep -E 'status:|account:|remoteid:|mac:|local ip:' | sed 's/^/  /'
+    fi
+    ident_show
+}
+
+# ================= 屏幕配置子命令 =================
+#
+#   awesunctl screens show           列出当前每块屏（<序号>|<类型>|<尺寸>|<目标>）
+#   awesunctl screens sizes          推荐分辨率（供页面下拉）
+#   awesunctl screens set            **从标准输入**读新配置，校验后落盘
+#
+# 输入格式与 screens.conf 一致：一行一屏 `<类型> <宽>x<高> <目标>`。
+# 落盘后**不自动重启**：调用方（插件后端）再跑一次 restart 生效，
+# 这样"配置写坏了"和"起了新配置"两件事能分开报告。
+cmd_screens() {
+    case "${2:-show}" in
+        show)
+            local i=0 type size target
+            while IFS='|' read -r type size target; do
+                [ -n "$size" ] || continue
+                echo "$i|$type|$size|$target"
+                i=$((i+1))
+            done <<EOF
+$(screens_load)
+EOF
+            ;;
+        sizes)
+            # 推荐分辨率：给页面下拉用（含常见 16:9 / 16:10 / 4:3）
+            echo "1280x720 1366x768 1600x900 1920x1080 1920x1200 2560x1440 3840x2160 1024x768 800x600"
+            ;;
+        set)
+            local tmp="$SCREENS_CONF.new" n=0 type size target w h bad
+            : > "$tmp"
+            while read -r type size target; do
+                [ -n "$type" ] || continue
+                case "$type" in '#'*) continue ;; esac
+                bad=0
+                case "$type" in web|shell|blank) ;; *) bad=1 ;; esac
+                case "$size" in *x*x*) bad=1 ;; esac
+                w="${size%x*}"; h="${size#*x}"
+                case "$w" in ''|*[!0-9]*) bad=1 ;; esac
+                case "$h" in ''|*[!0-9]*) bad=1 ;; esac
+                if [ "$bad" = 0 ]; then
+                    [ "$w" -ge 320 ] && [ "$w" -le 8192 ] || bad=1
+                    [ "$h" -ge 200 ] && [ "$h" -le 8192 ] || bad=1
+                fi
+                if [ "$bad" = 1 ]; then
+                    echo "!! 这行不合法: $type $size $target（宽高需 320..8192，类型只能是 web/shell/blank）"
+                    rm -f "$tmp"; return 1
+                fi
+                case "$type" in
+                    web) case "$target" in '-'|'ikuai'|http://*|https://*|file://*) ;; *) echo "!! web 屏的目标要么是 -（爱快自己的页面），要么是 http(s):// 或 file:// 开头的地址"; rm -f "$tmp"; return 1 ;; esac ;;
+                esac
+                echo "$type $size ${target:--}" >> "$tmp"
+                n=$((n+1))
+            done
+            if [ "$n" -lt 1 ]; then
+                echo "!! 至少要保留一块屏"; rm -f "$tmp"; return 1
+            fi
+            if [ "$n" -gt "$SCREEN_MAX" ]; then
+                echo "!! 最多 $SCREEN_MAX 块屏（收到 $n）"; rm -f "$tmp"; return 1
+            fi
+            mkdir -p "$DATA"
+            mv -f "$tmp" "$SCREENS_CONF"
+            echo "已保存 $n 块屏配置"
+            ;;
+        *)  echo "用法: awesunctl screens show|set|sizes"; return 1 ;;
+    esac
+}
+
+# ================= 代登录 / 验证码 =================
+#
+# 为什么要做成"喂 TUI"：awesuncli 没有任何 --account/--password 选项，
+# 只能把 bind / 账号 / 密码按顺序灌进它的标准输入。
+#
+# **密码走标准输入，不走命令行参数** —— 命令行参数会出现在 ps 里。
+#
+# 判断成功与否**不靠文案**（成功那句文案没有稳定样本，改版就废）：
+#   login: 输出里出现 "Binding failed" 判失败；否则看设备上的 account 是不是真写上了
+#   setpwd: 看 /etc/sys_ent_config.conf 里的 fastcodepsw 有没有变
+cli_drive() {   # cli_drive <秒> <要喂进去的多行>
+    # **喂完必须把管子挂着，不能马上 EOF。**
+    #
+    # awesuncli 的 connect 是异步的：stdin 一关它就立刻 "Quitting awesuncli shell"，
+    # 排在后面的命令还没轮到执行就随着进程一起没了。症状极具误导性 ——
+    # 输出里 "Connected successfully." 打得好好的，看着像成功，实际什么也没做。
+    # 用户报的"解绑点了没作用、状态还是绑定"就是这个：
+    #     同一句 `unbind`：
+    #       喂完立刻关管  -> 账号原封不动（无效）
+    #       喂完挂 20 秒  -> account=[] （解绑成功）
+    # 所以这里喂完再 sleep $t 把管子撑住，超时才由外层 kill 收。
+    local t="$1" inp="$2"
+    local C=/usr/local/awesuncli/bin/awesuncli
+    [ -x "$C" ] || { echo "找不到 awesuncli（先跑 setup）"; return 1; }
+    #
+    # **必须逐行喂、命令后留时间。** 只"把管子挂着"还不够：
+    # 把 "set_access_pwd\n密码\n" 一次灌进去时，密码那行会在服务还没连上、
+    # 提示符还没出现时就被读走 —— CLI 照样回
+    #   "Successfully set the independent password."
+    # 但 /etc/sys_ent_config.conf 里的 sunloginaccesspassword **一个字都没变**
+    # （实测：一次灌完 = 字段不变；隔 5 秒喂 = 字段变成 32 位密文）。
+    # 于是"设置成功"是假的，客户端一连过来就 verify password fail。
+    # connect/bind/unbind/set_access_pwd 要等服务回提示符，后面多停 6 秒。
+    (
+        printf '%b' "$inp" | while IFS= read -r _l; do
+            printf '%s\n' "$_l"
+            _d=1
+            case "$_l" in connect|bind|unbind|set_access_pwd) _d=6 ;; esac
+            sleep "$_d"
+        done
+        sleep "$t"
+    ) | "$C" > "$RT/cli.out" 2>&1 &
+    local p=$!
+    ( sleep $((t + 30)); kill -9 $p 2>/dev/null ) &
+    local w=$!
+    wait $p 2>/dev/null
+    kill -9 "$w" 2>/dev/null
+    # 去掉 ANSI 颜色，别把转义码带回网页
+    sed 's/\x1b\[[0-9;]*m//g' "$RT/cli.out" 2>/dev/null | tr -d '\r'
+}
+
+# 密码里可能有反斜杠，printf %b 会再解一遍转义，所以先加倍
+esc_cli() { printf '%s' "$1" | sed -e 's/\\/\\\\/g'; }
+
+cmd_login() {
+    local account="$1" password out before after brief
+    [ -n "$account" ] || { echo "用法: awesunctl login <账号>（密码从标准输入读）"; return 1; }
+    IFS= read -r password || true
+    [ -n "$password" ] || { echo "密码是空的"; return 1; }
+
+    before="$(grep -m1 '^account=' /etc/orayentconfig.conf 2>/dev/null | cut -d= -f2-)"
+    out="$(cli_drive 45 "connect\nbind\n$(esc_cli "$account")\n$(esc_cli "$password")\n")"
+    brief="$(printf '%s\n' "$out" | grep -iE 'input account|input password|logging in|binding|incorrect|failed|succeed|success|invalid|locked|expired' | tail -4)"
+
+    case "$brief" in
+        *failed*|*Incorrect*|*invalid*)
+            echo "${brief:-登录失败（没有可读输出）}"
+            return 1 ;;
+    esac
+    after="$(grep -m1 '^account=' /etc/orayentconfig.conf 2>/dev/null | cut -d= -f2-)"
+    if [ -n "$after" ] && { [ "$after" != "$before" ] || [ "$after" = "$account" ]; }; then
+        ident_save >/dev/null 2>&1   # 成功就顺手存一份凭证
+        echo "登录成功，账号 $after"
+        return 0
+    fi
+    echo "没确认到登录结果：${brief:-（无输出）}"
+    return 1
+}
+
+cmd_setpwd() {
+    local password out before after
+    IFS= read -r password || true
+    [ -n "$password" ] || { echo "用法: awesunctl setpwd（验证码从标准输入读）"; return 1; }
+    # 本地先按向日葵的规则判一次，比等它回一句英文快
+    if [ "${#password}" -lt 6 ]; then echo "验证码至少 6 位"; return 1; fi
+    local kinds=0
+    printf '%s' "$password" | grep -q '[0-9]'      && kinds=$((kinds+1))
+    printf '%s' "$password" | grep -q '[A-Za-z]'   && kinds=$((kinds+1))
+    printf '%s' "$password" | grep -q '[^0-9A-Za-z]' && kinds=$((kinds+1))
+    [ "$kinds" -ge 2 ] || { echo "验证码要含两类字符（数字/字母/符号）"; return 1; }
+
+    before="$(grep -m1 '^sunloginaccesspassword=' /etc/sys_ent_config.conf 2>/dev/null | cut -d= -f2-)"
+    out="$(cli_drive 25 "set_access_pwd\n$(esc_cli "$password")\n")"
+    after="$(grep -m1 '^sunloginaccesspassword=' /etc/sys_ent_config.conf 2>/dev/null | cut -d= -f2-)"
+
+    if printf '%s' "$out" | grep -qi 'invalid'; then
+        printf '%s\n' "$out" | grep -i 'invalid' | tail -1
+        return 1
+    fi
+    # 设成**同一个**密码时，摘录不会变 —— 只比 before/after 会误判成失败
+    # （实测：CLI 回 "Successfully set the independent password."，我们却报
+    #  "没确认到设置结果"）。所以先认这句稳定文案，再看摘要有没有变。
+    if printf '%s' "$out" | grep -qi 'successfully set'; then
+        echo "密码已设置"
+        return 0
+    fi
+    if [ -n "$after" ] && [ "$after" != "$before" ]; then
+        # 这里**故意不落任何明文**（用户明确要求：不存明文、页面也不显示）。
+        echo "密码已设置"
+        return 0
+    fi
+    echo "没确认到设置结果：$(printf '%s\n' "$out" | grep -iE 'password|invalid|error' | tail -1)"
+    return 1
+}
+
+# 从身份凭证备份里抹掉账号绑定。
+#
+# **解绑必须连备份一起抹**，否则下次 boot/setup 调 ident_restore 会把整份
+# orayentconfig.conf（含 account=）抄回 /etc —— 账号又绑上了。表现就是
+# "点了解绑没作用""怎么自动绑定了"（实测踩到，用户报的正是这个）。
+#
+# 只抹 account=：fastcode / license 是**设备身份**（换机免登录靠它），要留着。
+ident_forget_account() {
+    local f="$IDENT_DIR/orayentconfig.conf"
+    [ -f "$f" ] || return 0
+    if grep -q '^account=' "$f" 2>/dev/null; then
+        grep -v '^account=' "$f" > "$f.awtmp" 2>/dev/null && mv -f "$f.awtmp" "$f"
+        log "已从身份凭证备份里抹掉账号绑定（设备身份 fastcode/license 保留）"
+    fi
+    [ -f "$IDENT_DIR/meta" ] && sed -i '/^account=/d' "$IDENT_DIR/meta" 2>/dev/null
+    return 0
+}
+
+cmd_logout() {
+    local out acct
+    out="$(cli_drive 25 "unbind\n")"
+    acct="$(grep -m1 '^account=' /etc/orayentconfig.conf 2>/dev/null | cut -d= -f2-)"
+    if [ -n "$acct" ]; then
+        # 没绑掉：把向日葵自己的话带出来，别吞掉（原来这里 tail 一下就当成功返回了）
+        printf '%s\n' "$out" | grep -iE 'unbind|failed|success|error' | tail -1
+        echo "解绑没成功，账号仍是 $acct"
+        return 1
+    fi
+    ident_forget_account
+    # **解绑必须把设备上的身份备份一起删掉**（用户明确要求，也确实是必须的）：
+    # 只要备份还在，开机 ident_restore 就会把那份（含 account= 与绑定期的 license）
+    # 抄回 /etc —— 设备凭那个 license 自动重新登录，账号又回来了，解绑等于没做。
+    ident_backup_purge
+    # 解绑后浏览器里那份 iKuai 会话跟这事无关，不动
+    echo "已解绑账号（身份备份已清空，重启不会自动绑回来）"
+    return 0
+}
+
+# 清空设备上的身份备份（解绑时用）。备份能重存，解绑不彻底才是真麻烦。
+ident_backup_purge() {
+    local n=0 f
+    for f in "$IDENT_DIR"/sys_ent_config.conf "$IDENT_DIR"/orayentconfig.conf "$IDENT_DIR"/meta; do
+        [ -f "$f" ] && rm -f "$f" && n=$((n + 1))
+    done
+    log "已清空身份备份（$n 个文件）：$IDENT_DIR"
+    # 早期遗留在别处的备份也一并清掉，免得以后有人误用
+    for f in /etc/log/awesun/ident-bak-*; do
+        [ -d "$f" ] && log "提示：另有一份旧备份 $f（本功能不使用）"
+    done
+    return 0
+}
+
+cmd_console() {
+    [ -x /usr/local/awesuncli/bin/awesuncli ] || die "先跑 awesunctl setup"
+    exec /usr/local/awesuncli/bin/awesuncli
+}
+
+case "${1:-status}" in
+setup)
+    ensure_runtime
+    link_rootfs
+    # 虚拟屏幕配置：只在没有时写一份带注释的默认值，绝不覆盖用户改过的
+    if [ ! -f "$SCREENS_CONF" ]; then
+        mkdir -p "$DATA"
+        cat > "$SCREENS_CONF" <<'SCREENEOF'
+# 虚拟屏幕配置：一行一屏，按顺序对应 Xvfb 的 -screen 0/1/2...（最多 8 块）
+#
+#   <类型> <宽>x<高> <目标>
+#     web   <网址>   用 WebKit 打开网页；留 - 表示爱快自己的页面
+#                    多个网址用 ; 隔开，会变成同一个窗口里的 tab
+#     shell <程序>   跑一个终端；程序留空或 - 就是交互式 shell，也可以写 top 等
+#     blank -        空屏（只铺底色）
+#
+# 网页全部由**一个** awesun-shell 进程承载（tab），窗口落在第一条 web 屏上；
+# 再写多条 web 屏只是往同一个窗口加 tab，不会多起进程。终端每屏一个 xterm。
+#
+# 例（第一屏给命令行、第二屏给爱快网页 + 一个外网站）：
+#   shell 1280x720 -
+#   web   1920x1080 http://127.0.0.1/;http://example.com/
+web 1280x720 -
+SCREENEOF
+        log "已写入默认屏幕配置 $SCREENS_CONF"
+    fi
+    # 设备上已经有身份（比如装插件前就登录过）就存一份。
+    #
+    # **这里不再有"未绑定就不存"的守卫。**
+    # 那个守卫当初是为了避开"未绑定设备每次开机都重新注册，存下来再还原会跟客户端
+    # 打架"。现在"重新注册"这件事已经在**发起处**被拦掉了 ——
+    # libawesun_hook.so 的 prelogon 钩子（见 src/hook/src/monitor.rs）：
+    # 本地已经有 license 就不去云端取。身份本身就是稳的。
+    #
+    # 留着守卫反而有害：只要备份是在"已注册但未绑定"时存下的，之后一绑定，
+    # 备份和在线状态就永久分叉；重启时 ident_restore 会把那份旧身份抄回去，
+    # 绑定被抹掉、识别码回退到旧值（实测踩到，就是用户报的"识别码会变"）。
+    # 无条件存 + 无条件还原，两边永远一致，才是干净的。
+    if [ -f /etc/sys_ent_config.conf ] && [ ! -f "$IDENT_DIR/sys_ent_config.conf" ]; then
+        ident_save
+    fi
+    ident_restore
+    start_all
+    cmd_status
+    ;;
+boot)
+    mkdir -p "$PIDDIR"
+    ensure_runtime 2>/dev/null || true
+    [ -x "$RT_APP/bin/awesuncli_daemon" ] || { log "runtime 未就绪，boot 跳过（先 awesunctl setup）"; exit 0; }
+    # 关键：根分区每次开机还原，/lib 下的 glibc 软链、/usr/local/awesuncli 全都没了。
+    # 不重建的话所有 glibc 程序（含向日葵和我们自己的）都会以
+    # "No such file or directory" 起不来 —— 表现就是"重启后彻底失效"。
+    #
+    # 钩子**不在**这个清单里：它写在向日葵 ELF 的 DT_NEEDED 上，payload 里就是
+    # 打过补丁的，重启/重装都不影响（见 link_rootfs 末尾的说明）。
+    link_rootfs
+    ident_restore
+    start_all
+    ;;
+start)   mkdir -p "$PIDDIR"; start_all ;;
+stop)    stop_all ;;
+restart) stop_all; mkdir -p "$PIDDIR"; start_all ;;
+status)  cmd_status ;;
+ident-save)    ident_save ;;
+ident-restore) ident_restore ;;
+ident-show)    ident_show ;;
+screens)       cmd_screens "$@" ;;
+code)          cmd_code ;;
+session-state) session_state ;;
+content)       content_start ;;
+login)         cmd_login "${2:-}" ;;
+logout)        cmd_logout ;;
+setpwd)        cmd_setpwd ;;
+console) cmd_console ;;
+*)
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+esac

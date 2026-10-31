@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AList 网盘聚合</title>
+<style>
+  :root { --bd:#e4e7ed; --fg:#303133; --mut:#909399; --pri:#409eff; --ok:#67c23a; --warn:#e6a23c; --err:#f56c6c; --bg:#f5f7fa; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:14px; font:13px/1.6 "Microsoft YaHei",Helvetica,Arial,sans-serif; color:var(--fg); background:#fff; }
+  h3 { margin:0 0 10px; font-size:15px; }
+  h4 { margin:16px 0 6px; font-size:13px; color:#606266; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; }
+  .card { flex:1 1 150px; min-width:140px; border:1px solid var(--bd); border-radius:6px; padding:10px 12px; background:var(--bg); }
+  .card .k { color:var(--mut); font-size:12px; }
+  .card .v { font-size:16px; font-weight:700; margin-top:2px; word-break:break-all; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .err { color:var(--err); } .mut { color:var(--mut); }
+  pre { margin:0; padding:10px; background:#1e1e1e; color:#d4d4d4; border-radius:5px; max-height:260px; overflow:auto; font:12px/1.5 Consolas,Monaco,monospace; white-space:pre-wrap; }
+  button { cursor:pointer; border:1px solid var(--bd); background:#fff; border-radius:4px; padding:5px 12px; font-size:12px; }
+  button:hover:not(:disabled) { border-color:var(--pri); color:var(--pri); }
+  button.pri { background:var(--pri); border-color:var(--pri); color:#fff; }
+  button.pri:hover:not(:disabled) { background:#66b1ff; color:#fff; }
+  button.dgr { color:var(--err); border-color:#fbc4c4; }
+  button.dgr:hover:not(:disabled) { background:var(--err); border-color:var(--err); color:#fff; }
+  button:disabled { cursor:not-allowed; opacity:.5; }
+  .bar { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  .msg { min-height:18px; font-size:12px; color:var(--mut); }
+  .tag { display:inline-block; padding:1px 8px; border-radius:9px; font-size:11px; color:#fff; background:var(--mut); }
+  .tag.run { background:var(--ok); } .tag.stp { background:var(--err); }
+  .tip { color:var(--mut); font-size:12px; line-height:1.8; }
+  input { border:1px solid var(--bd); border-radius:4px; padding:4px 8px; font-size:12px; }
+  input:focus { outline:none; border-color:var(--pri); }
+  code { background:#f2f3f5; padding:0 4px; border-radius:3px; }
+  .linkbox { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+  .linkbox a { color:var(--pri); text-decoration:none; word-break:break-all; }
+  .linkbox a:hover { text-decoration:underline; }
+  .pwdbox { background:#fdf6ec; border:1px solid #faecd8; border-radius:6px; padding:10px 12px; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h3 style="margin:0">AList 网盘聚合</h3>
+  <span class="tag stp" id="tag">检测中…</span>
+  <span style="flex:1"></span>
+  <span class="msg" id="msg"></span>
+  <button onclick="load()">刷新</button>
+</div>
+
+<div class="row" id="cards"></div>
+
+<h4>访问入口</h4>
+<div class="linkbox">
+  <span class="mut">Web 界面:</span><a id="webUrl" href="#" target="_blank">—</a>
+  <button onclick="openWeb()">打开</button>
+  <button onclick="copyText(el('webUrl').href)">复制</button>
+</div>
+<div class="linkbox">
+  <span class="mut">WebDAV:</span><a id="davUrl" href="#" target="_blank">—</a>
+  <button onclick="copyText(el('davUrl').href)">复制</button>
+  <span class="tip">挂载参数: 地址 <code>/dav</code>, 账号 <code>admin</code>, 密码同 Web</span>
+</div>
+
+<h4>服务</h4>
+<div class="bar">
+  <button id="bStart" class="pri" onclick="ctl('start')">启动</button>
+  <button id="bStop"  class="dgr" onclick="ctl('stop')">停止</button>
+  <button id="bRestart" onclick="ctl('restart')">重启</button>
+  <span class="tip">改端口后需重启生效，下面保存端口会自动重启</span>
+</div>
+
+<h4>设置</h4>
+<div class="bar">
+  自定义端口 <input id="port" size="6" maxlength="5" placeholder="5244">
+  <button class="pri" onclick="savePort()">保存端口</button>
+  <span class="tip">默认 5244；运行中会自动重启切换，冲突会自动保留旧端口</span>
+  <span style="width:18px"></span>
+  开机自启
+  <button id="bAuto1" onclick="saveAuto(1)">开启</button>
+  <button id="bAuto0" onclick="saveAuto(0)">关闭</button>
+</div>
+
+<h4>管理员密码</h4>
+<div id="pwdInit" class="pwdbox" style="display:none">
+  <div>初始密码（首次安装自动生成，请尽快修改）：
+    <b id="initPwd" style="user-select:all"></b>
+    <button onclick="copyText(el('initPwd').textContent)">复制</button>
+  </div>
+</div>
+<div class="bar" style="margin-top:8px">
+  新密码 <input id="npwd" size="22" autocomplete="new-password">
+  <button onclick="genPwd()">随机生成</button>
+  <button class="pri" onclick="savePwd()">修改密码</button>
+  <span class="tip">4~64 位，不能含空格、引号、反斜杠</span>
+</div>
+
+<p class="tip">
+  添加网盘 / 挂载存储 / 设置用户权限，请点上方「打开」进入 AList 自己的管理界面（账号 <code>admin</code>）。<br>
+  数据保存在持久分区 <code>/etc/mnt/plugins/alist/data/alist/</code>，重启不丢；进程由 <code>boot.sh</code> 每次开机重新拉起。
+</p>
+
+<h4>运行日志 <button onclick="loadLog()">刷新日志</button></h4>
+<pre id="log">（点「刷新日志」查看）</pre>
+
+<script>
+function el(id){ return document.getElementById(id); }
+function tip(t, cls){
+  var m = el('msg'); m.textContent = t || ''; m.className = (cls || 'msg');
+  if (t) { setTimeout(function(){ if (m.textContent===t) m.textContent=''; }, 6000); }
+}
+function copyText(t){
+  t = String(t || '');
+  if (!t || t === '—') return;
+  var done = function(){ tip('已复制', 'msg ok'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(done, function(){ fallback(); });
+  } else { fallback(); }
+  function fallback(){
+    var ta = document.createElement('textarea');
+    ta.value = t; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch(e){ tip('复制失败，请手动选择', 'msg err'); }
+    document.body.removeChild(ta);
+  }
+}
+function fmtUp(s){
+  s = parseInt(s, 10) || 0;
+  if (s <= 0) return '-';
+  var d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d) return d + '天' + h + '时';
+  if (h) return h + '时' + m + '分';
+  return m + '分';
+}
+// action 调用: show 类返回 Data, 其它动作成功时后端不回传内容
+function api(action, param, opt){
+  opt = opt || {};
+  var ms = opt.timeout || 20000;
+  var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+  var timer = null;
+  var init = { method:'POST', headers:{'Content-Type':'application/json'},
+               body: JSON.stringify({ func_name:'alist', action:action, param:param||{} }) };
+  if (ctl) { init.signal = ctl.signal; timer = setTimeout(function(){ ctl.abort(); }, ms); }
+  return fetch('/Action/call', init).then(function(r){ return r.json(); }).then(function(j){
+    if (timer) clearTimeout(timer);
+    if (j.Result !== 30000) throw new Error(j.ErrMsg || ('错误码 ' + j.Result));
+    return j.Data || {};
+  }).catch(function(e){
+    if (timer) clearTimeout(timer);
+    if (e.name === 'AbortError') throw new Error('后端 ' + Math.round(ms/1000) + ' 秒无响应(action=' + action + ')');
+    throw e;
+  });
+}
+
+var S = null;   // 最近一次 status
+
+function load(){ return api('show', {TYPE:'status'}).then(render).catch(function(e){ tip('加载失败: '+e.message, 'msg err'); }); }
+
+function render(d){
+  var s = d && d.status;
+  if (!s || typeof s !== 'object') { tip('后端没有返回状态数据', 'msg err'); return; }
+  S = s;
+  var run = s.running === true;
+  var tag = el('tag');
+  tag.textContent = run ? '运行中' : '未运行';
+  tag.className = 'tag ' + (run ? 'run' : 'stp');
+
+  var html = '';
+  html += card('运行状态', run ? '运行中' : '未运行', run ? 'ok' : 'err');
+  html += card('监听端口', s.port || '-');
+  html += card('版本', s.version || '-');
+  html += card('运行时长', run ? fmtUp(s.uptime) : '-');
+  el('cards').innerHTML = html;
+
+  var w = el('webUrl'), dv = el('davUrl');
+  w.textContent = s.web_url || '—'; w.href = s.web_url || '#';
+  dv.textContent = s.webdav_url || '—'; dv.href = s.webdav_url || '#';
+
+  // 按钮状态: 运行中只能 停止/重启, 停止时只能 启动
+  el('bStart').disabled = run; el('bStop').disabled = !run; el('bRestart').disabled = !run;
+
+  if (document.activeElement.id !== 'port') el('port').value = s.port || '';
+  setAutoUI(s.autostart);
+
+  // 初始密码: 只有"装完没改过"才显示
+  if (s.pwd_state === 'initial' && s.init_pwd) {
+    el('pwdInit').style.display = '';
+    el('initPwd').textContent = s.init_pwd;
+  } else {
+    el('pwdInit').style.display = 'none';
+  }
+}
+function card(k, v, cls){
+  return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';
+}
+
+function setAutoUI(v){
+  el('bAuto1').className = (v == 1 || v === '1' || v === true) ? 'pri' : '';
+  el('bAuto0').className = (v == 0 || v === '0') ? 'dgr' : '';
+}
+
+function busy(btn, on, txt){
+  if (on) { btn.dataset.t = btn.textContent; btn.textContent = txt || '执行中…'; btn.disabled = true; }
+  else { btn.textContent = btn.dataset.t || btn.textContent; btn.disabled = false; }
+}
+
+function ctl(op){
+  // start/restart 后端要等端口就绪, 给足超时
+  var long = (op === 'start' || op === 'restart');
+  var btn = el(op === 'start' ? 'bStart' : (op === 'stop' ? 'bStop' : 'bRestart'));
+  busy(btn, true);
+  api('ctl', {op:op}, {timeout: long ? 50000 : 15000}).then(function(){
+    tip(op === 'stop' ? '已停止' : '已' + (op === 'start' ? '启动' : '重启'), 'msg ok');
+  }).catch(function(e){
+    tip((op === 'start' ? '启动' : op === 'stop' ? '停止' : '重启') + '失败: ' + e.message, 'msg err');
+  }).then(function(){ busy(btn, false); load(); });
+}
+
+function savePort(){
+  var v = el('port').value.trim();
+  if (!/^\d{1,5}$/.test(v) || +v < 1 || +v > 65535) { tip('端口需为 1~65535 的数字', 'msg err'); return; }
+  var wasRun = !!(S && S.running);
+  api('seting', {key:'port', value:v}, {timeout:50000}).then(function(){
+    return load();
+  }).then(function(){
+    var now = (S && S.port) ? S.port : v;
+    tip(now == v ? ('端口已生效: ' + now) : ('已保留在端口 ' + now + '（新端口不可用）'), S.running ? 'msg ok' : 'msg warn');
+    if (!S.running) tip('端口已保存: ' + v + (wasRun ? '' : '（服务未运行，下次启动生效）'), 'msg warn');
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+
+function saveAuto(v){
+  api('seting', {key:'autostart', value:String(v)}).then(function(){
+    tip(v ? '开机自启已开启' : '开机自启已关闭', 'msg ok');
+    setAutoUI(v);
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+
+function genPwd(){
+  var n = 12, s = '', arr = new Uint8Array(n);
+  if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(arr);
+  else for (var i=0;i<n;i++) arr[i] = Math.floor(Math.random()*256);
+  var hex = '0123456789abcdef';
+  for (var i=0;i<n;i++) s += hex[arr[i] & 15];
+  el('npwd').value = s;
+}
+
+function savePwd(){
+  var v = el('npwd').value;
+  if (!v) { tip('请先输入或随机生成新密码', 'msg err'); return; }
+  if (/[\s"'\\]/.test(v)) { tip('密码不能含空格、引号、反斜杠', 'msg err'); return; }
+  if (v.length < 4) { tip('密码至少 4 位', 'msg err'); return; }
+  api('passwd', {op:'set', value:v}).then(function(){
+    el('npwd').value = '';
+    tip('密码已修改, 请用新密码登录', 'msg ok');
+  }).catch(function(e){ tip('修改失败: '+e.message, 'msg err'); }).then(load);
+}
+
+function loadLog(){
+  el('log').textContent = '加载中…';
+  api('show', {TYPE:'log'}).then(function(d){
+    el('log').textContent = d.logtext || '（暂无日志）';
+    el('log').scrollTop = el('log').scrollHeight;
+  }).catch(function(e){ el('log').textContent = '加载失败: ' + e.message; });
+}
+
+function openWeb(){
+  var u = (S && S.web_url) || el('webUrl').href;
+  if (u && u !== '#') window.open(u, '_blank');
+}
+
+load();
+setInterval(function(){ if (!document.hidden && !el('npwd').value) load(); }, 30000);
+</script>
+</body>
+</html>

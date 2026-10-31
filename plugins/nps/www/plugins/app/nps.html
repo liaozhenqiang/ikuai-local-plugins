@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>NPS 内网穿透服务端</title>
+<style>
+  :root { --bd:#e4e7ed; --fg:#303133; --mut:#909399; --pri:#409eff; --ok:#67c23a; --warn:#e6a23c; --err:#f56c6c; --bg:#f5f7fa; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:14px; font:13px/1.6 "Microsoft YaHei",Helvetica,Arial,sans-serif; color:var(--fg); background:#fff; }
+  h3 { margin:0; font-size:15px; }
+  h4 { margin:16px 0 6px; font-size:13px; color:#606266; }
+  .bar { display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; }
+  .card { flex:1 1 150px; min-width:140px; border:1px solid var(--bd); border-radius:6px; padding:10px 12px; background:var(--bg); }
+  .card .k { color:var(--mut); font-size:12px; }
+  .card .v { font-size:15px; font-weight:700; margin-top:2px; word-break:break-all; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .err { color:var(--err); }
+  button { cursor:pointer; border:1px solid var(--bd); background:#fff; border-radius:4px; padding:5px 12px; font-size:12px; }
+  button:hover { border-color:var(--pri); color:var(--pri); }
+  button.pri { background:var(--pri); border-color:var(--pri); color:#fff; }
+  button.danger:hover { border-color:var(--err); color:var(--err); }
+  .msg { min-height:18px; font-size:12px; color:var(--mut); }
+  .tag { display:inline-block; padding:1px 7px; border-radius:9px; font-size:11px; background:var(--bd); color:#fff; }
+  .tip { color:var(--mut); font-size:12px; line-height:1.8; }
+  .warnbox { border:1px solid #fde2e2; background:#fef0f0; color:#c45656; border-radius:5px; padding:7px 10px; font-size:12px; margin:6px 0; }
+  .creds { border:1px solid #e1f3d8; background:#f0f9eb; color:#529b2e; border-radius:5px; padding:7px 10px; font-size:12px; margin:6px 0; }
+  input { border:1px solid var(--bd); border-radius:4px; padding:4px 8px; font-size:12px; }
+  code { background:#f2f3f5; padding:0 4px; border-radius:3px; }
+  label { color:var(--mut); font-size:12px; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h3 style="margin:0">NPS 内网穿透服务端</h3>
+  <span class="tag">nps</span>
+  <span style="flex:1"></span>
+  <span class="msg" id="msg"></span>
+  <button onclick="load()">刷新</button>
+</div>
+
+<div class="row" id="cards"></div>
+
+<h4>控制</h4>
+<div class="bar">
+  <button class="pri" onclick="ctl('start')">启动</button>
+  <button class="danger" onclick="ctl('stop')">停止</button>
+  <button onclick="ctl('restart')">重启</button>
+</div>
+<div class="bar">
+  <label>开机自启</label>
+  <button id="auto1" onclick="setAuto(1)">开启</button>
+  <button id="auto0" onclick="setAuto(0)">关闭</button>
+  <span class="tip">关闭后，重启路由器不会自动拉起服务，需手动点「启动」</span>
+</div>
+
+<h4>配置</h4>
+<div class="bar">
+  <label>Web 管理端口</label> <input id="web_port" size="7" placeholder="81">
+  <label>桥接端口</label> <input id="bridge_port" size="7" placeholder="8024">
+</div>
+<div class="bar">
+  <label>管理账号</label> <input id="web_username" size="14" placeholder="admin">
+  <label>管理密码</label> <input id="web_password" size="14" placeholder="登录密码">
+  <label>配置模式密钥</label> <input id="public_vkey" size="14" placeholder="留空=关闭">
+  <button class="pri" onclick="save()">保存并重启</button>
+</div>
+<p class="tip">
+  桥接端口是客户端 <code>npc</code> 连接服务端用的端口（<code>-server=&lt;本机IP&gt;:8024</code>）。
+  HTTP/HTTPS 代理端口故意留空，避免与 iKuai 控制台的 80/443 冲突；需要时请在 nps 自己的 Web 界面里开启。
+  全部配置保存在 <code>/etc/mnt/plugins/nps/data/conf/nps.conf</code>，重启与升级不丢。
+</p>
+
+<h4>NPS 管理界面</h4>
+<div class="bar">
+  <code id="uiUrl">-</code>
+  <button class="pri" onclick="openUi()">在新窗口打开</button>
+</div>
+<div id="uiHint" class="tip"></div>
+<div id="creds" class="creds" style="display:none"></div>
+
+<h4>运行日志 <button onclick="loadLog()">刷新日志</button> <button class="danger" onclick="clearLog()">清空日志</button></h4>
+<pre id="log" style="max-height:300px;overflow:auto;background:var(--bg);border:1px solid var(--bd);border-radius:4px;padding:8px;font-size:12px;white-space:pre-wrap;word-break:break-all;margin:0">（点「刷新日志」查看）</pre>
+
+<script>
+
+function api(action, param) {
+  return fetch('/Action/call', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ func_name:'nps', action:action, param:param||{} })
+  }).then(function(r){ return r.json(); }).then(function(j){
+    if (j.Result !== 30000) { throw new Error(j.ErrMsg || ('错误码 '+j.Result)); }
+    return j.Data || {};
+  });
+}
+function tip(t, cls) {
+  var m = document.getElementById('msg');
+  m.textContent = t || ''; m.className = (cls || 'msg');
+  if (t) { setTimeout(function(){ if (m.textContent===t) m.textContent=''; }, 7000); }
+}
+function card(k, v, cls) {
+  return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';
+}
+function pick(d, key) { return (d && d[key]) || (d && d.data && d.data[key]) || null; }
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+var curStatus = {};
+
+function webPort() {
+  var p = String(curStatus.web_port || '');
+  return /^\d+$/.test(p) ? p : '81';
+}
+function uiUrl() { return 'http://' + window.location.hostname + ':' + webPort() + '/'; }
+function isRun() {
+  var r = curStatus.running;
+  return r === true || r === 'true' || r === 1 || r === '1';
+}
+function webOk() {
+  var c = String(curStatus.web_code == null ? '' : curStatus.web_code);
+  return isRun() && c !== '' && c !== '000';
+}
+function hint(text, cls) {
+  var el = document.getElementById('uiHint');
+  el.className = cls || 'tip';
+  el.textContent = text || '';
+}
+function setVal(id, v) {
+  var el = document.getElementById(id);
+  if (document.activeElement !== el) el.value = (v == null ? '' : v);
+}
+
+function load() {
+  return api('show', {TYPE:'data'}).then(function(d){
+    var s = pick(d,'status') || {};
+    curStatus = s;
+    var run = isRun();
+    var html = '';
+    html += card('运行状态', run ? '运行中' : '未运行', run ? 'ok' : 'err');
+    html += card('进程 PID', s.pid || '-');
+    html += card('Web 管理端口', s.web_port || '-');
+
+    var portTxt = '未运行', portCls = 'err';
+    if (run) {
+      var c = String(s.web_code == null ? '' : s.web_code);
+      var wo = String(s.web_ok || 'unknown');
+      // web_ok 由后端指纹判定: 只看 http_code 会把别的服务返回的 302 当成自己正常
+      if (wo === 'ok') { portTxt = '正常 (HTTP ' + c + ')'; portCls = 'ok'; }
+      else if (wo === 'conflict') { portTxt = '被其他服务占用'; portCls = 'err'; }
+      else if (wo === 'down') { portTxt = '端口无响应'; portCls = 'err'; }
+      else if (c !== '' && c !== '000') { portTxt = '正常 (HTTP ' + c + ')'; portCls = 'ok'; }
+      else { portTxt = '端口无响应'; portCls = 'err'; }
+    }
+    html += card('管理端口状态', portTxt, portCls);
+    html += card('桥接端口', s.bridge_port || '-');
+    html += card('版本', 'v' + (s.version || '-'));
+    document.getElementById('cards').innerHTML = html;
+
+    document.getElementById('uiUrl').textContent = uiUrl();
+    setVal('web_port', s.web_port);
+    setVal('bridge_port', s.bridge_port);
+    setVal('web_username', s.web_user);
+    setVal('web_password', s.web_pass);
+    setVal('public_vkey', s.public_vkey);
+    setAutoUI(s.autostart);
+
+    if (!run) {
+      hint('服务未运行 —— 请先点上面的「启动」。', 'warnbox');
+    } else if (String(s.web_ok) === 'conflict') {
+      hint('进程在运行，但 ' + webPort() + ' 端口上跑的不是 nps（被别的服务占用了，' +
+           'HTTP ' + (s.web_code || '空') + ' 是对方的响应）。请换一个 Web 管理端口，' +
+           '或停掉占用者后重启。', 'warnbox');
+    } else if (!webOk()) {
+      hint('进程在运行，但 ' + webPort() + ' 端口没有响应（curl 返回 ' + (s.web_code || '空') +
+           '）。多半是端口被占用，请换一个 Web 管理端口。', 'warnbox');
+    } else {
+      hint('管理界面已就绪，点「在新窗口打开」进入（' + uiUrl() + '）。');
+    }
+
+    var creds = document.getElementById('creds');
+    if (s.web_user) {
+      creds.style.display = '';
+      creds.innerHTML = '登录账号：<b>' + esc(s.web_user) + '</b>　密码：<b>' + esc(s.web_pass) +
+                        '</b>　（首次安装自动生成，可在此页修改）';
+    } else {
+      creds.style.display = 'none';
+    }
+  }).catch(function(e){ tip('加载失败: '+e.message, 'err'); });
+}
+function ctl(action) {
+  api(action, {}).then(function(){ tip('已执行: '+action, 'ok'); load(); })
+    .catch(function(e){ tip('操作失败: '+e.message, 'err'); });
+}
+// 开机自启: 只改"下次开机要不要自动起来", 不动当前运行状态
+function setAuto(v) {
+  api('seting', {key:'autostart', value:String(v)}).then(function(){
+    tip(v ? '开机自启已开启' : '开机自启已关闭', 'ok'); load();
+  }).catch(function(e){ tip('保存失败: '+e.message, 'err'); });
+}
+function setAutoUI(v) {
+  var on = (v === '1' || v === 1 || v === true);
+  document.getElementById('auto1').className = on ? 'pri' : '';
+  document.getElementById('auto0').className = on ? '' : 'danger';
+}
+function save() {
+  var items = [
+    ['web_port', document.getElementById('web_port').value.trim()],
+    ['bridge_port', document.getElementById('bridge_port').value.trim()],
+    ['web_username', document.getElementById('web_username').value.trim()],
+    ['web_password', document.getElementById('web_password').value.trim()],
+    ['public_vkey', document.getElementById('public_vkey').value.trim()]
+  ].filter(function(x){ return x[1] !== ''; });
+
+  if (!items.length) { tip('没有要保存的内容', 'err'); return; }
+  var p = Promise.resolve();
+  items.forEach(function(x){
+    p = p.then(function(){ return api('seting', {key:x[0], value:x[1]}); });
+  });
+  p.then(function(){ tip('已保存并重启', 'ok'); load(); })
+   .catch(function(e){ tip('保存失败: '+e.message, 'err'); });
+}
+function openUi() { window.open(uiUrl(), '_blank'); }
+
+function loadLog(){
+  var e = document.getElementById('log');
+  e.textContent = '读取中 …';
+  return api('show', {TYPE:'log'}).then(function(d){
+    e.textContent = pick(d, 'log') || '(无日志)';
+    e.scrollTop = e.scrollHeight;
+  }).catch(function(err){ e.textContent = '读取失败: ' + err.message; });
+}
+function clearLog(){
+  if (!confirm('确定清空运行日志吗？')) return;
+  api('logclear', {}).then(function(){ tip('日志已清空', 'ok'); return loadLog(); })
+    .catch(function(err){ tip('清空失败: ' + err.message, 'err'); });
+}
+
+load();
+setInterval(function(){ if (!document.hidden) load(); }, 15000);
+</script>
+</body>
+</html>

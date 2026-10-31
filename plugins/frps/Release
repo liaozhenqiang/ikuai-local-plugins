@@ -1,0 +1,5 @@
+plugin=frps
+version=0.71.1.1
+author=fatedier/WorkBuddy
+title=FRP 内网穿透(服务端)
+description=frp 服务端(frps) V0.71.1 独立运行版：自定义通信端口与仪表盘端口、自动生成认证 Token、开机自启，静态 Go 二进制无需依赖。

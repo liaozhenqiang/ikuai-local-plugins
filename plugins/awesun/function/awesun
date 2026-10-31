@@ -1,0 +1,438 @@
+#!/bin/bash /etc/ikcommon
+#
+# awesun 插件后端接口（前端页面 /plugins/app/awesun.html）
+#
+# 动作：
+#   show        TYPE=data        状态总览（JSON）：葵码、登录态、虚拟屏幕、验证码
+#   control     op=start|stop|restart    起停整套（含虚拟桌面）
+#   login       account=.. password=..   代登录：驱动 awesuncli bind，判断并回显结果
+#   logout      -                        解绑账号
+#   setpwd      password=..              设置本机验证码（向日葵的独立密码）
+#   screens     op=get|set|sizes         虚拟屏幕配置读写
+#   ident       TYPE=data                身份凭证详情（JSON）
+#   identsave   -                        把当前登录态存成凭证
+#   identrestore-                        从凭证还原身份
+#   setuprt     -                        解压/下载 runtime（后台，用 show 轮询）
+#
+# 说明：真正的活都在 bin/awesunctl 里，这里只做参数校验与 JSON 组装。
+#       前端参数不能带空格和引号，自由文本用 '+' 代替空格。
+#
+# 关于"代登录"为什么要绕一圈：
+#   awesuncli 是个交互式 TUI，没有 --account/--password 这类选项，
+#   只能把 bind / 账号 / 密码按顺序喂给它的标准输入。
+#   它的结果**只打一句文案**（成功那句还没有稳定样本），所以判断不能只看文案：
+#     1) 输出里出现 "Binding failed" -> 失败，把那句话带回去
+#     2) 否则看设备上的 /etc/orayentconfig.conf 里 account 是不是真写上了 -> 成功
+#   这样文案变了也不会误判成"登录成功"。
+
+CTL=/etc/mnt/plugins/awesun/bin/awesunctl
+RT=/etc/log/awesun
+DATA_DIR=/etc/mnt/plugins/awesun/data
+AWESUNCLI=/usr/local/awesuncli/bin/awesuncli
+
+# 登录/设置验证码这类动作要几十秒，**超过框架给动作的等待时间**
+# （实测框架会先超时：ErrMsg = "failed to wait for process: timeout"）。
+# 所以做成异步：动作立刻返回，后台跑，把进度/结果写进这个文件，
+# 页面通过 show 轮询（login_state / login_msg）。
+ACT_STATE="$RT/act.state"
+
+# 设备没有 timeout，自己兜一个。
+#
+# **定时器子壳必须把 fd 全部掐掉**（</dev/null >/dev/null 2>&1）：
+# 它会继承本动作的 stdout 管道，而里面那个 `sleep` 会一直占着管道不放手
+# （kill 子壳杀不掉正在跑的 sleep）—— 框架于是要等到管道关闭才回应，
+# 表现就是 "failed to wait for process: timeout"（实测踩过）。
+rt_run() {   # rt_run <秒> <命令...>
+    local t="$1"; shift
+    "$@" > /tmp/.awesun_rt.$$ 2>&1 &
+    local p=$!
+    ( sleep "$t"; kill -9 $p 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+    local w=$!
+    wait $p 2>/dev/null
+    kill -9 $w 2>/dev/null
+    cat /tmp/.awesun_rt.$$ 2>/dev/null
+    rm -f /tmp/.awesun_rt.$$
+}
+
+# 把 awesuncli 当交互式 TUI 驱动：喂若干行，限时抓输出。
+# 它启动时会先打一屏 banner + 帮助，解析时要跳过。
+cli_drive() {   # cli_drive <秒> <多行输入>
+    [ -x "$AWESUNCLI" ] || { echo "找不到 awesuncli（先跑 setup）"; return 1; }
+    local t="$1" inp="$2"
+    printf '%b' "$inp" | "$AWESUNCLI" > /tmp/.awesun_cli.$$ 2>&1 &
+    local p=$!
+    ( sleep "$t"; kill -9 $p 2>/dev/null ) &
+    local w=$!
+    wait $p 2>/dev/null
+    kill -9 $w 2>/dev/null
+    # 去掉 ANSI 颜色，免得回显到网页上全是转义
+    sed 's/\x1b\[[0-9;]*m//g' /tmp/.awesun_cli.$$ 2>/dev/null | tr -d '\r'
+    rm -f /tmp/.awesun_cli.$$
+}
+
+conf_get() {   # conf_get <文件> <键>
+    grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2- | tr -d ' \r'
+}
+
+# ---------------------------------------------------------------- 代登录 / 验证码
+#
+# 真正的驱动逻辑在 bin/awesunctl（login/setpwd/logout），这里只做：
+#   - 参数校验
+#   - 把密码**从标准输入**喂过去（不走命令行参数，否则会出现在 ps 里）
+#   - 把成败与人话结果回给页面
+#
+# 为什么判断不靠文案：awesuncli 成功时那句提示没有稳定样本，改版就废。
+# awesunctl 里是按"设备上的账号/加密串有没有真的变化"来判的。
+
+# 起一个后台动作：动作名 + 账号/验证码。密码只经 tmpfs 中转，读完即删。
+# 结果写 ACT_STATE：第一行是状态（running|ok|fail），后面是给人看的说明。
+#
+# 用 setsid 脱离当前会话 —— 动作函数一返回，框架那边就把进程组收了，
+# 不走 setsid 的话后台任务会被一起杀掉（表现是永远停在 running）。
+bg_action() {   # bg_action <login|setpwd|logout> <参数>
+    local what="$1" arg="${2:-}"
+    local req=/tmp/.awesun-req.$$
+    # 密码走标准输入，不落持久盘；600 权限，读完就删
+    ( umask 077; cat > "$req" )
+
+    rm -f "$ACT_STATE"
+    printf 'running\n正在处理…\n' > "$ACT_STATE"
+
+    # 设备上**没有 setsid / nohup**（busybox 也没编这俩），所以不能靠它们脱离会话。
+    # 关键是重定向要作用在**整个后台作业**上：只重定向内部那条命令不够 ——
+    # fork 出来的 bash 自己还攥着框架给的 stdout 管道，框架会一直等到它退出。
+    # 表现就是动作挂 55 秒以上、最后 ErrMsg="failed to wait for process: timeout"
+    # （登录、设验证码都中招；其实后台早干完了）。
+    {
+        if [ -s "$req" ]; then "$CTL" "$what" $arg < "$req" > /tmp/.awesun-act.out 2>&1
+        else "$CTL" "$what" $arg > /tmp/.awesun-act.out 2>&1; fi
+        rc=$?
+        msg="$(grep -vE '^\[' /tmp/.awesun-act.out 2>/dev/null | tail -2 | tr '\n' ' ')"
+        [ -n "$msg" ] || msg='没有返回信息'
+        if [ "$rc" = 0 ]; then printf 'ok\n%s\n' "$msg" > "$ACT_STATE"
+        else printf 'fail\n%s\n' "$msg" > "$ACT_STATE"; fi
+        rm -f "$req" /tmp/.awesun-act.out
+    } </dev/null >/dev/null 2>&1 &
+    return 0
+}
+
+do_login() {
+    local account="$1" password="$2"
+    [ -n "$account" ]  || { echo "账号不能为空"; return 1; }
+    [ -n "$password" ] || { echo "密码不能为空"; return 1; }
+    [ -x "$CTL" ] || { echo "找不到 awesunctl"; return 1; }
+    printf '%s\n' "$password" | bg_action login "$account"
+    echo "已开始登录，几秒后自动刷新结果"
+    return 0
+}
+
+do_setpwd() {
+    local password="$1"
+    [ -n "$password" ] || { echo "验证码不能为空"; return 1; }
+    [ -x "$CTL" ] || { echo "找不到 awesunctl"; return 1; }
+    printf '%s\n' "$password" | bg_action setpwd
+    echo "已开始设置验证码，几秒后自动刷新结果"
+    return 0
+}
+
+# 动作状态（给页面轮询）：state / msg
+act_state() {
+    if [ -f "$ACT_STATE" ]; then
+        head -1 "$ACT_STATE"
+    else
+        echo ""
+    fi
+}
+act_msg() {
+    if [ -f "$ACT_STATE" ]; then
+        tail -n +2 "$ACT_STATE" | tr '\n' ' '
+    else
+        echo ""
+    fi
+}
+
+# ---------------------------------------------------------------- 状态
+
+# 注意：json_append 是**按键名直接展开同名变量**（`"键":${键}`，靠 bash 动态作用域），
+# 所以这里设的变量名必须和键名一模一样，不能带 __ 前缀。
+# 现解一次验证码（页面"刷新"按钮）：让钩子在向日葵进程里重新解 encry_pwd，
+# 设备换过码之后这里拿到的就是新的，不依赖上次缓存的 access-code。
+__show_code() {
+    local f=/etc/log/awesun/access-code code code_ts i
+    rm -f "$f" 2>/dev/null
+    : > /etc/log/awesun/refresh-code 2>/dev/null
+    i=0
+    while [ "$i" -lt 6 ]; do
+        sleep 1
+        [ -s "$f" ] && break
+        i=$((i + 1))
+    done
+    code="$(grep -m1 '^code=' "$f" 2>/dev/null | cut -d= -f2- | tr -d ' \r')"
+    code_ts="$(grep -m1 '^ts=' "$f" 2>/dev/null | cut -d= -f2- | tr -d ' \r')"
+    json_append __json_result__ code:str
+    json_append __json_result__ code_ts:str
+}
+
+__show_data() {
+    local online account fastcode license mac daemon desktop
+    local logged bound pwd_set screen_count screens runtime ident fb
+    local login_state login_msg sess_state content autologin
+    local kuaima idcode code
+    login_state="$(act_state)"
+    login_msg="$(act_msg)"
+    sess_state="$("$CTL" session-state 2>/dev/null)"
+    [ -n "$sess_state" ] || sess_state="none"
+    ps 2>/dev/null | grep -qE '[a]wesun-shell|[x]term' && content=1 || content=0
+    autologin="$(grep -m1 '^autologin=' "$DATA_DIR/ui.conf" 2>/dev/null | cut -d= -f2- | tr -d ' \r')"
+    [ -n "$autologin" ] || autologin=1
+    [ -r /sys/class/graphics/fb0/virtual_size ] && \
+        fb="$(cat /sys/class/graphics/fb0/virtual_size | tr ',' 'x')"
+
+    account="$(conf_get /etc/orayentconfig.conf account)"
+    mac="$(conf_get /etc/orayentconfig.conf macaddress)"
+    fastcode="$(conf_get /etc/sys_ent_config.conf fastcode)"
+    kuaima="$(conf_get /etc/sys_ent_config.conf sunlogincode)"
+    # 当前验证码（明文）：钩子在向日葵进程里解好写在这里，页面直接读
+    code="$(grep -m1 '^code=' /etc/log/awesun/access-code 2>/dev/null | cut -d= -f2- | tr -d ' \r')"
+    idcode="${fastcode#k}"
+    idcode="${idcode#K}"
+    license="$(conf_get /etc/sys_ent_config.conf license)"
+
+    ps 2>/dev/null | grep -q '[a]wesuncli --mod=service' && daemon=1 || daemon=0
+    if [ "$daemon" = 1 ]; then online=1; else online=0; fi
+
+    ps 2>/dev/null | grep -q '[X]vfb'      && desktop=1 || desktop=0
+    [ -x "$RT/app/bin/awesuncli_daemon" ] && [ -x "$RT/x11/bin/Xvfb" ] && runtime=1 || runtime=0
+    # 凭证在持久分区（/etc/log/awesun/identity），不在插件 data/ 下：
+    # 插件重装会重建 data/，身份不该跟着插件版本走
+    [ -f /etc/log/awesun/identity/sys_ent_config.conf ] && ident=1 || ident=0
+
+    [ -n "$account" ] && logged=1 || logged=0
+    # 绑定 = 配置里有账号。未绑定时向日葵每次启动都会重新领号，识别码不固定
+    bound=$logged
+
+    [ -n "$(conf_get /etc/sys_ent_config.conf sunloginaccesspassword)" ] && pwd_set=1 || pwd_set=0
+
+    screens="$("$CTL" screens 2>/dev/null | tr '\n' ';')"
+    screen_count="$("$CTL" screens 2>/dev/null | grep -c '|')"
+
+    json_append __json_result__ online:int
+    json_append __json_result__ logged:int
+    json_append __json_result__ bound:int
+    json_append __json_result__ account:str
+    json_append __json_result__ fastcode:str
+    json_append __json_result__ kuaima:str
+    json_append __json_result__ idcode:str
+    json_append __json_result__ code:str
+    json_append __json_result__ license:str
+    json_append __json_result__ mac:str
+    json_append __json_result__ daemon:int
+    json_append __json_result__ desktop:int
+    json_append __json_result__ runtime:int
+    json_append __json_result__ ident:int
+    json_append __json_result__ pwd_set:int
+    json_append __json_result__ screen_count:int
+    json_append __json_result__ screens:str
+    json_append __json_result__ login_state:str
+    json_append __json_result__ login_msg:str
+    json_append __json_result__ sess_state:str
+    json_append __json_result__ content:int
+    json_append __json_result__ autologin:int
+    json_append __json_result__ fb:str
+}
+
+# 命名必须是 __show_<TYPE>：Show 按 $TYPE 找同名函数，
+# 而且只给 action=show 的调用包 Data，所以页面查凭证也走 show + TYPE=ident。
+__show_ident() {
+    local d="$DATA_DIR/identity"
+    local saved saved_at fastcode mac account license cur_fastcode cur_mac
+    saved=0
+    [ -f "$d/meta" ] && saved=1
+    saved_at=""; fastcode=""; mac=""; account=""; license=""
+    if [ "$saved" = 1 ]; then
+        saved_at="$(conf_get "$d/meta" saved_at)"
+        fastcode="$(conf_get "$d/meta" fastcode)"
+        mac="$(conf_get "$d/meta" macaddress)"
+        account="$(conf_get "$d/meta" account)"
+        license="$(conf_get "$d/meta" license)"
+    fi
+    cur_fastcode="$(conf_get /etc/sys_ent_config.conf fastcode)"
+    cur_mac="$(conf_get /etc/orayentconfig.conf macaddress)"
+
+    json_append __json_result__ saved:int
+    json_append __json_result__ saved_at:str
+    json_append __json_result__ fastcode:str
+    json_append __json_result__ kuaima:str
+    json_append __json_result__ idcode:str
+    json_append __json_result__ mac:str
+    json_append __json_result__ account:str
+    json_append __json_result__ license:str
+    json_append __json_result__ cur_fastcode:str
+    json_append __json_result__ cur_mac:str
+}
+
+# **不要显式调 __show_data**：Show 会按 $TYPE 调 __show_<TYPE>，
+# 两边都调会让每个键追加两遍（JSON 里出现重复键）。
+# $TYPE 由请求参数给（默认 data），所以 show + TYPE=ident 也能用。
+show() {
+    Show __json_result__
+}
+
+# 命令行/兼容入口：等价于 show + TYPE=ident。
+# （页面直接用 show 带 TYPE=ident，见 __show_ident 上面的说明）
+ident() {
+    TYPE=ident
+    Show __json_result__
+}
+
+control() {
+    case "$op" in
+        start|stop|restart) ;;
+        *) echo "不支持的 op: $op"; return 1 ;;
+    esac
+    local out
+    # 起停会拉 X 服务器，Xvfb 里的 xkbcomp 会往 stderr 刷一堆
+    # "Could not resolve keysym ..." 的告警。它们会漏到接口的 stderr 上，
+    # 框架看到 stderr 就回 Result=30002（页面会当成错误弹出来）。
+    # 把这些噪声收进日志：只让"我们自己的那行话"上 stdout。
+    out="$( { rt_run 120 "$CTL" "$op"; } 2>>"$RT/control.log" )"
+    case "$out" in
+        *"!!"*) echo "$out" | tail -3; return 1 ;;
+        *) echo "已执行 $op"; return 0 ;;
+    esac
+}
+
+# 虚拟屏幕：get 返回可读清单；set 把前端给的配置交给 awesunctl 校验落盘，
+# 落盘成功后重启虚拟桌面让它生效（重启放在这里，用户只要点一次"应用"）。
+# sizes 给页面下拉用的推荐分辨率。
+screens() {
+    case "$op" in
+        get)
+            "$CTL" screens show 2>&1 | tr '\n' ';'
+            ;;
+        sizes)
+            "$CTL" screens sizes 2>&1
+            ;;
+        set)
+            # **参数里不能有空格/逗号/分号**（框架会回 "Invalid characters"），
+            # 所以屏幕配置按序号分字段传：
+            #   n=2  t0=shell s0=1280x720 g0=-  t1=web s1=1920x1080 g1=http://...
+            # 这里拼回 awesunctl 认的 "<类型> <WxH> <目标>" 每行一屏。
+            local i t sz g cfg="" line
+            case "${n:-}" in ''|*[!0-9]*) echo "缺少屏幕数量 n"; return 1 ;; esac
+            [ "$n" -ge 1 ] || { echo "至少要保留一块屏"; return 1; }
+            [ "$n" -le 8 ] || { echo "最多 8 块屏（收到 $n）"; return 1; }
+
+            i=0
+            while [ "$i" -lt "$n" ]; do
+                eval "t=\${t$i}"
+                eval "sz=\${s$i}"
+                eval "g=\${g$i}"
+                [ -n "$t" ]  || { echo "第 $i 块屏缺少类型"; return 1; }
+                [ -n "$sz" ] || { echo "第 $i 块屏缺少分辨率"; return 1; }
+                [ -n "$g" ] || g="-"
+                line="$t $sz $g"
+                if [ -z "$cfg" ]; then cfg="$line"; else cfg="$cfg
+$line"; fi
+                i=$((i+1))
+            done
+
+            [ -x "$CTL" ] || { echo "找不到 awesunctl"; return 1; }
+            local out
+            out="$(printf '%s\n' "$cfg" | rt_run 60 "$CTL" screens set 2>&1)"
+            case "$out" in
+                *"!!"*) echo "$out" | tail -2; return 1 ;;
+            esac
+            echo "${out:-已保存屏幕配置}"
+            # 让新配置生效：重启虚拟桌面（向日葵会短暂断开）。
+            #
+            # **必须 setsid 彻底脱离**：只写 `( ... ) &` 的话子进程还挂在
+            # 动作的 stdout 管道上，框架会一直等到它退出 —— 表现就是
+            # "failed to wait for process: timeout"（实测踩过）。
+            if command -v setsid >/dev/null 2>&1; then
+                setsid "$CTL" restart > /tmp/.awesun-restart.out 2>&1 </dev/null &
+            else
+                ( "$CTL" restart > /tmp/.awesun-restart.out 2>&1 </dev/null & ) &
+            fi
+            echo "已应用，虚拟桌面正在重启"
+            return 0
+            ;;
+        *)
+            echo "不支持的 op: $op"; return 1 ;;
+    esac
+}
+
+
+
+# 网页屏自动登录的凭据。
+#
+# **用户名和密码都是 base64 传进来的**：框架会拒绝带空格/逗号/分号的参数
+# （"Invalid characters"），而密码里完全可能有这些字符。
+# base64 的字母表只有 A-Za-z0-9+/= —— 这几个都能过。
+#
+# 落盘在插件 data 目录、权限 600。这是本机 iKuai 后台的登录密码，
+# 想清楚再填；不填就不自动登录。
+webui() {
+    local f="$DATA_DIR/webui.conf" u="" pp="" aon="${autologin:-}"
+    local u_b64="${user_b64:-}" p_b64="${pass_b64:-}"
+
+    if [ -n "$u_b64" ]; then
+        u="$(printf '%s' "$u_b64" | base64 -d 2>/dev/null)" || { echo "用户名解码失败"; return 1; }
+    fi
+    if [ -n "$p_b64" ]; then
+        pp="$(printf '%s' "$p_b64" | base64 -d 2>/dev/null)" || { echo "密码解码失败"; return 1; }
+    fi
+    if [ -n "$aon" ]; then
+        case "$aon" in 0|1) ;; *) echo "autologin 只能是 0 或 1"; return 1 ;; esac
+    fi
+    [ -n "$u_b64$p_b64$aon" ] || { echo "没有要保存的内容"; return 1; }
+
+    mkdir -p "$DATA_DIR" 2>/dev/null
+    if [ ! -f "$f" ]; then
+        printf 'user=\npass=\nautologin=1\n' > "$f"
+    fi
+    if [ -n "$u_b64" ]; then
+        # 用 | 当分隔符，密码里出现 / 也不会把它弄坏
+        sed -i "s|^user=.*|user=$u|" "$f"
+    fi
+    if [ -n "$p_b64" ]; then
+        sed -i "s|^pass=.*|pass=$pp|" "$f"
+    fi
+    chmod 600 "$f" 2>/dev/null
+    if [ -n "$aon" ]; then
+        [ -f "$DATA_DIR/ui.conf" ] || printf 'autologin=1\n' > "$DATA_DIR/ui.conf"
+        sed -i "s/^autologin=.*/autologin=$aon/" "$DATA_DIR/ui.conf"
+    fi
+    echo "已保存（自动登录 $(grep -m1 '^autologin=' "$DATA_DIR/ui.conf" | cut -d= -f2)，免密，不需要账号密码）"
+    return 0
+}
+
+identsave() {
+    [ -f /etc/sys_ent_config.conf ] || { echo "设备上还没有向日葵身份（先登录一次）"; return 1; }
+    local out
+    out="$(rt_run 30 "$CTL" ident-save 2>&1)"
+    echo "$out" | grep -q "已保存" && { echo "身份凭证已保存"; return 0; }
+    echo "${out:-保存失败}" | tail -3
+    return 1
+}
+
+identrestore() {
+    local out
+    out="$(rt_run 60 "$CTL" ident-restore 2>&1)"
+    echo "${out:-已还原}" | tail -3
+    return 0
+}
+
+setuprt() {
+    # 后台跑，前端轮询 show.runtime
+    [ -x "$CTL" ] || { echo "找不到 awesunctl"; return 1; }
+    ( "$CTL" setup > /etc/log/awesun/setup.log 2>&1 </dev/null ) >/dev/null 2>&1 &
+    echo "已在后台开始下载/布置 runtime，稍后刷新状态"
+    return 0
+}
+
+logout() { do_logout; }
+
+# 动作名 -> 函数名（func_api.sh 直接按 action 找同名函数）
+login()   { do_login "$account" "$password"; }
+setpwd()  { do_setpwd "$password"; }

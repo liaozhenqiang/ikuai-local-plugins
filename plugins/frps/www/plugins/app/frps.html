@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>FRP 内网穿透(服务端)</title>
+<style>
+  :root { --bd:#e4e7ed; --fg:#303133; --mut:#909399; --pri:#409eff; --ok:#67c23a; --warn:#e6a23c; --err:#f56c6c; --bg:#f5f7fa; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:14px; font:13px/1.6 "Microsoft YaHei",Helvetica,Arial,sans-serif; color:var(--fg); background:#fff; }
+  h3 { margin:0 0 10px; font-size:15px; }
+  h4 { margin:16px 0 6px; font-size:13px; color:#606266; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; }
+  .card { flex:1 1 150px; min-width:140px; border:1px solid var(--bd); border-radius:6px; padding:10px 12px; background:var(--bg); }
+  .card .k { color:var(--mut); font-size:12px; }
+  .card .v { font-size:16px; font-weight:700; margin-top:2px; word-break:break-all; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .err { color:var(--err); } .mut { color:var(--mut); }
+  pre { margin:0; padding:10px; background:#1e1e1e; color:#d4d4d4; border-radius:5px; max-height:260px; overflow:auto; font:12px/1.5 Consolas,Monaco,monospace; white-space:pre-wrap; }
+  button { cursor:pointer; border:1px solid var(--bd); background:#fff; border-radius:4px; padding:5px 12px; font-size:12px; }
+  button:hover:not(:disabled) { border-color:var(--pri); color:var(--pri); }
+  button.pri { background:var(--pri); border-color:var(--pri); color:#fff; }
+  button.pri:hover:not(:disabled) { background:#66b1ff; color:#fff; }
+  button.dgr { color:var(--err); border-color:#fbc4c4; }
+  button.dgr:hover:not(:disabled) { background:var(--err); border-color:var(--err); color:#fff; }
+  button:disabled { cursor:not-allowed; opacity:.5; }
+  .bar { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  .msg { min-height:18px; font-size:12px; color:var(--mut); }
+  .tag { display:inline-block; padding:1px 8px; border-radius:9px; font-size:11px; color:#fff; background:var(--mut); }
+  .tag.run { background:var(--ok); } .tag.stp { background:var(--err); }
+  .tip { color:var(--mut); font-size:12px; line-height:1.8; }
+  input { border:1px solid var(--bd); border-radius:4px; padding:4px 8px; font-size:12px; }
+  input:focus { outline:none; border-color:var(--pri); }
+  code { background:#f2f3f5; padding:0 4px; border-radius:3px; }
+  .linkbox { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+  .linkbox a { color:var(--pri); text-decoration:none; word-break:break-all; }
+  .linkbox a:hover { text-decoration:underline; }
+  .warnbox { background:#fdf6ec; border:1px solid #faecd8; border-radius:6px; padding:10px 12px; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h3 style="margin:0">FRP 内网穿透(服务端)</h3>
+  <span class="tag stp" id="tag">检测中…</span>
+  <span style="flex:1"></span>
+  <span class="msg" id="msg"></span>
+  <button onclick="load()">刷新</button>
+</div>
+
+<div class="row" id="cards"></div>
+
+<h4>仪表盘入口</h4>
+<div class="linkbox">
+  <span class="mut">管理地址:</span><a id="webUrl" href="#" target="_blank">—</a>
+  <button id="bOpen" class="pri" onclick="openWeb()">打开仪表盘</button>
+  <button onclick="copyText(el('webUrl').href)">复制</button>
+</div>
+<div id="credBox" class="warnbox">
+  <div class="bar" style="margin-bottom:4px">
+    登录名 <b id="webUser" style="user-select:all"></b>
+    <button onclick="copyText(el('webUser').textContent)">复制</button>
+    密码 <b id="webPass" style="user-select:all"></b>
+    <button onclick="copyText(el('webPass').textContent)">复制</button>
+  </div>
+  <div class="bar" style="margin-bottom:0">
+    认证 Token <b id="tok" style="user-select:all"></b>
+    <button onclick="copyText(el('tok').textContent)">复制</button>
+    <button onclick="regenToken()">重新生成</button>
+  </div>
+  <div class="tip" style="margin-top:6px">
+    Token 是 frpc 连进来时的口令，<b>重新生成后所有已连接的 frpc 会全部掉线</b>，需要同步改 frpc 那边的 Token。
+  </div>
+</div>
+
+<h4>服务</h4>
+<div class="bar">
+  <button id="bStart" class="pri" onclick="ctl('start')">启动</button>
+  <button id="bStop"  class="dgr" onclick="ctl('stop')">停止</button>
+  <button id="bRestart" onclick="ctl('restart')">重启</button>
+  <span class="tip">改端口/Token 会自动重启生效</span>
+</div>
+
+<h4>设置</h4>
+<div class="bar">
+  通信端口 <input id="bindport" size="6" maxlength="5" placeholder="7000">
+  <button class="pri" onclick="savePort('bindport')">保存端口</button>
+  <span class="tip">默认 <b>7000</b> —— frpc 通过它连进来，改了 frpc 那边要同步改；
+    路由器上如需从外网连，还要在 iKuai 后台做端口映射</span>
+</div>
+<div class="bar">
+  仪表盘端口 <input id="webport" size="6" maxlength="5" placeholder="7500">
+  <button class="pri" onclick="savePort('webport')">保存端口</button>
+  <span class="tip">默认 <b>7500</b>；占用时会自动保留旧端口</span>
+</div>
+<div class="bar">
+  开机自启
+  <button id="bAuto1" onclick="saveAuto(1)">开启</button>
+  <button id="bAuto0" onclick="saveAuto(0)">关闭</button>
+</div>
+
+<h4>仪表盘账号</h4>
+<div class="bar">
+  用户名 <input id="wuser" size="14" placeholder="admin">
+  新密码 <input id="wpass" size="18" autocomplete="new-password">
+  <button onclick="genPwd()">随机生成</button>
+  <button class="pri" onclick="saveWeb()">修改</button>
+  <span class="tip">不能含空格、引号、反斜杠</span>
+</div>
+
+<p class="tip">
+  frps 是 frp 的<b>服务端</b>，负责接收 frpc 的连接并按配置把端口转发到内网。
+  通信端口(7000)走 TCP，仪表盘(7500)用浏览器打开可看在线客户端与流量。<br>
+  插件只负责把 frps 跑起来并管好端口/口令；<b>代理规则在 frpc 那边配</b>，请配合本插件系列里的
+  <b>FRP 内网穿透(客户端)</b> 使用。仪表盘请勿暴露到公网。
+</p>
+
+<h4>运行日志 <button onclick="loadLog()">刷新日志</button> <button class="dgr" onclick="clearLog()">清空日志</button></h4>
+<pre id="log">（点「刷新日志」查看）</pre>
+
+<script>
+function el(id){ return document.getElementById(id); }
+function tip(t, cls){
+  var m = el('msg'); m.textContent = t || ''; m.className = (cls || 'msg');
+  if (t) { setTimeout(function(){ if (m.textContent===t) m.textContent=''; }, 6000); }
+}
+function copyText(t){
+  t = String(t || '');
+  if (!t || t === '—') return;
+  var done = function(){ tip('已复制', 'msg ok'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(done, function(){ fallback(); });
+  } else { fallback(); }
+  function fallback(){
+    var ta = document.createElement('textarea');
+    ta.value = t; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch(e){}
+    document.body.removeChild(ta);
+  }
+}
+function fmtUp(s){
+  s = Number(s || 0);
+  var d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d > 0) return d + '天' + h + '时';
+  if (h > 0) return h + '时' + m + '分';
+  return m + '分';
+}
+// action 调用: show 类返回 Data, 其它动作成功时后端不回传内容
+function api(action, param, opt){
+  opt = opt || {};
+  var ms = opt.timeout || 20000;
+  var ab = (typeof AbortController === 'function') ? new AbortController() : null;
+  var timer = null;
+  var init = { method:'POST', headers:{'Content-Type':'application/json'},
+               body: JSON.stringify({ func_name:'frps', action:action, param:param||{} }) };
+  if (ab) { init.signal = ab.signal; timer = setTimeout(function(){ ab.abort(); }, ms); }
+  return fetch('/Action/call', init).then(function(r){ return r.json(); }).then(function(j){
+    if (timer) clearTimeout(timer);
+    if (j.Result !== 30000) throw new Error(j.ErrMsg || ('错误码 ' + j.Result));
+    return j.Data || {};
+  }).catch(function(e){
+    if (timer) clearTimeout(timer);
+    if (e.name === 'AbortError') throw new Error('后端 ' + Math.round(ms/1000) + ' 秒无响应(action=' + action + ')');
+    throw e;
+  });
+}
+
+var S = null;   // 最近一次 status
+
+function load(){ return api('show', {TYPE:'status'}).then(render).catch(function(e){ tip('加载失败: '+e.message, 'msg err'); }); }
+
+function card(k, v, cls){
+  return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';
+}
+function esc(t){
+  return String(t == null ? '' : t).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+function setSegUI(base, v){
+  var on = (v == 1 || v === '1' || v === true);
+  el(base+'1').className = on ? 'pri' : '';
+  el(base+'0').className = on ? '' : 'dgr';
+}
+
+function render(d){
+  var s = d && d.status;
+  if (!s || typeof s !== 'object') { tip('后端没有返回状态数据', 'msg err'); return; }
+  S = s;
+  var run = s.running === true;
+  var tag = el('tag');
+  tag.textContent = run ? '运行中' : '未运行';
+  tag.className = 'tag ' + (run ? 'run' : 'stp');
+
+  var host = (typeof location !== 'undefined' && location && location.hostname) ? location.hostname : '';
+  var url = host ? ('http://' + host + ':' + (s.webport || 7500) + '/') : (s.web_url || '#');
+  el('webUrl').textContent = url; el('webUrl').href = url;
+  el('bOpen').disabled = !run;
+
+  el('bStart').disabled = run; el('bStop').disabled = !run; el('bRestart').disabled = !run;
+
+  if (document.activeElement.id !== 'bindport') el('bindport').value = s.bindport || '';
+  if (document.activeElement.id !== 'webport') el('webport').value = s.webport || '';
+  if (document.activeElement.id !== 'wuser') el('wuser').value = s.web_user || 'admin';
+
+  el('webUser').textContent = s.web_user || 'admin';
+  el('webPass').textContent = s.web_pass || '';
+  el('tok').textContent = s.token || '';
+  setSegUI('bAuto', s.autostart);
+
+  var wc = String(s.web_code == null ? '' : s.web_code);
+  var portTxt = '未运行', portCls = 'err';
+  if (run) {
+    if (wc === '401' || wc === '200' || wc === '302' || wc === '307') { portTxt = '正常 (' + wc + ')'; portCls = 'ok'; }
+    else if (wc === '' || wc === '000') { portTxt = '端口无响应'; portCls = 'err'; }
+    else { portTxt = 'HTTP ' + wc; portCls = 'warn'; }
+  }
+
+  var html = '';
+  html += card('运行状态', run ? '运行中' : '未运行', run ? 'ok' : 'err');
+  html += card('通信端口', s.bindport || '-');
+  html += card('仪表盘端口', portTxt, portCls);
+  html += card('运行时长', run ? fmtUp(s.uptime) : '—');
+  html += card('frps 版本', 'v' + (s.version || '-'));
+  el('cards').innerHTML = html;
+
+  if (!run) {
+    tip('服务未运行 —— 请先点上面的「启动」。', 'warnbox');
+  } else if (portCls === 'err') {
+    tip('进程在运行，但仪表盘 ' + (s.webport || 7500) + ' 端口没有响应（curl 返回 ' + (wc || '空') +
+        '）。多半是端口被占用，请换一个仪表盘端口。', 'warnbox');
+  } else {
+    tip('frps 已就绪，仪表盘：' + url);
+  }
+}
+
+function ctl(op){
+  tip('执行中 …');
+  return api(op, {}).then(function(){ tip('已' + ({start:'启动',stop:'停止',restart:'重启'}[op]||op), 'msg ok'); return load(); })
+    .catch(function(e){ tip('操作失败: ' + e.message, 'msg err'); });
+}
+
+function savePort(k){
+  var v = String(el(k).value || '').replace(/^\s+|\s+$/g, '');
+  if (!/^\d+$/.test(v)) { tip('端口必须是数字', 'msg err'); return; }
+  if (Number(v) < 1 || Number(v) > 65535) { tip('端口需在 1~65535', 'msg err'); return; }
+  if (v === '80' || v === '443') { tip('80/443 被 iKuai 控制台占用, 请换端口', 'msg err'); return; }
+  tip('保存中(会重启服务) …');
+  api('seting', {key:k, value:v}).then(function(){ tip('已保存并重启', 'msg ok'); return load(); })
+    .catch(function(e){ tip('保存失败: ' + e.message, 'msg err'); });
+}
+
+function saveAuto(v){
+  api('seting', {key:'autostart', value:String(v)}).then(function(){
+    tip(v ? '开机自启已开启' : '开机自启已关闭', 'msg ok');
+    setSegUI('bAuto', v);
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+
+function genPwd(){
+  var n = 14, s = '', arr = new Uint8Array(n);
+  if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(arr);
+  else { for (var i=0;i<n;i++) arr[i] = Math.floor(Math.random()*256); }
+  var cs = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (var j=0;j<n;j++) s += cs[arr[j] % cs.length];
+  el('wpass').value = s;
+  tip('已生成随机密码，点「修改」生效');
+}
+
+function saveWeb(){
+  var u = String(el('wuser').value || '').replace(/^\s+|\s+$/g, '');
+  var p = String(el('wpass').value || '').replace(/^\s+|\s+$/g, '');
+  if (!u) { tip('用户名不能为空', 'msg err'); return; }
+  if (!p) { tip('密码不能为空', 'msg err'); return; }
+  if (p.length < 4) { tip('密码至少 4 位', 'msg err'); return; }
+  tip('保存中(会重启服务) …');
+  api('seting', {key:'webuser', value:u}).then(function(){
+    return api('seting', {key:'webpass', value:p});
+  }).then(function(){
+    tip('仪表盘账号已修改并重启', 'msg ok'); el('wpass').value = ''; return load();
+  }).catch(function(e){ tip('保存失败: ' + e.message, 'msg err'); });
+}
+
+function regenToken(){
+  if (!confirm('重新生成 Token 会让所有已连接的 frpc 全部掉线，确定？')) return;
+  tip('生成中(会重启服务) …');
+  api('seting', {key:'token', value:''}).then(function(){ tip('Token 已重新生成，请同步到 frpc', 'msg ok'); return load(); })
+    .catch(function(e){ tip('操作失败: ' + e.message, 'msg err'); });
+}
+
+function loadLog(){
+  el('log').textContent = '读取中 …';
+  return api('show', {TYPE:'log'}).then(function(d){
+    el('log').textContent = d.log || '(无日志)';
+  }).catch(function(e){ el('log').textContent = '读取失败: ' + e.message; });
+}
+function clearLog(){
+  if (!confirm('确定清空运行日志吗？')) return;
+  api('logclear', {}).then(function(){ tip('日志已清空', 'msg ok'); return loadLog(); })
+    .catch(function(e){ tip('清空失败: ' + e.message, 'msg err'); });
+}
+
+
+load();
+</script>
+</body>
+</html>

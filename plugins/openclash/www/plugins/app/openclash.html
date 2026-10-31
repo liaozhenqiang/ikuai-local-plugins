@@ -1,0 +1,1826 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenClash</title>
+<style>
+:root{
+  --bg:#f5f7fa; --panel:#fff; --line:#e5e8ee; --line2:#eef1f5;
+  --fg:#1f2430; --fg2:#5c6675; --fg3:#8b95a5;
+  --pri:#2563eb; --pri-d:#1d4ed8; --pri-bg:#eff5ff;
+  --ok:#0f9d6e; --ok-bg:#eafaf4; --warn:#b45309; --warn-bg:#fff7ea;
+  --err:#d92d20; --err-bg:#fef3f2; --radius:10px;
+  --sh:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#141821; --panel:#1b2029; --line:#2a313d; --line2:#232a35;
+    --fg:#e8ecf3; --fg2:#a9b4c4; --fg3:#7d8798;
+    --pri:#5b8cff; --pri-d:#7ba3ff; --pri-bg:#18233a;
+    --ok:#34d399; --ok-bg:#12261f; --warn:#fbbf24; --warn-bg:#2a2113;
+    --err:#f87171; --err-bg:#2a1614;
+    --sh:0 1px 2px rgba(0,0,0,.4);
+  }
+}
+*{box-sizing:border-box}
+body{
+  margin:0;padding:14px 16px 40px;background:var(--bg);color:var(--fg);
+  font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Roboto,"Helvetica Neue",Arial,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+h3{font-size:16px;font-weight:650;margin:0;letter-spacing:.2px}
+a{color:var(--pri);text-decoration:none}
+a:hover{text-decoration:underline}
+code{
+  background:var(--line2);color:var(--fg);padding:1.5px 5px;border-radius:5px;
+  font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+/* ---------- 顶栏 ---------- */
+.topbar{
+  display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:10px 14px;margin:0 0 12px;box-shadow:var(--sh);
+}
+.topbar .grow{flex:1}
+/* ---------- 页签 ---------- */
+.tabs{
+  display:flex;flex-wrap:wrap;gap:4px;margin:0 0 14px;padding:4px;
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--sh);
+}
+.tabs a{
+  padding:8px 16px;border-radius:7px;color:var(--fg2);cursor:pointer;user-select:none;
+  font-weight:550;font-size:13.5px;transition:background .15s,color .15s;white-space:nowrap;
+}
+.tabs a:hover{background:var(--line2);color:var(--fg)}
+.tabs a.on{background:var(--pri);color:#fff;box-shadow:0 1px 2px rgba(37,99,235,.35)}
+@media (prefers-color-scheme:dark){.tabs a.on{color:#0b1220}}
+.pane{display:none}
+.pane.on{display:block;animation:fade .18s ease}
+@keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+/* ---------- 大状态区 ---------- */
+.hero{
+  display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:16px 18px;margin:0 0 12px;box-shadow:var(--sh);
+}
+.bigstate{font-size:22px;font-weight:700;letter-spacing:.3px;line-height:1.2}
+.bigstate.run{color:var(--ok)}
+.bigstate.stop{color:var(--err)}
+.herometa{color:var(--fg2);font-size:12.5px;margin-top:4px}
+.herometa b{color:var(--fg);font-weight:600}
+.hero .acts{display:flex;flex-wrap:wrap;gap:8px}
+/* ---------- 告警区 ---------- */
+#alerts{margin:0 0 12px}
+.alert{
+  display:flex;gap:10px;align-items:flex-start;
+  border:1px solid var(--line);border-radius:var(--radius);padding:11px 14px;margin:0 0 8px;
+  font-size:13px;line-height:1.7;background:var(--panel);box-shadow:var(--sh);
+}
+.alert .ic{font-weight:700;flex:none}
+.alert .bd{flex:1;min-width:0}
+.alert .bd .t{font-weight:650}
+.alert .bd .d{color:var(--fg2);font-size:12.5px;margin-top:2px}
+.alert .ac{flex:none;display:flex;gap:6px;align-items:center}
+.alert.danger{background:var(--err-bg);border-color:var(--err)}
+.alert.danger .ic,.alert.danger .t{color:var(--err)}
+.alert.warn{background:var(--warn-bg);border-color:var(--warn)}
+.alert.warn .ic,.alert.warn .t{color:var(--warn)}
+.alert.info{background:var(--pri-bg);border-color:var(--pri)}
+.alert.info .ic,.alert.info .t{color:var(--pri)}
+/* ---------- 卡片网格 ---------- */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin:0 0 12px}
+.card{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:10px 12px;box-shadow:var(--sh);
+}
+.card .k{color:var(--fg3);font-size:12px;margin-bottom:4px;letter-spacing:.3px}
+.card .v{font-size:14px;font-weight:650;word-break:break-all}
+.card .v.ok{color:var(--ok)}.card .v.warn{color:var(--warn)}.card .v.err{color:var(--err)}
+/* ---------- 区块(常显) ---------- */
+.blk{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:12px 14px;margin:0 0 12px;box-shadow:var(--sh);
+}
+.blk-t{font-size:13.5px;font-weight:650;margin:0 0 10px}
+.blk-t .sub{color:var(--fg3);font-weight:400;font-size:12px;margin-left:8px}
+/* ---------- 折叠区块 ---------- */
+details.blk{padding:0}
+details.blk>summary{
+  cursor:pointer;list-style:none;padding:12px 14px;font-size:13.5px;font-weight:650;
+  display:flex;align-items:center;gap:8px;user-select:none;
+}
+details.blk>summary::-webkit-details-marker{display:none}
+details.blk>summary::before{
+  content:"▸";color:var(--fg3);font-size:12px;transition:transform .15s;flex:none;
+}
+details.blk[open]>summary::before{transform:rotate(90deg)}
+details.blk>summary:hover{color:var(--pri)}
+details.blk>.blkbd{padding:0 14px 14px;border-top:1px solid var(--line2);padding-top:12px}
+/* ---------- 按钮 ---------- */
+button{
+  appearance:none;padding:7px 14px;border:1px solid var(--line);border-radius:8px;
+  background:var(--panel);color:var(--fg);font:550 13.5px/1.2 inherit;cursor:pointer;
+  transition:background .15s,border-color .15s,box-shadow .15s,transform .06s;white-space:nowrap;
+}
+button:hover{background:var(--line2);border-color:var(--fg3)}
+button:active{transform:translateY(1px)}
+button.pri{background:var(--pri);border-color:var(--pri);color:#fff}
+button.pri:hover{background:var(--pri-d);border-color:var(--pri-d)}
+button.danger{background:var(--err-bg);border-color:var(--err);color:var(--err)}
+button.danger:hover{background:var(--err);color:#fff}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.sm{padding:4px 10px;font-size:12.5px}
+/* ---------- 输入 ---------- */
+input[type=text],input[type=number],input[type=password],input[type=file],select,textarea{
+  padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--fg);
+  font:13.5px/1.4 inherit;min-width:120px;max-width:100%;
+}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--pri);box-shadow:0 0 0 3px var(--pri-bg)}
+input[type=file]{border-style:dashed;padding:6px 8px}
+label{color:var(--fg2)}
+/* ---------- 行内表单 ---------- */
+.frow2{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px}
+.frow2:last-child{margin-bottom:0}
+.frow2>.lab{min-width:96px;color:var(--fg2);font-weight:550;font-size:13px}
+.frow2>.grow{flex:1;min-width:200px}
+.frow2>.grow input{width:100%}
+/* ---------- 分段选择行 ---------- */
+.segrow{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center}
+.segrow .item{display:flex;align-items:center;gap:8px}
+.segrow .item label{font-weight:550;font-size:13px;white-space:nowrap}
+.segrow select{min-width:150px}
+/* ---------- 标签/提示/消息 ---------- */
+.tag{
+  display:inline-block;padding:1.5px 9px;border-radius:20px;background:var(--line2);color:var(--fg2);
+  font-size:12px;font-weight:550;
+}
+.tag.ok{background:var(--ok-bg);color:var(--ok)}
+.tag.warn{background:var(--warn-bg);color:var(--warn)}
+.tag.err{background:var(--err-bg);color:var(--err)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.err{color:var(--err)}
+.tip{color:var(--fg2);font-size:12.5px;line-height:1.7}
+.tip b{color:var(--fg)}
+.hint{color:var(--fg3);font-size:12px;white-space:nowrap}
+.frow2 .hint{align-self:center}
+.segrow .hint{margin-left:-4px}
+.msg{min-height:20px;font-size:13px;color:var(--ok);font-weight:550}
+.msg.err{color:var(--err)}.msg.warn{color:var(--warn)}
+/* ---------- 表格 ---------- */
+table{
+  width:100%;border-collapse:separate;border-spacing:0;background:var(--panel);
+  border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--sh);margin:6px 0 12px;
+}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line2);font-size:13px;vertical-align:middle}
+th{background:var(--line2);color:var(--fg2);font-weight:600;font-size:12.5px;letter-spacing:.2px}
+tbody tr:hover td{background:var(--pri-bg)}
+tbody tr:last-child td{border-bottom:none}
+td.ok,td.err,td.warn{font-weight:600}
+td.cur{font-weight:650}
+/* ---------- 节点组 pills ---------- */
+.pills{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+.pills a{
+  padding:6px 13px;border-radius:20px;border:1px solid var(--line);background:var(--panel);
+  color:var(--fg2);cursor:pointer;user-select:none;font-size:13px;font-weight:550;transition:all .15s;
+}
+.pills a:hover{border-color:var(--fg3);color:var(--fg)}
+.pills a.on{background:var(--pri);border-color:var(--pri);color:#fff}
+@media (prefers-color-scheme:dark){.pills a.on{color:#0b1220}}
+/* ---------- 设置分组 ---------- */
+.setgrp{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  margin:0 0 12px;box-shadow:var(--sh);overflow:hidden;
+}
+.setgrp-t{
+  padding:10px 14px;font-size:13.5px;font-weight:650;background:var(--line2);
+  border-bottom:1px solid var(--line);
+}
+.frow{display:flex;flex-wrap:wrap;gap:4px 14px;padding:10px 14px;border-bottom:1px solid var(--line2)}
+.frow:last-child{border-bottom:none}
+.frow .flabel{min-width:180px;flex:0 0 180px;color:var(--fg);font-weight:550;font-size:13px;padding-top:6px}
+.frow .fctl{flex:1;min-width:220px}
+.frow .fctl input,.frow .fctl select{min-width:160px}
+.fhint{color:var(--fg3);font-size:12px;margin-top:3px;line-height:1.5}
+/* ---------- 工具卡片 ---------- */
+.tools{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;margin:0 0 12px}
+.tool{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:12px 14px;box-shadow:var(--sh);display:flex;flex-direction:column;gap:8px;
+}
+.tool .tt{font-size:13.5px;font-weight:650}
+.tool .td{color:var(--fg2);font-size:12.5px;line-height:1.7;flex:1}
+.tool .ta{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+/* ---------- 日志/代码块 ---------- */
+pre{
+  background:#0e1116;color:#d6dbe4;border:1px solid #1e242e;border-radius:var(--radius);
+  padding:12px 14px;margin:6px 0 14px;overflow:auto;max-height:360px;white-space:pre-wrap;word-break:break-all;
+  font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace;box-shadow:var(--sh);
+}
+@media (prefers-color-scheme:light){pre{background:#10141a}}
+/* ---------- 小屏 ---------- */
+@media (max-width:720px){
+  body{padding:10px 10px 30px}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
+  .hero{padding:12px 14px}
+  .bigstate{font-size:18px}
+  .frow .flabel{flex-basis:100%;min-width:0;padding-top:0}
+  .frow .fctl{min-width:0}
+  .tabs a{padding:7px 12px;font-size:13px}
+  th,td{padding:8px 9px;font-size:12.5px}
+  .segrow .item{width:100%}
+  .segrow select{flex:1}
+}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h3>OpenClash</h3>
+  <span class="tag" id="tag-run">-</span>
+  <span class="tag" id="tag-mode">-</span>
+  <span class="grow"></span>
+  <span class="msg" id="msg"></span>
+  <button class="sm" onclick="load()">刷新</button>
+</div>
+
+<div class="tabs">
+  <a data-p="p-status" class="on">状态</a>
+  <a data-p="p-sub">订阅</a>
+  <a data-p="p-node">节点</a>
+  <a data-p="p-set">设置</a>
+  <a data-p="p-log">日志</a>
+  <a data-p="p-tool">工具</a>
+</div>
+
+<!-- ============================ 状态 ============================ -->
+<div class="pane on" id="p-status">
+  <div id="alerts"></div>
+
+  <div class="hero">
+    <div>
+      <div class="bigstate stop" id="hero-state">读取中…</div>
+      <div class="herometa" id="hero-meta">-</div>
+    </div>
+    <div class="acts">
+      <button class="pri" id="btn-start" onclick="act('ctl','start')">启动</button>
+      <button id="btn-stop" onclick="act('ctl','stop')">停止</button>
+      <button id="btn-restart" onclick="act('ctl','restart')">重启</button>
+      <button id="btn-reload" onclick="act('ctl','reload')">热重载</button>
+    </div>
+  </div>
+
+  <div class="grid" id="cards"></div>
+
+  <div class="blk">
+    <div class="blk-t">代理模式<span class="sub">三种改动的生效方式不同, 见每项后的标注</span></div>
+    <div class="segrow">
+      <div class="item"><label>透明代理</label>
+        <select id="s-mode" onchange="setMode(this.value)">
+          <option value="redirect">redirect</option>
+          <option value="tproxy">tproxy</option>
+          <option value="tun">tun</option>
+          <option value="off">off</option>
+        </select><span class="hint">切换后重启内核</span></div>
+      <div class="item"><label>运行模式</label>
+        <select id="s-clashmode" onchange="nodeMode(this.value)">
+          <option value="rule">rule</option>
+          <option value="global">global</option>
+          <option value="direct">direct</option>
+        </select><span class="hint">热切换, 不重启</span></div>
+      <div class="item"><label>开机自启</label>
+        <select id="s-enable" onchange="setOne('enable', this.value)">
+          <option value="1">开启</option><option value="0">关闭</option>
+        </select><span class="hint">下次开机生效</span></div>
+    </div>
+    <div class="tip" style="margin-top:10px">
+      <b>redirect</b> iptables 重定向(TCP, 兼容性最好) · <b>tproxy</b> 透明代理(TCP+UDP, 需内核支持) ·
+      <b>tun</b> 虚拟网卡(需 /dev/net/tun) · <b>off</b> 仅本地代理端口。<br>
+      「停止」会同时清理透明代理与 DNS 劫持规则, 网络恢复成直连。
+    </div>
+  </div>
+
+  <details class="blk">
+    <summary>控制面板(zashboard)</summary>
+    <div class="blkbd">
+      <div class="frow2">
+        <span class="lab">打开面板</span>
+        <a id="panel-link" href="#" target="_blank" class="grow">在新窗口打开 ↗</a>
+        <button class="sm" onclick="copyPanel()">复制地址</button>
+      </div>
+      <div class="frow2">
+        <span class="lab">连接信息</span>
+        <span class="tip grow" id="panel-info">-</span>
+        <button class="sm" onclick="copySecret()">复制密钥</button>
+      </div>
+      <div class="frow2">
+        <span class="lab">控制端口</span>
+        <span class="grow"><input type="text" id="f-ctrl" placeholder="0.0.0.0:9090"></span>
+        <button class="sm" onclick="saveCtrl()">保存</button>
+        <span class="hint">改后重启内核</span>
+      </div>
+      <div class="frow2">
+        <span class="lab">密钥</span>
+        <span class="grow"><input type="text" id="f-secret" placeholder="secret"></span>
+        <button class="sm" onclick="saveSecret()">保存</button>
+        <span class="hint">改后重启内核</span>
+      </div>
+      <div class="tip">
+        面板跑在你电脑的浏览器里, 「主机」用的是路由器地址(访问后台那个), 打开即自动连接;
+        自动带参没生效时, 在面板「配置」里手动填上面三项。面板地址含密钥, 不要外发。
+      </div>
+    </div>
+  </details>
+</div>
+
+<!-- ============================ 订阅 ============================ -->
+<div class="pane" id="p-sub">
+  <div class="blk">
+    <div class="blk-t">订阅地址<span class="sub">一次点击: 保存地址并立即更新, 自动识别格式</span></div>
+    <div class="frow2">
+      <span class="grow"><input type="text" id="f-suburl" placeholder="https://example.com/api/v1/client/subscribe?token=xxx"></span>
+      <button class="pri" onclick="saveAndUpdate()">保存并更新</button>
+      <button onclick="setOne('sub_url', val('f-suburl'))">仅保存</button>
+    </div>
+    <div class="frow2">
+      <span class="lab">下载方式</span>
+      <select id="s-submode" title="下载方式: 自动=先用直连, 直连失败才改用转换服务">
+        <option value="auto">自动(直连优先, 失败用转换服务)</option>
+        <option value="direct">仅直连</option>
+        <option value="converter">仅转换服务</option>
+      </select>
+      <span class="hint">装好前路由器无代理, 转换服务常被阻断</span>
+      <button onclick="subDownload()">重新下载</button>
+      <button onclick="loadSub().then(function(){var e=document.getElementById('sub-raw');if(e&&e.scrollIntoView){e.scrollIntoView({block:'center'});}})">查看原文</button>
+      <button class="danger" onclick="if(confirm('确认清空订阅数据？运行中的内核会随之重启'))act('sub','clear')">清空</button>
+    </div>
+    <div class="tip" id="sub-conv-warn" style="display:none;margin-top:4px"></div>
+    <div class="tip" style="margin-top:8px">
+      <b>Clash/Meta(YAML)</b> 订阅直接生效; <b>base64 / 分享链接列表</b>由本页面在浏览器里转换成 Clash YAML 再回传导入
+      (设备上没有 ruby/subconverter)。直连失败(机场域名被污染/阻断)时自动改走转换服务代取, 成功后会把订阅地址改写为转换服务地址。
+    </div>
+    <div class="frow2" style="margin-top:10px">
+      <span class="lab">转换服务</span>
+      <span class="grow"><input type="text" id="f-subconv" placeholder="https://api.asailor.org/sub"></span>
+      <button class="sm" onclick="setOne('sub_conv', val('f-subconv'))">保存</button>
+    </div>
+    <div class="frow2" style="margin-top:10px">
+      <span class="lab">定时自动更新</span>
+      <select id="s-autoh" onchange="setAuto(this.value)">
+        <option value="0">关闭</option>
+        <option value="1">每 1 小时</option>
+        <option value="2">每 2 小时</option>
+        <option value="6">每 6 小时</option>
+        <option value="12">每 12 小时</option>
+        <option value="24">每天</option>
+      </select>
+      <span class="hint" id="auto-hint">由 cron 定时拉取订阅; 内容有变化才重启内核</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="k">当前格式</div><div class="v" id="sub-kind">-</div></div>
+    <div class="card"><div class="k">原文大小</div><div class="v" id="sub-size">-</div></div>
+    <div class="card"><div class="k">已导入配置</div><div class="v" id="sub-imported">-</div></div>
+    <div class="card"><div class="k">最近更新</div><div class="v" id="sub-time">-</div></div>
+  </div>
+
+  <div class="blk">
+    <div class="blk-t">订阅转换<span class="sub">非 Clash 格式( base64 / ss·vmess·vless·trojan·hysteria2·tuic 链接 )</span></div>
+    <div class="frow2">
+      <button class="pri" onclick="doConvert(false)">转换并预览</button>
+      <button class="pri" onclick="doConvert(true)">转换并应用</button>
+      <span class="msg grow" id="cv-msg"></span>
+    </div>
+    <div id="cv-out"></div>
+  </div>
+
+  <details class="blk">
+    <summary>手动导入配置文件</summary>
+    <div class="blkbd">
+      <div class="frow2">
+        <span class="lab">Clash 配置</span>
+        <span class="grow"><input type="file" id="f-yaml" accept=".yaml,.yml"></span>
+        <button class="sm" onclick="uploadAs('f-yaml','config')">作为订阅导入</button>
+      </div>
+      <div class="tip">仅含 <code>proxies:</code> 段的配置; 导入后由模板渲染(端口/密钥仍用插件设置)。</div>
+      <div class="frow2" style="margin-top:10px">
+        <span class="lab">完整 config.yaml</span>
+        <span class="grow"><input type="file" id="f-custom" accept=".yaml,.yml"></span>
+        <button class="sm" onclick="uploadAs('f-custom','custom')">作为自定义配置</button>
+      </div>
+      <div class="tip">自定义配置直接把 <code>cfg_mode</code> 设为 custom, 模板不再参与渲染(端口/密钥要自己写全)。</div>
+    </div>
+  </details>
+
+  <details class="blk">
+    <summary>订阅原文</summary>
+    <div class="blkbd"><pre id="sub-raw">(未下载)</pre></div>
+  </details>
+</div>
+
+<!-- ============================ 节点 ============================ -->
+<div class="pane" id="p-node">
+  <div class="blk">
+    <div class="frow2">
+      <button class="pri" onclick="loadNodes()">读取节点</button>
+      <button onclick="testGroup(CUR.gi||0)">整组测速(前30)</button>
+      <span class="tip grow">「选用中」即当前生效节点; 单节点测速点表格里的「测速」。</span>
+      <span class="msg grow" id="node-msg"></span>
+    </div>
+    <div id="node-groups"></div>
+    <div id="node-table-wrap"></div>
+  </div>
+</div>
+
+<!-- ============================ 设置 ============================ -->
+<div class="pane" id="p-set">
+  <div id="cfg-form"></div>
+  <div class="blk">
+    <div class="frow2">
+      <button class="pri" onclick="saveCfg()">保存所有改动</button>
+      <button onclick="resetCfg()">放弃改动</button>
+      <button onclick="previewCfg()">查看生成的配置</button>
+      <span class="tip grow">保存后运行中才会重启内核(只重启一次); 「放弃改动」恢复为设备当前配置。</span>
+    </div>
+  </div>
+  <details class="blk">
+    <summary>生成的运行配置(data/config.yaml)</summary>
+    <div class="blkbd"><pre id="cfg-preview">(尚未读取)</pre></div>
+  </details>
+</div>
+
+<!-- ============================ 日志 ============================ -->
+<div class="pane" id="p-log">
+  <div class="blk">
+    <div class="frow2">
+      <button onclick="loadLogs()">刷新日志</button>
+      <button class="danger" onclick="clearLogs()">清空日志</button>
+      <span class="tip grow" id="log-file"></span>
+    </div>
+  </div>
+  <details class="blk" open>
+    <summary>最后一次操作</summary>
+    <div class="blkbd"><pre id="log-op">-</pre></div>
+  </details>
+  <details class="blk">
+    <summary>内核日志</summary>
+    <div class="blkbd"><pre id="log-core">-</pre></div>
+  </details>
+  <details class="blk">
+    <summary>自愈引导 / 野输出(backend-noise · bootstrap)</summary>
+    <div class="blkbd"><pre id="log-noise">-</pre></div>
+  </details>
+</div>
+
+<!-- ============================ 工具 ============================ -->
+<div class="pane" id="p-tool">
+  <div class="tools">
+    <div class="tool">
+      <div class="tt">自检与诊断</div>
+      <div class="td">检查依赖命令、内核、geo、iptables/TPROXY 能力与运行状态, 出问题先看这里。</div>
+      <div class="ta">
+        <button class="pri" onclick="loadDoctor()">运行环境自检</button>
+        <button onclick="loadRules()">查看 iptables 规则</button>
+      </div>
+      <div class="ta">
+        <button onclick="act('ctl','rules')">重装透明代理规则</button>
+        <button class="danger" onclick="if(confirm('确认清理全部透明代理规则？清理后流量恢复直连'))act('ctl','unrules')">清理全部规则</button>
+      </div>
+    </div>
+    <div class="tool">
+      <div class="tt">内核管理</div>
+      <div class="td">内核只支持<b>离线上传</b>(不联网下载)。选本地已下载的
+        <code>mihomo-linux-amd64-compatible-*.gz</code>(约 23 MB), 上传后自动解压、校验 ELF 并试跑, 通过才落盘。
+        空间不足时可设 <code>core_dir</code> 到数据盘。</div>
+      <div class="ta">
+        <button onclick="coreStatus()">查看内核状态</button>
+      </div>
+      <div class="ta">
+        <input type="file" id="f-core" accept=".gz">
+        <button class="pri" onclick="uploadCore()">上传并安装内核</button>
+      </div>
+    </div>
+    <div class="tool">
+      <div class="tt">GEOSITE 数据</div>
+      <div class="td">约 11 MB。装上后启用 GEOSITE 规则(广告拦截 + 细粒度域名分流)并重启内核;
+        没有也能用(自动降级为 GEOIP / IP 规则)。</div>
+      <div class="ta">
+        <input type="file" id="f-geo" accept=".dat">
+        <button class="pri" onclick="uploadGeo()">上传并安装</button>
+      </div>
+    </div>
+    <div class="tool">
+      <div class="tt">维护</div>
+      <div class="td">免回环列表: 把代理服务器 IP 设为直连, 防止路由器自己的流量绕进代理。
+        清理空间: 删除插件包归档/残留内核压缩包/坏 geo 数据。</div>
+      <div class="ta">
+        <button onclick="act('ctl','bypass-refresh')">刷新免回环列表</button>
+        <button onclick="uiFetch()">下载面板(后台)</button>
+        <button class="danger" onclick="if(confirm('确认清理可删文件(插件包归档/残留内核压缩包/坏 geo 数据)？'))act('ctl','cleanup')">清理空间</button>
+      </div>
+      <div class="tt" style="margin-top:10px">免代理目标(直连, 不走 clash)</div>
+      <div class="td">nps/npc 等对外服务若被透明代理劫走(表现为外网连不上), 把服务端 IP 加到这里即可直连。
+        手动添加的条目在刷新/重装规则后依然保留。</div>
+      <div class="ta">
+        <input type="text" id="bypass-ip" placeholder="IP 或 CIDR, 例 1.2.3.4" style="min-width:180px">
+        <button onclick="bypassAdd()">加入</button>
+        <button onclick="bypassDel()">移除</button>
+        <button onclick="loadBypass()">查看列表</button>
+      </div>
+      <pre id="bypass" style="display:none;margin:8px 0 0"></pre>
+    </div>
+  </div>
+  <details class="blk" open>
+    <summary>内核 / geo 状态</summary>
+    <div class="blkbd"><pre id="core-status">(点击"查看内核状态")</pre></div>
+  </details>
+  <details class="blk">
+    <summary>环境自检(doctor)</summary>
+    <div class="blkbd"><pre id="doctor">(点击"运行环境自检")</pre></div>
+  </details>
+  <details class="blk">
+    <summary>当前 iptables / 策略路由规则</summary>
+    <div class="blkbd"><pre id="rules">(切换到本页自动读取)</pre></div>
+  </details>
+</div>
+
+<script>
+/* =====================================================================
+ * OCConvert —— 订阅(base64 / 分享链接列表) -> Clash/Meta YAML
+ * 说明: 原版 OpenClash 把这一步交给 subconverter(远程服务), iKuai 上既没有
+ *       ruby 也没有 subconverter, 所以本页面在浏览器里完成转换:
+ *       后端 curl 拿到订阅原文 -> 这里的纯函数转换成 YAML -> /Action/upload 回传。
+ *       下面 start/end 标记之间的代码是纯函数(不依赖 DOM), 由 tools/test-convert.js
+ *       在 Node 里直接跑单元测试。
+ * =================================================================== */
+/*==OCConvert-start==*/
+var OCConvert = (function () {
+  'use strict';
+
+  function b64decode(s) {
+    s = String(s || '').replace(/[\r\n\s]/g, '').replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) { s += '='; }
+    var bin;
+    try { bin = atob(s); } catch (e) { return ''; }
+    try {
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
+      return new TextDecoder('utf-8').decode(bytes);
+    } catch (e) {
+      return bin;
+    }
+  }
+
+  function looksBase64(s) {
+    var t = String(s || '').replace(/[\r\n\s]/g, '');
+    if (t.length < 16) { return false; }
+    return /^[A-Za-z0-9+/=_-]+$/.test(t);
+  }
+
+  function isClashYaml(s) {
+    return /(^|\n)\s*(proxies|proxy-groups|proxy-providers|rules)\s*:/.test(String(s || ''));
+  }
+
+  function splitName(u) {
+    var i = u.indexOf('#');
+    if (i < 0) { return { body: u, name: '' }; }
+    var n = u.slice(i + 1);
+    n = du(n);
+    return { body: u.slice(0, i), name: n };
+  }
+
+  // 安全解码: 一个坏的 % 转义(机场订阅里很常见)不能让整条节点被丢弃
+  function du(s) {
+    try { return decodeURIComponent(String(s == null ? '' : s)); }
+    catch (e) { return String(s == null ? '' : s); }
+  }
+
+  function qs(u) {
+    var i = u.indexOf('?');
+    if (i < 0) { return { base: u, q: {} }; }
+    var out = {}, parts = u.slice(i + 1).split('&');
+    for (var k = 0; k < parts.length; k++) {
+      if (!parts[k]) { continue; }
+      var p = parts[k].split('=');
+      var key = du(p[0]);
+      var valv = p.length > 1 ? du(p.slice(1).join('=')) : '';
+      out[key] = valv;
+    }
+    return { base: u.slice(0, i), q: out };
+  }
+
+  function truthy(v) { return v === true || v === '1' || v === 'true'; }
+
+  function decodeUserinfo(ui) {
+    // ss 的 userinfo 可能是 base64(method:pass), 也可能是明文
+    if (ui.indexOf(':') >= 0) { return ui; }
+    var d = b64decode(ui);
+    return d || ui;
+  }
+
+  function tlsCommon(p, q) {
+    var sec = (q.security || '').toLowerCase();
+    if (sec === 'tls' || sec === 'reality' || truthy(q.tls)) {
+      p.tls = true;
+      if (q.sni) { p.servername = q.sni; }
+      else if (q.host) { p.servername = q.host; }
+      if (q.fp) { p['client-fingerprint'] = q.fp; }
+      if (sec === 'reality') {
+        p['reality-opts'] = {};
+        if (q.pbk) { p['reality-opts']['public-key'] = q.pbk; }
+        if (q.sid) { p['reality-opts']['short-id'] = q.sid; }
+      }
+    }
+    if (truthy(q.allowInsecure) || truthy(q.insecure) || truthy(q['skip-cert-verify'])) {
+      p['skip-cert-verify'] = true;
+    }
+    return p;
+  }
+
+  function transport(p, q) {
+    var net = (q.type || q.net || 'tcp').toLowerCase();
+    if (net === 'ws') {
+      p.network = 'ws';
+      p['ws-opts'] = { path: q.path || '/' };
+      if (q.host) { p['ws-opts'].headers = { Host: q.host }; }
+    } else if (net === 'grpc') {
+      p.network = 'grpc';
+      p['grpc-opts'] = { 'grpc-service-name': q.serviceName || q.path || '' };
+    } else if (net === 'h2' || net === 'http') {
+      p.network = 'h2';
+      p['h2-opts'] = { path: [q.path || '/'] };
+      if (q.host) { p['h2-opts'].host = q.host.split(','); }
+    } else if (net && net !== 'tcp') {
+      p.network = net;
+    }
+    return p;
+  }
+
+  // ---- 各协议解析: 每个函数返回一条 Clash proxy 对象, 失败返回 null ----
+  var handlers = {
+    ss: function (u, name) {
+      var sp = splitName(u), body = sp.body.slice(5), q, plain, ui, hp, at;
+      var qq = qs(body); q = qq.q; body = qq.base;
+      if (body.indexOf('@') >= 0) {
+        at = body.lastIndexOf('@');
+        ui = decodeUserinfo(body.slice(0, at));
+        hp = body.slice(at + 1);
+      } else {
+        plain = b64decode(body);
+        if (!plain) { return null; }
+        at = plain.lastIndexOf('@');
+        ui = plain.slice(0, at);
+        hp = plain.slice(at + 1);
+      }
+      var ci = ui.indexOf(':');
+      if (ci < 0) { return null; }
+      var host = hp.split(':');
+      var p = {
+        name: name || sp.name || (host[0] + ':' + host[1]),
+        type: 'ss', server: host[0], port: Number(host[1]) || 0,
+        cipher: ui.slice(0, ci), password: ui.slice(ci + 1), udp: true
+      };
+      if (q.plugin) {
+        var pl = q.plugin.split(';');
+        if (pl[0].indexOf('obfs') === 0) {
+          var pm = pl[1] || 'http';
+          if (pm.indexOf('obfs=') === 0) { pm = pm.slice(5); }   // "obfs=http" -> "http"
+          if (pm !== 'http' && pm !== 'tls') { pm = 'http'; }    // mihomo 只认这两个值
+          p.plugin = 'obfs';
+          p['plugin-opts'] = { mode: pm };
+          for (var i = 1; i < pl.length; i++) {
+            if (pl[i].indexOf('obfs-host=') === 0) { p['plugin-opts'].host = pl[i].slice(10); }
+          }
+        }
+      }
+      return p;
+    },
+
+    ssr: function (u, name) {
+      var sp = splitName(u);
+      var raw = b64decode(sp.body.slice(6));
+      if (!raw) { return null; }
+      var main = raw.split('/?')[0];
+      var f = main.split(':');
+      if (f.length < 6) { return null; }
+      var pass = b64decode(f[5]);
+      var p = {
+        name: name || sp.name || (f[0] + ':' + f[1]),
+        type: 'ssr', server: f[0], port: Number(f[1]) || 0,
+        protocol: f[2], cipher: f[3], obfs: f[4],
+        password: pass, udp: true
+      };
+      var q = qs('?' + (raw.split('/?')[1] || '')).q;
+      if (q.obfsparam) { p['obfs-param'] = b64decode(q.obfsparam) || q.obfsparam; }
+      if (q.protoparam) { p['protocol-param'] = b64decode(q.protoparam) || q.protoparam; }
+      if (q.remarks && !name && !sp.name) { p.name = b64decode(q.remarks) || p.name; }
+      return p;
+    },
+
+    vmess: function (u, name) {
+      var j = b64decode(u.slice(8));
+      if (!j) { return null; }
+      var o;
+      try { o = JSON.parse(j); } catch (e) { return null; }
+      var host = String(o.add || ''), port = Number(o.port) || 0;
+      var p = {
+        name: name || o.ps || (host + ':' + port),
+        type: 'vmess', server: host, port: port, uuid: String(o.id || ''),
+        alterId: Number(o.aid || 0) || 0, cipher: o.scy || 'auto', udp: true
+      };
+      var net = String(o.net || 'tcp').toLowerCase();
+      if (net === 'ws') {
+        p.network = 'ws';
+        p['ws-opts'] = { path: o.path || '/' };
+        if (o.host) { p['ws-opts'].headers = { Host: o.host }; }
+      } else if (net === 'grpc') {
+        p.network = 'grpc';
+        p['grpc-opts'] = { 'grpc-service-name': o.path || '' };
+      } else if (net === 'h2') {
+        p.network = 'h2';
+        p['h2-opts'] = { path: [o.path || '/'] };
+        if (o.host) { p['h2-opts'].host = String(o.host).split(','); }
+      } else if (net && net !== 'tcp') {
+        p.network = net;
+      }
+      if (String(o.tls) === 'tls' || truthy(o.tls)) {
+        p.tls = true;
+        if (o.sni) { p.servername = o.sni; }
+        else if (o.host) { p.servername = o.host; }
+      }
+      if (o.fp) { p['client-fingerprint'] = o.fp; }
+      if (truthy(o.verify_cert === false)) { p['skip-cert-verify'] = true; }
+      return p;
+    },
+
+    vless: function (u, name) {
+      var sp = splitName(u), qq = qs(sp.body.slice(8));
+      var q = qq.q, base = qq.base;
+      var at = base.lastIndexOf('@');
+      if (at < 0) { return null; }
+      var uuid = base.slice(0, at), hp = base.slice(at + 1).split(':');
+      var p = {
+        name: name || sp.name || (hp[0] + ':' + hp[1]),
+        type: 'vless', server: hp[0], port: Number(hp[1]) || 0,
+        uuid: uuid, udp: true
+      };
+      if (q.flow) { p.flow = q.flow; }
+      transport(p, q);
+      tlsCommon(p, q);
+      return p;
+    },
+
+    trojan: function (u, name) {
+      var sp = splitName(u), qq = qs(sp.body.slice(9));
+      var q = qq.q, base = qq.base;
+      var at = base.lastIndexOf('@');
+      if (at < 0) { return null; }
+      var pw = decodeURIComponent(base.slice(0, at)), hp = base.slice(at + 1).split(':');
+      var p = {
+        name: name || sp.name || (hp[0] + ':' + hp[1]),
+        type: 'trojan', server: hp[0], port: Number(hp[1]) || 0,
+        password: pw, udp: true
+      };
+      if (q.sni) { p.sni = q.sni; } else if (q.peer) { p.sni = q.peer; }
+      if (truthy(q.allowInsecure) || truthy(q.insecure)) { p['skip-cert-verify'] = true; }
+      if (q.fp) { p['client-fingerprint'] = q.fp; }
+      if (q.alpn) { p.alpn = q.alpn.split(','); }
+      transport(p, q);
+      if (q.security === 'reality' || q.pbk) {
+        p['reality-opts'] = {};
+        if (q.pbk) { p['reality-opts']['public-key'] = q.pbk; }
+        if (q.sid) { p['reality-opts']['short-id'] = q.sid; }
+      }
+      return p;
+    },
+
+    hysteria2: function (u, name) {
+      var sp = splitName(u), qq = qs(sp.body.replace(/^hy2:\/\//, 'hysteria2://').slice('hysteria2://'.length));
+      var q = qq.q, base = qq.base;
+      var at = base.lastIndexOf('@');
+      if (at < 0) { return null; }
+      var pw = decodeURIComponent(base.slice(0, at)).split(':').pop();
+      var hp = base.slice(at + 1).split(':');
+      var p = {
+        name: name || sp.name || (hp[0] + ':' + hp[1]),
+        // 端口跳跃(443,8443 / 20000-30000): 取第一个端口, 不能整条丢弃
+        type: 'hysteria2', server: hp[0], port: Number(String(hp[1]).split(/[,\-\/]/)[0]) || 0,
+        password: pw
+      };
+      if (q.sni) { p.sni = q.sni; }
+      if (truthy(q.insecure) || truthy(q.allowInsecure)) { p['skip-cert-verify'] = true; }
+      if (q.obfs) { p.obfs = q.obfs; p['obfs-password'] = q['obfs-password'] || ''; }
+      if (q.up) { p.up = q.up; }
+      if (q.down) { p.down = q.down; }
+      return p;
+    },
+
+    tuic: function (u, name) {
+      var sp = splitName(u), qq = qs(sp.body.slice(7));
+      var q = qq.q, base = qq.base;
+      var at = base.lastIndexOf('@');
+      if (at < 0) { return null; }
+      var ui = decodeURIComponent(base.slice(0, at)).split(':');
+      var hp = base.slice(at + 1).split(':');
+      var p = {
+        name: name || sp.name || (hp[0] + ':' + hp[1]),
+        type: 'tuic', server: hp[0], port: Number(hp[1]) || 0,
+        uuid: ui[0], password: ui.slice(1).join(':')
+      };
+      if (q.sni) { p.sni = q.sni; }
+      if (q.alpn) { p.alpn = q.alpn.split(','); }
+      if (truthy(q.allow_insecure) || truthy(q.insecure)) { p['skip-cert-verify'] = true; }
+      if (q.congestion_control) { p['congestion-controller'] = q.congestion_control; }
+      if (q.udp_relay_mode) { p['udp-relay-mode'] = q.udp_relay_mode; }
+      return p;
+    },
+
+    http: function (u, name, scheme) {
+      var sp = splitName(u), qq = qs(sp.body);
+      var base = qq.base.replace(/^https?:\/\//, '');
+      var at = base.lastIndexOf('@'), ui = '', hp = base;
+      if (at >= 0) { ui = decodeURIComponent(base.slice(0, at)); hp = base.slice(at + 1); }
+      hp = hp.split('/')[0].split(':');
+      var p = {
+        name: name || sp.name || (hp[0] + ':' + hp[1]),
+        type: 'http', server: hp[0], port: Number(hp[1]) || 0
+      };
+      if (ui) {
+        var c = ui.indexOf(':');
+        p.username = c < 0 ? ui : ui.slice(0, c);
+        p.password = c < 0 ? '' : ui.slice(c + 1);
+      }
+      if (scheme === 'https') { p.tls = true; }
+      return p;
+    },
+
+    socks: function (u, name) {
+      var sp = splitName(u), base = sp.body.replace(/^socks5?:\/\//, '');
+      var at = base.lastIndexOf('@'), ui = '', hp = base;
+      if (at >= 0) { ui = decodeURIComponent(base.slice(0, at)); hp = base.slice(at + 1); }
+      hp = hp.split('/')[0].split(':');
+      var p = {
+        name: name || sp.name || (hp[0] + ':' + hp[1]),
+        type: 'socks5', server: hp[0], port: Number(hp[1]) || 0, udp: true
+      };
+      if (ui) {
+        var c = ui.indexOf(':');
+        p.username = c < 0 ? ui : ui.slice(0, c);
+        p.password = c < 0 ? '' : ui.slice(c + 1);
+      }
+      return p;
+    }
+  };
+
+  function one(link, idx) {
+    var u = String(link || '').trim();
+    if (!u || u.charAt(0) === '#') { return null; }
+    var scheme = (u.split('://')[0] || '').toLowerCase();
+    var h;
+    if (scheme === 'ss') { h = handlers.ss; }
+    else if (scheme === 'ssr') { h = handlers.ssr; }
+    else if (scheme === 'vmess') { h = handlers.vmess; }
+    else if (scheme === 'vless') { h = handlers.vless; }
+    else if (scheme === 'trojan') { h = handlers.trojan; }
+    else if (scheme === 'hysteria2' || scheme === 'hy2') { h = handlers.hysteria2; }
+    else if (scheme === 'tuic') { h = handlers.tuic; }
+    else if (scheme === 'socks' || scheme === 'socks5') { h = handlers.socks; }
+    else if (scheme === 'http' || scheme === 'https') { h = handlers.http; }
+    else { return null; }
+    try {
+      var p = h === handlers.http ? h(u, '', scheme) : h(u, '');
+      if (!p || !p.server || !p.port) { return null; }
+      return p;
+    } catch (e) { return null; }
+  }
+
+  function dedup(list) {
+    // 按"基名计数 + 已用表"去重: 顺序无关, 且不会产出 "X #2" 与 "X #2" 重名
+    // (provider 里重名可能导致整份订阅加载失败)
+    var used = {}, out = [];
+    for (var i = 0; i < list.length; i++) {
+      var base = String(list[i].name || ('node-' + (i + 1)));
+      var n = base, c = 1;
+      while (used[n]) { c++; n = base + ' #' + c; }
+      used[n] = 1;
+      list[i].name = n;
+      out.push(list[i]);
+    }
+    return out;
+  }
+
+  // 主入口: 任意订阅原文 -> { yaml, count, failed, links, names }
+  function convert(text, opts) {
+    opts = opts || {};
+    var src = String(text == null ? '' : text);
+    var body = src;
+    if (looksBase64(src) && !isClashYaml(src)) {
+      var dec = b64decode(src);
+      if (dec && dec.indexOf('://') >= 0) { body = dec; }
+    }
+    var lines = body.split(/\r?\n/);
+    var list = [], failed = 0;
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i].trim();
+      if (!ln || ln.indexOf('://') < 0) { continue; }
+      var p = one(ln, i);
+      if (p) { list.push(p); } else { failed++; }
+    }
+    list = dedup(list);
+    var names = [];
+    for (var k = 0; k < list.length; k++) { names.push(list[k].name); }
+    var yaml = '';
+    if (list.length) {
+      // YAML 1.2 兼容 JSON: 用 flow 风格输出最省事、最不容易出错
+      yaml = 'proxies: ' + JSON.stringify(list, null, 0) + '\n';
+    }
+    return { yaml: yaml, count: list.length, failed: failed, names: names, proxies: list,
+             source_kind: isClashYaml(src) ? 'yaml' : (body === src ? 'uri' : 'base64') };
+  }
+
+  var api = {
+    convert: convert,
+    detect: function (text) {
+      var s = String(text == null ? '' : text);
+      if (!s.trim()) { return 'empty'; }
+      if (isClashYaml(s)) { return 'yaml'; }
+      if (looksBase64(s)) { return b64decode(s).indexOf('://') >= 0 ? 'base64' : 'unknown'; }
+      if (s.indexOf('://') >= 0) { return 'uri'; }
+      return 'unknown';
+    },
+    parseOne: one,
+    b64decode: b64decode,
+    isClashYaml: isClashYaml
+  };
+  return api;
+})();
+/*==OCConvert-end==*/
+
+/* ===================== 页面逻辑 ===================== */
+var CUR = {};   // 最近一次 show 的结果
+
+function api(action, param, opt) {
+  // 超时保护: 后端一旦卡住(比如撞上 occtl 的互斥锁), 没有超时就会永远停在"读取中 …",
+  // 用户看到的就是"点了没反应"。宁可明确报"无响应"也不要无限转圈。
+  opt = opt || {};
+  var ms = opt.timeout || 25000;
+  var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+  var timer = null;
+  var init = {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ func_name:'openclash', action:action, param:param||{} })
+  };
+  if (ctl) { init.signal = ctl.signal; timer = setTimeout(function(){ ctl.abort(); }, ms); }
+  var done = function(){ if (timer) { clearTimeout(timer); timer = null; } };
+  return fetch('/Action/call', init).then(function(r){
+    var ct = r.headers.get('content-type') || '';
+    return r.text().then(function(t){ done(); return { ct:ct, t:t }; });
+  }).then(function(o){
+    var t = o.t;
+    if (!t) { throw new Error('后端返回空内容(插件刚重启或后端异常, 刷新一次即可)'); }
+    // 会话过期时 iKuai 会返回 200 + HTML 登录页, 直接报"不是合法 JSON"会让人摸不着头脑
+    if (o.ct && o.ct.indexOf('json') < 0) {
+      throw new Error('登录已过期或接口异常(请刷新页面重新登录)');
+    }
+    var j;
+    try { j = JSON.parse(t); } catch (e) {
+      throw new Error('后端返回的不是合法 JSON: ' + t.slice(0, 120));
+    }
+    if (j.Result !== 30000) { throw new Error(j.ErrMsg || ('错误码 ' + j.Result)); }
+    return j.Data || {};
+  }).catch(function(e){
+    done();
+    if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) {
+      throw new Error('后端 ' + Math.max(1, Math.round(ms / 1000)) + ' 秒无响应(action=' + action +
+        (param && param.op ? ' op=' + param.op : '') +
+        ')。常见原因: 另一个 occtl 操作正占着互斥锁(等它一会儿再点), 或内核控制接口卡住。');
+    }
+    throw e;
+  });
+}
+// encodeURIComponent 不转义单引号, 而框架的 lua 会拒绝含引号的参数值
+function enc(s) { return encodeURIComponent(String(s == null ? '' : s)).replace(/'/g, '%27'); }
+function tip(t, cls) {
+  var m = document.getElementById('msg');
+  m.textContent = t || ''; m.className = 'msg ' + (cls || '');
+  if (t) { setTimeout(function(){ if (m.textContent === t) { m.textContent=''; } }, 8000); }
+}
+function val(id) { var e = document.getElementById(id); return e ? e.value : ''; }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n > 1048576) { return (n/1048576).toFixed(2)+' MB'; }
+  if (n > 1024) { return (n/1024).toFixed(1)+' KB'; }
+  return n+' B';
+}
+function fmtUp(s) {
+  s = Number(s)||0; var d = Math.floor(s/86400), h = Math.floor(s%86400/3600),
+      m = Math.floor(s%3600/60), ss = s%60;
+  return (d?d+'天':'') + (h||d?h+'时':'') + m+'分'+ss+'秒';
+}
+function onoff(v, on, off) { return String(v) === '1' ? (on||'开启') : (off||'关闭'); }
+function goto(id) {
+  var a = document.querySelector('.tabs a[data-p="'+id+'"]');
+  if (a) { a.onclick(); }
+}
+
+/* ---- 顶栏/告警/概览 ---- */
+var LOAD_SEQ = 0;
+function load(skipForm) {
+  var my = ++LOAD_SEQ;
+  return api('show', {TYPE:'data,conf'}).then(function(d){
+    if (my !== LOAD_SEQ) { return d; }          // 丢弃过期响应(轮询与手动操作会并发)
+    if (!d.conf || !Object.keys(d.conf).length) {
+      tip('后端未返回配置段(前后端版本不一致? 请重装插件包)', 'err');
+      return d;
+    }
+    CUR = d;
+    var s = d.status || {}, c = d.conf || {};
+    var runOk = String(s.running) === '1';
+
+    /* 顶栏 */
+    document.getElementById('tag-run').textContent = runOk ? ('运行中 #'+s.pid) : '未运行';
+    document.getElementById('tag-run').className = 'tag ' + (runOk ? 'ok' : 'err');
+    document.getElementById('tag-mode').textContent = '模式 ' + (s.mode || '-');
+    document.getElementById('tag-mode').className = 'tag ' + (s.mode === 'off' ? 'warn' : (runOk ? 'ok' : ''));
+
+    /* 大状态区 */
+    var hs = document.getElementById('hero-state');
+    hs.textContent = runOk ? '运行中' : '未运行';
+    hs.className = 'bigstate ' + (runOk ? 'run' : 'stop');
+    document.getElementById('hero-meta').innerHTML =
+      '运行时长 <b>' + (runOk ? fmtUp(s.uptime) : '—') + '</b> · 内存 <b>' +
+      (runOk ? fmtSize(Number(s.mem_kb || 0) * 1024) : '—') + '</b> · 模式 <b>' + esc(s.mode || '-') +
+      '</b> · 内核 <b>' + (String(s.core_exists) === '1' ? esc(s.core_version || '已就位') : '未安装') + '</b>';
+
+    /* 控制按钮按运行状态启用/禁用 —— 未运行时"停止/重启/热重载"点了要么无意义,
+       要么(重启)会把内核意外拉起来, 必须禁用; 内核没装时启动也禁用 */
+    updateHeroButtons(s);
+
+    /* 关键指标卡片 */
+    var html = '';
+    html += card('透明代理规则', onoff(s.rules, '已安装', '未安装'),
+                 s.rules === 1 ? 'ok' : (runOk ? 'err' : 'warn'));
+    html += card('DNS 劫持', onoff(s.dns_hijack, '已开启', '已关闭'), s.dns_hijack === 1 ? 'ok' : '');
+    html += card('控制接口', (s.api === 1 ? '正常' : '无响应'), s.api === 1 ? 'ok' : (runOk ? 'err' : ''));
+    html += card('订阅', c.sub_format ? (c.sub_time || '已导入') : '未订阅', c.sub_format ? 'ok' : 'warn');
+    html += card('GEO 数据', 'GEOSITE ' + (String(s.geosite) === '1' ? '有' : '无') +
+                 ' / GEOIP ' + (String(s.geoip) === '1' ? '有' : '无'),
+                 String(s.geoip) === '1' ? 'ok' : 'warn');
+    html += card('LAN 网卡', s.lan_if || '未识别');
+    html += card('配置模式', s.cfg_mode || '-');
+    document.getElementById('cards').innerHTML = html;
+
+    renderAlerts(s, c, d.runtime || {});
+
+    /* 表单只在"完整刷新"时重建 —— 15 秒轮询不能清掉用户正在编辑的内容 */
+    if (!skipForm) {
+      setSel('s-mode', c.mode);
+      setSel('s-clashmode', c.clash_mode);
+      setSel('s-enable', c.enable);
+      document.getElementById('f-ctrl').value = c.ctrl || '';
+      document.getElementById('f-secret').value = c.secret || '';
+      document.getElementById('f-suburl').value = c.sub_url || '';
+      var a = document.getElementById('panel-link');
+      a.href = panelUrl(s);
+      var _pp = panelParts(s);
+      document.getElementById('panel-info').textContent =
+        '主机 ' + _pp.host + ' · 端口 ' + _pp.port + ' · 密钥 ' + (_pp.secret || '(未设置)');
+      var fc = document.getElementById('f-subconv');
+      if (fc) { fc.value = c.sub_conv || ''; }
+      setAutoUI(c);
+      renderConvWarn(c);
+      buildCfgForm(c);
+    }
+    if (document.getElementById('p-set').classList.contains('on')) { previewCfg(); }
+    return d;
+  }).catch(function(e){ tip('加载失败: ' + e.message, 'err'); });
+}
+
+/* 告警区: 把"看着正常其实不正常"的状态显式摆出来, 每条都带直接动作 */
+function renderAlerts(s, c, rt) {
+  var runOk = String(s.running) === '1';
+  var a = [];
+  if (rt.incomplete) {
+    a.push(['danger', '安装不完整(缺少:' + esc(rt.incomplete) + ')',
+            '常见原因是插件分区(/etc/mnt)空间不足导致解包半途失败。请卸载后重新上传插件包。', '']);
+  } else if (String(rt.occtl) === '0') {
+    a.push(['danger', '引擎脚本不可执行',
+            '已尝试自动修复, 请刷新; 若仍如此, SSH 执行: chmod +x ' + esc(rt.dir || '/etc/mnt/plugins/openclash') + '/bin/*', '']);
+  } else if (String(rt.data) === '0') {
+    a.push(['danger', '数据目录不可写', esc(rt.dir || ''), '']);
+  } else if (String(rt.conf) === '0') {
+    a.push(['warn', '配置未初始化', '已尝试自动修复, 请刷新一次。', '']);
+  }
+  if (String(s.core_exists) !== '1') {
+    a.push(['warn', '内核未安装', '上传 mihomo 内核后才能启动(工具页 → 内核管理)。',
+            '<button class="sm pri" onclick="goto(\'p-tool\')">去上传</button>']);
+  }
+  if (runOk && String(s.rules) !== '1') {
+    a.push(['danger', '透明代理规则未安装 —— 当前流量是直连, 并没有走代理',
+            (s.rules_reason ? '原因: ' + esc(s.rules_reason) + ' ' : '') + '可点右侧立即安装; 若仍失败, 到「工具」看自检结果。',
+            '<button class="sm pri" onclick="act(\'ctl\',\'rules\')">立即安装</button>']);
+  }
+  if (String(c.cfg_mode) === 'custom') {
+    a.push(['warn', 'custom 配置模式',
+            '内核只加载你上传的完整配置, 插件不保证端口/控制接口/规则(控制接口无响应属正常)。', '']);
+  }
+  if (!c.sub_format) {
+    a.push(['info', '尚未导入订阅', '去「订阅」页填写地址并下载, 或手动导入配置。',
+            '<button class="sm" onclick="goto(\'p-sub\')">去订阅</button>']);
+  } else if (String(s.geosite) !== '1') {
+    a.push(['info', '未安装 GeoSite.dat',
+            'GEOSITE 规则已自动降级为 GEOIP / IP 规则; 需要广告拦截与域名分流时, 到「工具」导入。',
+            '<button class="sm" onclick="goto(\'p-tool\')">去导入</button>']);
+  }
+  var ic = { danger:'✕', warn:'!', info:'i' };
+  var h = '';
+  for (var i = 0; i < a.length; i++) {
+    h += '<div class="alert ' + a[i][0] + '"><div class="ic">' + ic[a[i][0]] + '</div>' +
+         '<div class="bd"><div class="t">' + a[i][1] + '</div><div class="d">' + a[i][2] + '</div></div>' +
+         (a[i][3] ? '<div class="ac">' + a[i][3] + '</div>' : '') + '</div>';
+  }
+  document.getElementById('alerts').innerHTML = h;
+}
+function card(k, v, cls) {
+  return '<div class="card"><div class="k">'+esc(k)+'</div><div class="v '+(cls||'')+'">'+esc(v)+'</div></div>';
+}
+function setSel(id, v) { var e = document.getElementById(id); if (e) { e.value = String(v); } }
+
+/* 控制按钮按运行状态启用/禁用。
+ * 为什么需要: 未运行时「停止/重启/热重载」要么无意义, 要么(重启=stop+start)
+ * 会把内核意外拉起来 —— 用户点"重启"却没想启动, 代理悄悄开了。
+ * 内核没装时「启动」也禁用(后端此时只会提示去上传, 不如直接给按钮说明)。 */
+function updateHeroButtons(s) {
+  var runOk = String((s || {}).running) === '1';
+  var coreOk = String((s || {}).core_exists) === '1';
+  var b = {
+    start:  document.getElementById('btn-start'),
+    stop:   document.getElementById('btn-stop'),
+    restart:document.getElementById('btn-restart'),
+    reload: document.getElementById('btn-reload')
+  };
+  if (b.start)  { b.start.disabled  = runOk || !coreOk;
+                  b.start.title = !coreOk ? '内核未安装: 请先到「工具」页上传 mihomo 内核' : (runOk ? '内核已在运行' : '启动内核'); }
+  if (b.stop)   { b.stop.disabled   = !runOk; b.stop.title   = runOk ? '' : '内核未运行'; }
+  if (b.restart){ b.restart.disabled= !runOk; b.restart.title= runOk ? '' : '内核未运行(重启会把它启动起来, 已禁用)'; }
+  if (b.reload) { b.reload.disabled = !runOk; b.reload.title = runOk ? '' : '内核未运行'; }
+}
+
+/* 透明代理模式切换: 会重启内核(约 10 秒, 期间局域网直连), 必须先确认;
+ * 用户取消时把下拉框恢复原值, 否则 UI 显示与实际不符 */
+function setMode(v) {
+  var prev = (CUR.conf || {}).mode;
+  if (String(v) === String(prev)) { return; }
+  if (!confirm('切换透明代理模式为 ' + v + ' 会重启内核(约 10 秒), 期间局域网流量直连、代理短暂中断。\n确定切换?')) {
+    setSel('s-mode', prev);
+    return;
+  }
+  setOne('mode', v);
+}
+/* 控制端口/密钥: 改了都会重启内核, 且用户手里已复制的地址/密钥当即失效 */
+function saveCtrl() {
+  var v = val('f-ctrl');
+  if (String(v) === String((CUR.conf || {}).ctrl)) { tip('没有改动'); return; }
+  if (!confirm('修改控制端口会重启内核, 已打开的面板会断开, 刚复制的地址也会失效。\n确定修改?')) { return; }
+  setOne('ctrl', v);
+}
+function saveSecret() {
+  var v = val('f-secret');
+  if (String(v) === String((CUR.conf || {}).secret)) { tip('没有改动'); return; }
+  if (!confirm('修改密钥会重启内核, 所有已连接的面板都需要用新密钥重新连接。\n确定修改?')) { return; }
+  setOne('secret', v);
+}
+/* 下载面板: 墙内 GitHub 基本不可达, 先说明再让用户决定 */
+function uiFetch() {
+  if (!confirm('将从 GitHub 镜像下载 zashboard 面板(约 20MB)。\n墙内网络可能很慢或失败(失败不影响使用, 插件页已自带管理功能)。继续?')) { return; }
+  act('ctl', 'ui-fetch');
+}
+function panelParts(s) {
+  s = s || {};
+  var ctrl = String(s.ctrl || '0.0.0.0:9090');
+  return { host: location.hostname || '127.0.0.1', port: ctrl.split(':').pop(), secret: s.secret || '' };
+}
+function panelUrl(s) {
+  var p = panelParts(s);
+  // 关键: 设了 external-ui-name 时, /ui/ 会 302 跳到 /ui/<name>/ 并丢掉查询参数,
+  // 所以这里直接给出 /ui/<name>/(踩过的坑: 用 /ui/ 导致面板回落到 127.0.0.1)
+  var ui = (CUR && CUR.conf && CUR.conf.ui_name) ? String(CUR.conf.ui_name) : '';
+  var path = '/ui/' + (ui ? ui + '/' : '');
+  var q = 'hostname=' + encodeURIComponent(p.host) + '&port=' + p.port +
+          '&secret=' + encodeURIComponent(p.secret) + '&type=clash';
+  // zashboard 有的版本从 location.search 读参数, 有的只从 hash 读 —— 两处都带上
+  return 'http://' + p.host + ':' + p.port + path + '?' + q + '#/?' + q;
+}
+function copyText(t, okMsg) {
+  var ta = document.createElement('textarea');
+  ta.value = t; document.body.appendChild(ta); ta.select();
+  var ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+  document.body.removeChild(ta);
+  if (!ok) { tip('复制失败, 请手动复制', 'err'); return; }
+  tip(okMsg || '已复制', 'ok');
+}
+function copySecret() {
+  var p = panelParts((CUR && CUR.status) || {});
+  copyText(p.secret, '密钥已复制(注意: 面板地址含密钥, 不要外发)');
+}
+function copyPanel() { copyText(panelUrl((CUR && CUR.status) || {}), '面板地址已复制(地址含密钥, 不要外发)'); }
+
+function setOne(key, value) {
+  if (value === undefined || value === null) { return; }
+  tip('保存 ' + key + ' …');
+  // 参数值统一 percent-encode: 后端会解回原文(这样 URL 里的 % / 空格都不会被吃掉)
+  return api('seting', {key:key, value:encodeURIComponent(String(value))}).then(function(d){
+    tip(key + ' 已保存', 'ok');
+    load();
+  }).catch(function(e){ tip('保存失败: ' + e.message, 'err'); });
+}
+function act(action, op, extra) {
+  var p = extra || {};
+  if (op) { p.op = op; }
+  tip('执行中 …');
+  return api(action, p).then(function(){
+    tip('操作已提交(详见「日志」页签的最后一次操作)', 'ok');
+    return load();
+  }).catch(function(e){ tip('操作失败: ' + e.message, 'err'); });
+}
+
+/* ---- 设置表单(按用途分组) ---- */
+var CFG_GROUPS = [
+  { title:'端口与监听', fields:[
+    ['mixed_port','混合代理端口','本地 HTTP+SOCKS 代理端口', 'num'],
+    ['redir_port','REDIRECT 端口','redirect 模式专用', 'num'],
+    ['tproxy_port','TPROXY 端口','tproxy 模式专用', 'num'],
+    ['dns_port','DNS 端口','内核 DNS 监听端口', 'num']
+  ]},
+  { title:'DNS', fields:[
+    ['dns_enable','启用内核 DNS','关闭后 DNS 劫持同时失效', 'bool'],
+    ['dns_hijack','劫持 LAN 53 端口','把局域网 DNS 查询导入内核', 'bool'],
+    ['fakeip','fake-ip 模式','关闭则使用 redir-host', 'bool']
+  ]},
+  { title:'分流与路由', fields:[
+    ['geosite','GEOSITE 规则','auto=按数据可用性 / 1=强制 / 0=关闭', 'enum:auto,1,0'],
+    ['ipv6','IPv6','开启后代理 IPv6 流量', 'bool'],
+    ['proxy_self','代理路由器自身流量','路由器自己的流量也走代理', 'bool'],
+    ['quic_block','禁用 QUIC(UDP 443)','让浏览器立刻回落 TCP, 不再白等 QUIC 超时; 零额外开销, 不用改代理模式', 'bool'],
+    ['lan_if','LAN 网卡','留空=自动探测(多 WAN 时建议手动指定)', 'text']
+  ]},
+  { title:'TPROXY 高级路由', fields:[
+    ['routing_mark','SO_MARK','内核出站标记, 用于免回环', 'num'],
+    ['fwmark','fwmark','TPROXY 策略路由标记', 'num'],
+    ['route_table','路由表号','TPROXY 策略路由表(勿与其它插件共用)', 'num']
+  ]},
+  { title:'订阅自动更新', fields:[
+    ['sub_interval','内核拉取间隔(秒)','仅订阅为 http provider 时生效(已导入的 sub.yaml 是文件型, 不看这项); 定时拉取请到「订阅」页设置', 'num'],
+    ['sub_conv_enable','直连失败自动改用转换服务','开启后在直连失败时会访问第三方转换服务', 'bool'],
+    ['sub_conv','转换服务地址','留空=内置默认 api.asailor.org/sub', 'text']
+  ]},
+  { title:'高级', fields:[
+    ['cfg_mode','配置模式','auto=模板渲染 / url=订阅直链 / custom=自定义完整配置', 'enum:auto,url,custom'],
+    ['log_level','日志级别','debug 会显著增加日志量', 'enum:silent,error,warning,info,debug'],
+    ['ui_name','面板目录名','内置 zashboard 的目录名', 'text'],
+    ['core_dir','内核安装目录','留空=插件 data/bin; 空间不足时可填 /etc/log/openclash', 'text'],
+    ['core_auto','内核缺失自动下载','在线下载已禁用, 此开关暂不生效(保留兼容)', 'bool']
+  ]}
+];
+function cfgAll() {
+  var out = [];
+  for (var i = 0; i < CFG_GROUPS.length; i++) { out = out.concat(CFG_GROUPS[i].fields); }
+  return out;
+}
+function buildCfgForm(c) {
+  var h = '';
+  for (var g = 0; g < CFG_GROUPS.length; g++) {
+    var grp = CFG_GROUPS[g];
+    h += '<div class="setgrp"><div class="setgrp-t">' + esc(grp.title) + '</div>';
+    for (var i = 0; i < grp.fields.length; i++) {
+      var f = grp.fields[i], k = f[0], label = f[1], hint = f[2], kind = f[3];
+      h += '<div class="frow"><div class="flabel">' + esc(label) + '</div><div class="fctl">';
+      if (kind === 'bool') {
+        h += '<select id="c-' + k + '"><option value="1">开启</option><option value="0">关闭</option></select>';
+      } else if (kind.indexOf('enum:') === 0) {
+        h += '<select id="c-' + k + '">';
+        var opts = kind.slice(5).split(',');
+        for (var j = 0; j < opts.length; j++) { h += '<option value="' + opts[j] + '">' + opts[j] + '</option>'; }
+        h += '</select>';
+      } else {
+        h += '<input type="' + (kind === 'num' ? 'number' : 'text') + '" id="c-' + k + '">';
+      }
+      if (hint) { h += '<div class="fhint">' + esc(hint) + '</div>'; }
+      h += '</div></div>';
+    }
+    h += '</div>';
+  }
+  document.getElementById('cfg-form').innerHTML = h;
+  var all = cfgAll();
+  for (var m = 0; m < all.length; m++) {
+    var el = document.getElementById('c-' + all[m][0]);
+    if (el) { el.value = c[all[m][0]] == null ? '' : String(c[all[m][0]]); }
+  }
+}
+function saveCfg() {
+  var jobs = [], i, k, el;
+  var all = cfgAll();
+  for (i = 0; i < all.length; i++) {
+    k = all[i][0];
+    el = document.getElementById('c-' + k);
+    if (!el) { continue; }
+    if (String(el.value) === String((CUR.conf || {})[k] == null ? '' : (CUR.conf || {})[k])) { continue; }
+    jobs.push([k, el.value]);
+  }
+  if (!jobs.length) { tip('没有改动', ''); return; }
+  tip('正在保存 ' + jobs.length + ' 项 …');
+  var chain = Promise.resolve();
+  jobs.forEach(function(j){
+    // defer=1: 后端只保存不重启, 由最后统一重启一次(否则改 N 个键 = N 次 stop+start)
+    chain = chain.then(function(){
+      return api('seting', {key:j[0], value:enc(String(j[1])), defer:'1'});
+    });
+  });
+  if (String((((CUR || {}).status) || {}).running) === '1') {
+    chain = chain.then(function(){ return api('ctl', {op:'restart'}); });
+  }
+  chain.then(function(){ tip('已保存 ' + jobs.length + ' 项' + (String((((CUR || {}).status) || {}).running) === '1' ? '并重启内核' : ''), 'ok'); load(); })
+       .catch(function(e){ tip('保存失败: ' + e.message, 'err'); });
+}
+/* 放弃改动: 重新拉一次配置重建表单(不碰设备上的值) */
+function resetCfg() {
+  if (!confirm('放弃所有未保存的改动, 恢复显示设备当前配置?')) { return; }
+  tip('已恢复当前配置', 'ok');
+  load();
+}
+function previewCfg() {
+  var el = document.getElementById('cfg-preview');
+  el.textContent = '读取中 …';
+  return api('show', {TYPE:'config'}).then(function(d){
+    var s = (CUR && CUR.status) || {};
+    var head = '配置文件: ' + (s.config_file || '/etc/mnt/plugins/openclash/data/config.yaml') +
+               '\n配置模式: ' + (s.cfg_mode || '-') + '   内核目录: ' + (s.core_dir || '插件 data/bin') + '\n' +
+               '----------------------------------------\n';
+    el.textContent = head + (d.config || '(尚未生成运行配置, 点「重新渲染配置」)');
+  }).catch(function(e){ el.textContent = '读取失败: ' + e.message; });
+}
+
+/* ---- 订阅 ---- */
+function renderConvWarn(c) {
+  var cw = document.getElementById('sub-conv-warn');
+  if (!cw) { return; }
+  var su = String(c.sub_url || '');
+  if (su.indexOf('api.asailor.org') >= 0 || (c.sub_conv && su.indexOf(String(c.sub_conv)) === 0)) {
+    cw.style.display = '';
+    cw.className = 'tip warn';
+    cw.textContent = '⚠ 当前订阅地址是转换服务地址(定时自动更新也走它)。要改回直连: 填回原订阅地址并保存, 再用「仅直连」下载一次。';
+  } else {
+    cw.style.display = 'none';
+  }
+}
+function loadSub() {
+  return api('show', {TYPE:'sub'}).then(function(d){
+    var s = d.sub || {};
+    document.getElementById('sub-kind').textContent = s.kind || '-';
+    document.getElementById('sub-size').textContent = fmtSize(s.size);
+    document.getElementById('sub-imported').textContent = String(s.imported) === '1' ? '是' : '否';
+    document.getElementById('sub-raw').textContent = (s.raw || '(未下载)').slice(0, 20000);
+    CUR.sub = s;
+    if (String(s.truncated) === '1') {
+      tip('订阅原文超过 512KB, 只取了前 512KB 用于转换预览(导入的仍是你转换后的完整结果)', 'warn');
+    }
+    return s;
+  }).catch(function(e){ tip('读取订阅失败: ' + e.message, 'err'); });
+}
+// 保存并更新: 一次点击完成"保存地址 + 下载订阅"。
+// 为什么能合并: 后端 conf-set 是同步写盘的(defer=1 只是跳过重启), 随后的
+// sub-update 会从 conf 读到新地址 —— 两步串行即可, 不需要用户点两次。
+// 合并还比原来更优: 内核最多重启一次(下载成功后的那次), 原来是保存重启一次、
+// 下载又重启一次。
+function saveAndUpdate() {
+  var url = val('f-suburl');
+  if (!url) { tip('请先填写订阅地址', 'err'); return; }
+  tip('正在保存地址并更新订阅 …');
+  return api('seting', {key:'sub_url', value:encodeURIComponent(url), defer:'1'})
+    .then(function(){
+      var sel = document.getElementById('s-submode');
+      var m = sel ? sel.value : 'auto';
+      return api('sub', {op:'update', mode:m});
+    })
+    .then(function(){ return api('show', {TYPE:'data'}); })
+    .then(function(d){
+      var out = String((d && d.lastop) || '').replace(/^[\d\-: ]+/, '');
+      var isErr = /下载失败|内容为空|未配置订阅地址|也失败了/.test(out);
+      tip(out ? out.slice(0, 400) : '订阅已更新', isErr ? 'err' : 'ok');
+      loadSub();
+      load();
+    })
+    .catch(function(e){ tip('保存并更新失败: ' + e.message, 'err'); });
+}
+
+// 一键下载订阅(用已保存的地址, 不重新保存)。
+//   auto      : 先直连; 失败(域名被 DNS 污染 / SNI 阻断)自动改走转换服务, 全程一次点击
+//   direct    : 只直连, 失败就报错(不碰第三方服务)
+//   converter : 直接用转换服务
+// 真正的回退发生在设备端 occtl sub-update, 这里只负责带上模式、然后回读后端记录的真实结果。
+// (动作类接口的 stdout 由框架丢弃, 只有 show 的返回值能拿到, 所以结果统一从 lastop 回读)
+function subDownload(mode) {
+  var sel = document.getElementById('s-submode');
+  var m = (mode && mode !== 'auto') ? mode : (sel ? sel.value : 'auto');
+  tip('正在下载订阅(方式: ' + m + ') …');
+  return api('sub', {op:'update', mode:m}).then(function(){
+    return api('show', {TYPE:'data'});
+  }).then(function(d){
+    var out = String((d && d.lastop) || '').replace(/^[\d\-: ]+/, '');
+    var isErr = /下载失败|内容为空|未配置订阅地址|也失败了/.test(out);
+    tip(out ? out.slice(0, 400) : '订阅已更新', isErr ? 'err' : 'ok');
+    loadSub();
+    load();
+  }).catch(function(e){ tip('下载失败: ' + e.message, 'err'); });
+}
+
+/* ---- 订阅定时自动更新 ----
+ * 注意顺序: 必须先保存间隔(sub_auto_h)再保存开关(sub_auto) —— 后端每次保存
+ * sub_auto/sub_auto_h 都会立刻重铺 cron, 先开开关会用一个还没更新的旧间隔装一次。 */
+function setAuto(h) {
+  h = String(h);
+  var on = (h && h !== '0') ? '1' : '0';
+  var hh = (h && h !== '0') ? h : '12';
+  tip('正在设置定时更新 …');
+  return api('seting', {key:'sub_auto_h', value:hh})
+    .then(function(){ return api('seting', {key:'sub_auto', value:on}); })
+    .then(function(){
+      tip(on === '1' ? ('定时更新已开启: 每 ' + h + ' 小时拉取一次') : '定时更新已关闭', 'ok');
+      load();
+    })
+    .catch(function(e){ tip('设置失败: ' + e.message, 'err'); load(); });
+}
+function setAutoUI(c) {
+  c = c || {};
+  var sel = document.getElementById('s-autoh');
+  if (!sel) { return; }
+  var on = String(c.sub_auto || '0');
+  var h = String(c.sub_auto_h || '12');
+  sel.value = (on === '1') ? h : '0';
+  var hint = document.getElementById('auto-hint');
+  if (hint) {
+    hint.textContent = (on === '1')
+      ? ('已开启: 每 ' + h + ' 小时拉取一次订阅(内容有变化才重启内核)')
+      : '关闭状态: 只在手动点「保存并更新 / 重新下载」时拉取';
+  }
+}
+
+/* ---- 日志清理 ---- */
+function clearLogs() {
+  if (!confirm('清空运行日志？\n包括: 内核日志 / 野输出 / bootstrap / 最后操作记录。\n只影响日志, 不影响运行中的内核与配置。')) { return; }
+  tip('正在清空日志 …');
+  return api('ctl', {op:'log-clear'}).then(function(){
+    tip('日志已清空', 'ok');
+    loadLogs();
+  }).catch(function(e){ tip('清空失败: ' + e.message, 'err'); });
+}
+
+function doConvert(apply) {
+  var m = document.getElementById('cv-msg');
+  m.textContent = '正在读取订阅原文 …';
+  loadSub().then(function(s){
+    var raw = s.raw || '';
+    if (!raw) { throw new Error('还没有订阅原文, 请先点「保存并更新」或「重新下载」'); }
+    var detected = OCConvert.detect(raw);
+    if (detected === 'yaml') {
+      m.textContent = '订阅本身就是 Clash/Meta 格式, 直接点「重新下载」即可, 无需转换';
+      return null;
+    }
+    var r = OCConvert.convert(raw);
+    if (!r.count) { throw new Error('没有解析出任何节点(格式: ' + detected + ', 失败 ' + r.failed + ' 条)'); }
+    var preview = '<div class="tip">识别为 <b>' + detected + '</b>, 解析出 <b>' + r.count +
+      '</b> 个节点' + (r.failed ? ', 跳过 ' + r.failed + ' 条' : '') + '</div>' +
+      '<pre>' + esc(r.names.slice(0, 40).join('\n') + (r.count > 40 ? '\n…' : '')) + '</pre>';
+    document.getElementById('cv-out').innerHTML = preview;
+    m.textContent = apply ? '正在回传导入 …' : '转换成功(仅预览)';
+    if (!apply) { return null; }
+    return uploadText('openclash-sub.yaml', r.yaml).then(function(){
+      return api('sub', {op:'save', name:'openclash-sub.yaml'});
+    }).then(function(){
+      m.textContent = '已导入 ' + r.count + ' 个节点并重启内核';
+      tip('订阅转换并导入成功', 'ok');
+      return load();
+    });
+  }).catch(function(e){ m.textContent = '转换失败: ' + e.message; });
+}
+// 上传文本: 先用 upload 接口落盘(字段名=文件名), 再让后端处理
+function uploadText(name, text) {
+  var fd = new FormData();
+  fd.append(name, new Blob([text], {type:'text/yaml'}), name);
+  return fetch('/Action/upload', { method:'POST', body: fd }).then(function(r){ return r.json(); })
+    .then(function(j){
+      if (j.Result !== 10000) { throw new Error(j.ErrMsg || ('上传失败 '+j.Result)); }
+      return true;
+    });
+}
+function uploadAs(inputId, mode) {
+  var input = document.getElementById(inputId);
+  if (!input.files || !input.files.length) { tip('请先选择文件', 'err'); return; }
+  var f = input.files[0];
+  var name = (mode === 'custom') ? 'openclash-custom.yaml' : 'openclash-sub.yaml';
+  tip('上传 ' + f.name + ' …');
+  var fd = new FormData();
+  fd.append(name, f, name);   // 字段名必须等于目标文件名(iKuai 上传接口按字段名存盘)
+  fetch('/Action/upload', { method:'POST', body: fd }).then(function(r){ return r.json(); })
+    .then(function(j){
+      if (j.Result !== 10000) { throw new Error(j.ErrMsg || ('上传失败 '+j.Result)); }
+      return mode === 'custom' ? api('imp', {op:'custom', name:name}) : api('sub', {op:'save', name:name});
+    })
+    .then(function(){ tip('导入完成: ' + f.name, 'ok'); input.value = ''; load(); loadSub(); })
+    .catch(function(e){ tip('导入失败: ' + e.message, 'err'); });
+}
+
+/* ---- 节点 ---- */
+function loadNodes() {
+  var wrap = document.getElementById('node-table-wrap');
+  var gbox = document.getElementById('node-groups');
+  var msg  = document.getElementById('node-msg');
+  // 任何一个元素缺失都不能让整个函数抛错 —— 那样点击就"毫无反应"(连个提示都没有)
+  function say(t, cls) { if (msg) { msg.textContent = t || ''; msg.className = 'msg ' + (cls || ''); } }
+  function put(box, html) { if (box) { box.innerHTML = html; } }
+  say('读取中 …');
+  // 节点数据走 show + TYPE=proxies: 框架只把 show 的 stdout 包成 Data,
+  // 旧的 node 动作里调 Show 前端永远拿不到(「读取节点没反应」的根因)
+  return api('show', {TYPE:'proxies'}, {timeout:20000}).then(function(d){
+    if (d && d.proxies && d.proxies.error) {
+      // 控制接口不通: 后端把原因放在 proxies.error 里, 原样展示并给处置按钮
+      say('读取失败', 'err');
+      put(gbox, '');
+      put(wrap, '<div class="tip err">' + esc(String(d.proxies.error)) + '</div>' +
+        '<div style="margin-top:8px">' +
+        '<button class="pri" onclick="loadNodes()">重试</button> ' +
+        '<button onclick="act(\'ctl\',\'start\')">启动内核</button> ' +
+        '<button onclick="act(\'ctl\',\'restart\')">重启内核</button> ' +
+        '<button onclick="load()">刷新状态</button></div>');
+      return;
+    }
+    if (!d || !d.proxies) {
+      // 后端通了但没给数据: 多半是前后端版本不一致(装了新页面却还是旧后端)
+      say('', 'err');
+      put(gbox, '');
+      put(wrap, '<div class="tip err">后端没有返回节点数据(插件前后端版本不一致? 请重装插件包)</div>' +
+        '<div style="margin-top:8px"><button class="pri" onclick="loadNodes()">重试</button> ' +
+        '<button onclick="load()">刷新状态</button></div>');
+      return;
+    }
+    var all = (d.proxies || {}).proxies || {};
+    var groups = [];
+    for (var k in all) {
+      if (!all.hasOwnProperty(k)) { continue; }
+      var p = all[k];
+      if (['Selector','URLTest','Fallback','LoadBalance','Relay'].indexOf(p.type) >= 0) { groups.push(p); }
+    }
+    if (!groups.length) {
+      CUR.groups = []; CUR.proxies = {}; CUR.gi = 0;
+      put(gbox, '');
+      put(wrap, '<div class="tip">控制接口通了, 但里面没有策略组。<br>' +
+        '通常是<b>还没导入订阅</b>: 去「订阅」页导入节点(或点「改用转换服务地址」后下载), 再重启内核。</div>' +
+        '<div style="margin-top:8px">' +
+        '<button class="pri" onclick="act(\'ctl\',\'restart\')">重启内核</button> ' +
+        '<button onclick="goto(\'p-sub\')">去订阅页</button></div>');
+      say('', '');
+      return;
+    }
+    CUR.groups = groups; CUR.proxies = all;
+    if (!(CUR.gi >= 0 && CUR.gi < groups.length)) { CUR.gi = 0; }
+    var h = '<div class="pills">';
+    groups.forEach(function(g, gi){
+      h += '<a data-gi="' + gi + '" class="' + (gi === CUR.gi ? 'on' : '') + '">' + esc(g.name) + '</a>';
+    });
+    h += '</div>';
+    put(gbox, h);
+    renderNodeTable();
+    say('共 ' + groups.length + ' 个策略组');
+  }).catch(function(e){
+    say('读取失败', 'err');
+    put(gbox, '');
+    put(wrap, '<div class="tip err">读不到节点: ' + esc(e.message) + '</div>' +
+      '<div style="margin-top:8px">' +
+      '<button class="pri" onclick="loadNodes()">重试</button> ' +
+      '<button onclick="act(\'ctl\',\'start\')">启动内核</button> ' +
+      '<button onclick="act(\'ctl\',\'restart\')">重启内核</button> ' +
+      '<button onclick="load()">刷新状态</button></div>' +
+      '<div class="tip" style="margin-top:6px">常见原因: 内核未运行; 控制接口密钥不匹配' +
+      '(例如配置模式还在 custom); 或内核正在启动中(等 3~5 秒再点一次)。' +
+      '详细原因看「日志」页签的"最后一次操作"。</div>');
+  });
+}
+function renderNodeTable() {
+  var gi = CUR.gi || 0;
+  var g = (CUR.groups || [])[gi];
+  var wrap = document.getElementById('node-table-wrap');
+  if (!g) { wrap.innerHTML = ''; return; }
+  var all = CUR.proxies || {};
+  var nodes = g.all || [];
+  var h = '<div class="frow2"><span class="tip grow">当前组: <b>' + esc(g.name) + '</b>' +
+    (g.now ? ' · 选用中: <b class="ok">' + esc(g.now) + '</b>' : '') + '</span>' +
+    '<span class="hint">单节点测速/选用点表格行内按钮</span></div>';
+  h += '<table><thead><tr><th>节点</th><th>类型</th><th>延迟</th><th>操作</th></tr></thead><tbody>';
+  nodes.forEach(function(n, ni){
+    var pr = all[n] || {};
+    h += '<tr' + (n === g.now ? ' class="cur"' : '') + '><td>' + esc(n) + (n === g.now ? ' <span class="tag ok">选用中</span>' : '') +
+         '</td><td>' + esc(pr.type || '-') + '</td>' +
+         '<td id="dl-' + gi + '-' + ni + '">-</td>' +
+         '<td><button class="sm btn-test" data-gi="' + gi + '" data-ni="' + ni + '">测速</button> ' +
+         '<button class="sm btn-use" data-gi="' + gi + '" data-ni="' + ni + '">选用</button></td></tr>';
+  });
+  h += '</tbody></table>';
+  wrap.innerHTML = h;
+}
+function gName(gi) { var g = (CUR.groups || [])[gi]; return g ? g.name : ''; }
+function nName(gi, ni) { var g = (CUR.groups || [])[gi]; return (g && g.all) ? g.all[ni] : ''; }
+function pick2(group, node) {
+  if (!group || !node) { return; }
+  return api('node', {op:'select', group:enc(group), name:enc(node)})
+    .then(function(){ tip('已切换 ' + group + ' → ' + node, 'ok'); renderNodeTable(); })
+    .catch(function(e){ tip('切换失败: ' + e.message, 'err'); });
+}
+function testOne(gi, ni) {
+  var el = document.getElementById('dl-' + gi + '-' + ni);
+  var node = nName(gi, ni);
+  if (el) { el.textContent = '测试中…'; }
+  return api('show', {TYPE:'delay', name:enc(node)}).then(function(d){
+    var delay = (d.delay || {}).delay;
+    var txt = (delay === undefined || delay === null) ? ((d.delay || {}).message || '超时') : (delay + ' ms');
+    if (el) {
+      el.textContent = txt;
+      el.className = delay ? 'ok' : 'err';
+    }
+    return delay;
+  }).catch(function(){ if (el) { el.textContent = '失败'; el.className = 'err'; } });
+}
+function testGroup(gi) {
+  var g = (CUR.groups || [])[gi];
+  if (!g) { tip('先读取节点', 'err'); return; }
+  var list = (g.all || []).slice(0, 30);
+  var idx = 0, done = 0;
+  tip('测速中 0/' + list.length + ' …');
+  function next() {
+    if (idx >= list.length) { tip('测速完成 ' + done + '/' + list.length, 'ok'); return; }
+    var ni = idx++;
+    testOne(gi, ni).then(function(){ done++; tip('测速中 ' + done + '/' + list.length + ' …'); next(); });
+  }
+  for (var c = 0; c < 4; c++) { next(); }
+}
+function nodeMode(v) {
+  return api('node', {op:'mode', name:v}).then(function(){
+    tip('运行模式已切换为 ' + v, 'ok');
+    return load(true);
+  }).catch(function(e){ tip('切换失败: ' + e.message, 'err'); });
+}
+// 节点区事件委托(只挂一次): 组切换 pills + 表格按钮
+(function(){
+  var gbox = document.getElementById('node-groups');
+  if (gbox) {
+    gbox.addEventListener('click', function(ev){
+      var t = ev.target, gi = t.getAttribute && t.getAttribute('data-gi');
+      if (gi === null || gi === undefined) { return; }
+      CUR.gi = Number(gi);
+      var as = gbox.querySelectorAll('.pills a');
+      for (var i = 0; i < as.length; i++) { as[i].classList.toggle('on', i === CUR.gi); }
+      renderNodeTable();
+    });
+  }
+  var box = document.getElementById('node-table-wrap');
+  if (!box) { return; }
+  box.addEventListener('click', function(ev){
+    var t = ev.target, cls = (t && t.className) || '';
+    if (cls.indexOf('btn-test') >= 0) {
+      testOne(Number(t.getAttribute('data-gi')), Number(t.getAttribute('data-ni')));
+    } else if (cls.indexOf('btn-use') >= 0) {
+      pick2(gName(Number(t.getAttribute('data-gi'))), nName(Number(t.getAttribute('data-gi')), Number(t.getAttribute('data-ni'))));
+    }
+  });
+})();
+
+/* ---- 日志 / 自检 ---- */
+function loadLogs() {
+  return api('show', {TYPE:'logs'}).then(function(d){
+    var l = d.logs || {};
+    document.getElementById('log-op').textContent = l.lastop || '(无)';
+    document.getElementById('log-core').textContent = l.core || '(无)';
+    document.getElementById('log-file').textContent = l.file || '';
+    var n = (l.noise || '') + '\n--- bootstrap ---\n' + (l.bootstrap || '');
+    var el = document.getElementById('log-noise');
+    if (el) { el.textContent = n.replace(/^\s+|\s+$/g, '') ? n : '(无)'; }
+  }).catch(function(e){ tip('读取日志失败: ' + e.message, 'err'); });
+}
+function loadDoctor() {
+  document.getElementById('doctor').textContent = '检测中(约 2 秒) …';
+  return api('show', {TYPE:'doctor'}).then(function(d){
+    document.getElementById('doctor').textContent = d.doctor || '(无输出)';
+  }).catch(function(e){ document.getElementById('doctor').textContent = '自检失败: ' + e.message; });
+}
+function loadRules() {
+  return api('show', {TYPE:'rules'}).then(function(d){
+    document.getElementById('rules').textContent = d.rules || '(无规则)';
+  }).catch(function(e){ document.getElementById('rules').textContent = '读取失败: ' + e.message; });
+}
+function bypassVal() {
+  var el = document.getElementById('bypass-ip');
+  var v = (el.value || '').replace(/^\s+|\s+$/g, '');
+  if (!v) { tip('请先填 IP 或 CIDR', 'err'); return null; }
+  if (!/^[0-9]+(\.[0-9]+){3}(\/[0-9]{1,2})?$/.test(v)) { tip('格式不对: 需要 IPv4 地址或 CIDR', 'err'); return null; }
+  return v;
+}
+function bypassAdd() {
+  var v = bypassVal(); if (!v) return;
+  act('ctl', 'bypass-add', {value:v}).then(loadBypass);
+}
+function bypassDel() {
+  var v = bypassVal(); if (!v) return;
+  act('ctl', 'bypass-del', {value:v}).then(loadBypass);
+}
+function loadBypass() {
+  var el = document.getElementById('bypass');
+  el.style.display = ''; el.textContent = '读取中 …';
+  return api('show', {TYPE:'bypass'}).then(function(d){
+    el.textContent = d.bypass || '(空)';
+  }).catch(function(e){ el.textContent = '读取失败: ' + e.message; });
+}
+function coreStatus() {
+  document.getElementById('core-status').textContent = '读取中 …';
+  return api('core', {op:'status'}).then(function(d){
+    document.getElementById('core-status').textContent = d.corestatus || '(无输出)';
+    return load();
+  }).catch(function(e){
+    // 老版本后端没有 core 动作时退回 show
+    return api('show', {TYPE:'data'}).then(function(d){
+      var s = (d && d.status) || {};
+      document.getElementById('core-status').textContent =
+        '内核路径 : /etc/mnt/plugins/openclash/bin/mihomo\n' +
+        '内核状态 : ' + (String(s.core_exists) === '1' ? '已就位' : '未就位') + '\n' +
+        '内核版本 : ' + (s.core_version || '未知') + '\n' +
+        'GEOSITE  : ' + (String(s.geosite) === '1' ? '已安装' : '未安装(规则已降级)') + '\n' +
+        'GEOIP    : ' + (String(s.geoip) === '1' ? '已安装' : '未安装');
+    }).catch(function(e2){ document.getElementById('core-status').textContent = '读取失败: ' + e2.message; });
+  });
+}
+// 通过 iKuai 上传接口把内核文件送上设备, 再让后端装到 bin/mihomo
+// 字段名固定(本地文件名可能含中文/空格/引号, 会被框架拒绝或校验失败)
+function uploadCore() {
+  var input = document.getElementById('f-core');
+  if (!input.files || !input.files.length) { tip('请先选择 mihomo 的 .gz 文件', 'err'); return; }
+  var f = input.files[0];
+  var name = 'openclash-core.gz';
+  var m = document.getElementById('msg');
+  tip('正在上传 ' + f.name + '（' + fmtSize(f.size) + '，请稍候）…');
+  var fd = new FormData();
+  fd.append(name, f, name);   // 字段名 = 文件名: iKuai 上传接口按字段名存盘
+  fetch('/Action/upload', { method:'POST', body: fd }).then(function(r){ return r.json(); })
+    .then(function(j){
+      if (j.Result !== 10000) { throw new Error(j.ErrMsg || ('上传失败 '+j.Result)); }
+      if (m) { m.textContent = '上传完成，正在解压安装 …'; m.className = 'msg'; }
+      return api('core', {op:'import', name:name});
+    })
+    .then(function(){
+      tip('内核安装完成，可以点「启动」了', 'ok');
+      input.value = '';
+      coreStatus();
+      load();
+    })
+    .catch(function(e){ tip('内核上传/安装失败: ' + e.message, 'err'); });
+}
+// 离线安装 GeoSite.dat(墙内下不到时的唯一通路)
+function uploadGeo() {
+  var input = document.getElementById('f-geo');
+  if (!input.files || !input.files.length) { tip('请先选择 GeoSite.dat', 'err'); return; }
+  var f = input.files[0];
+  var name = 'openclash-geosite.dat';
+  tip('正在上传 ' + f.name + '（' + fmtSize(f.size) + '）…');
+  var fd = new FormData();
+  fd.append(name, f, name);
+  fetch('/Action/upload', { method:'POST', body: fd }).then(function(r){ return r.json(); })
+    .then(function(j){
+      if (j.Result !== 10000) { throw new Error(j.ErrMsg || ('上传失败 '+j.Result)); }
+      tip('上传完成，正在安装 …');
+      return api('geo', {op:'import', name:name});
+    })
+    .then(function(){ tip('GeoSite.dat 已安装(内核会重启使规则生效)', 'ok'); input.value=''; load(); })
+    .catch(function(e){ tip('GEOSITE 上传/安装失败: ' + e.message, 'err'); });
+}
+
+/* ---- 页签 ---- */
+document.querySelectorAll('.tabs a').forEach(function(a){
+  a.onclick = function(){
+    document.querySelectorAll('.tabs a').forEach(function(x){ x.classList.remove('on'); });
+    document.querySelectorAll('.pane').forEach(function(x){ x.classList.remove('on'); });
+    a.classList.add('on');
+    document.getElementById(a.dataset.p).classList.add('on');
+    if (a.dataset.p === 'p-log') { loadLogs(); }
+    if (a.dataset.p === 'p-sub') { loadSub(); }
+    if (a.dataset.p === 'p-tool') { loadDoctor(); loadRules(); }
+    if (a.dataset.p === 'p-node') { loadNodes(); }
+    if (a.dataset.p === 'p-set') { previewCfg(); }
+  };
+});
+
+load();
+loadSub();
+setInterval(function(){ if (!document.hidden) { load(true); } }, 15000);
+</script>
+</body>
+</html>

@@ -1,0 +1,450 @@
+#!/bin/bash
+#
+# gecoosctl —— 集客AC 无线控制器 控制器(纯 shell)
+#
+# 框架会把 pkg/bin/* 软链到 /usr/sbin/ 并去掉 .sh 后缀, 设备上直接 `gecoosctl <命令>`。
+#
+# 命令:
+#   start [nowait] | stop | restart    启停(幂等; nowait 给开机用)
+#   status | status-json               人类可读 / JSON 状态
+#   port <1-65535>                     管理端口(-mp, Web 界面)
+#   apport <1024-65535>                AP 通信端口(-p, AP 发现/关联)
+#   autostart <0|1>                    开机自启
+#   wan_access <0|1>                   公网访问管理界面(默认 0=仅内网)
+#   passwd <新密码>                     设置 Web 管理密码(随启动写入)
+#   log [行数]                         查看运行日志
+#   ensure                             确保目录就位(不启动)
+#   version                            版本
+#
+# 真机实测结论(改之前先看):
+#   * 集客 AC 官方 x86_64 二进制(ac_linux_amd64_V2.2_202510151606)是 UPX 壳 +
+#     Go 静态 ELF, uClibc 1.0.40 设备直接跑, 启动 <1 秒, RSS 约 24MB。
+#   * 二进制没有配置文件, 一切靠命令行参数 => "改设置" = 停进程 -> 改我们的
+#     conf -> 再拉起。必须先停: AC 用的 LevelDB 在启动时加锁, 第二个实例会
+#     panic 在 create_db() 退出(RC=2), 端口也一样。
+#   * -passwd 只在启动那一刻把密码写进数据库(持久), 之后不带 -passwd 重启
+#     密码依然有效; 但如果 AC 网页里改了密码, 我们 conf 里存的旧值会在下次
+#     启动时把它盖回去 —— 所以密码以插件页面为准, 页面 tip 已写明。
+#   * 默认 Web 密码 admin; -p 60650 是集客 AP 的标准通信端口, 改了 AP 就
+#     发现不了 AC, 页面上有警告。
+#   * 设备没有 nohup/setsid, 后台常驻只能 `( trap '' HUP; exec ... ) &`。
+#
+set -u
+
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+ROOT="${PLUGIN_DIR:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+BIN="$ROOT/share/ac"                    # 大二进制放 share/ —— 框架不软链这个目录
+DATA="$ROOT/data"
+PIDF="$DATA/gecoos.pid"
+STARTF="$DATA/gecoos.start"
+CTLCONF="$DATA/gecoosctl.conf"
+ACPIDS="$DATA/run/ac_pid"               # AC 自己写的 pid 文件(-piddir)
+LOG=/etc/log/gecoos/gecoos.log
+DEF_PORT=8080                           # -mp  管理端口
+DEF_APORT=60650                         # -p   AP 通信端口
+DEF_VER="V2.2_202510151606"
+
+have() { command -v "$1" >/dev/null 2>/dev/null; }
+oc_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null; }
+
+ensure_dirs() {
+    mkdir -p "$DATA/db" "$DATA/upload" "$DATA/run" "$DATA" "$(dirname "$LOG")" 2>/dev/null
+    return 0
+}
+
+cfg_get() { sed -n "s/^$1=//p" "$CTLCONF" 2>/dev/null | head -n1; }
+cfg_set() {
+    local k="$1" v="$2"
+    test -f "$CTLCONF" || : > "$CTLCONF" 2>/dev/null
+    if grep -q "^$k=" "$CTLCONF" 2>/dev/null; then
+        sed -i "s|^$k=.*|$k=$v|" "$CTLCONF" 2>/dev/null
+    else
+        printf '%s=%s\n' "$k" "$v" >> "$CTLCONF" 2>/dev/null
+    fi
+}
+
+num_get() {  # num_get <键> <默认值>
+    local v
+    v="$(cfg_get "$1")"
+    case "$v" in ''|*[!0-9]*) v="$2" ;; esac
+    printf '%s' "$v"
+}
+port_get()   { num_get port   "$DEF_PORT";  }
+apport_get() { num_get apport "$DEF_APORT"; }
+
+# 只认 0/1, 默认开 —— 装完就该能用
+autostart_get() {
+    case "$(cfg_get autostart)" in
+        0) printf '0' ;;
+        *) printf '1' ;;
+    esac
+}
+
+# 只认 0/1, 默认关 —— 管理界面暴露在公网是实打实的风险, 要用得自己开
+wan_access_get() {
+    case "$(cfg_get wan_access)" in
+        1) printf '1' ;;
+        *) printf '0' ;;
+    esac
+}
+
+# WAN 口列表。iKuai 的 WAN 系接口名前缀(含多拨/虚拟 WAN), 与 openclash 的判定保持一致
+wan_ifaces() {
+    ip -o -4 addr show 2>/dev/null | awk '
+        $2 ~ /^(wan|vwan|adsl|pptp|l2tp|ovpn|iked|wwan)/ {print $2}
+    ' | awk '!s[$0]++'
+}
+
+# 公网访问开关: 关闭时在 filter/INPUT 把 WAN 口进来的管理端口流量 DROP 掉。
+# 全部用 -C/-D 直接操作, 不解析 `iptables -S` 的输出 —— iKuai 会给每条规则加
+# `[fastid: N] ` 前缀, 按 `^-A` 匹配会一条都匹配不到(规则永远删不掉的坑)。
+wan_guard_apply() {
+    local p i n=0
+    have iptables || return 0
+    p="$(port_get)"
+    for i in $(wan_ifaces); do
+        iptables -C INPUT -i "$i" -p tcp --dport "$p" -j DROP 2>/dev/null && continue
+        iptables -I INPUT 1 -i "$i" -p tcp --dport "$p" -j DROP 2>/dev/null && n=$((n + 1))
+    done
+    test "$n" -gt 0 && oc_log "[wan] 已禁止公网访问管理端口 $p (新增 $n 条规则)"
+    return 0
+}
+
+# $1 可指定要删的端口(改端口时清旧规则用), 缺省用当前端口
+wan_guard_remove() {
+    local p i n=0
+    have iptables || return 0
+    p="${1:-}"
+    case "$p" in ''|*[!0-9]*) p="$(port_get)" ;; esac
+    for i in $(wan_ifaces); do
+        while iptables -D INPUT -i "$i" -p tcp --dport "$p" -j DROP 2>/dev/null; do
+            n=$((n + 1))
+        done
+    done
+    test "$n" -gt 0 && oc_log "[wan] 已开放公网访问管理端口 $p (删除 $n 条规则)"
+    return 0
+}
+
+# 按开关把规则同步到当前状态(开机/改端口后调用)
+wan_guard_sync() {
+    if test "$(wan_access_get)" = "1"; then
+        wan_guard_remove
+    else
+        wan_guard_apply
+    fi
+    return 0
+}
+
+# 版本: 优先取日志里 AC 自己打的 "AC版本:", 取不到用随包二进制的已知版本
+ver_get() {
+    local v
+    v="$(grep -a '^AC版本:' "$LOG" 2>/dev/null | tail -n1 | awk '{print $2}')"
+    printf '%s' "${v:-$DEF_VER}"
+}
+
+# 日志超过 1MB 只留最后 1000 行
+log_trim() {
+    local kb
+    kb="$(du -k "$LOG" 2>/dev/null | awk '{print $1}')"
+    case "$kb" in ''|*[!0-9]*) return 0 ;; esac
+    if test "$kb" -gt 1024; then
+        tail -n 1000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG" 2>/dev/null
+        oc_log "[log] 日志过大($kb KB), 已裁剪"
+    fi
+    return 0
+}
+
+# 存活 = pid 文件在 + 进程在 + cmdline 里确实是我们的二进制(防 pid 复用)
+pid_alive() {
+    local p
+    test -f "$PIDF" || return 1
+    p="$(cat "$PIDF" 2>/dev/null)"
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$p" 2>/dev/null || return 1
+    if test -r "/proc/$p/cmdline"; then
+        case "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" in
+            *"$BIN"*) : ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+# 端口是否已被"别的进程"占用(自己占用不算)
+port_busy_others() {
+    local p="$1" self line pid
+    have netstat || return 1
+    self="$(cat "$PIDF" 2>/dev/null)"
+    line="$(netstat -tlnp 2>/dev/null | awk -v pt=":$p\$" '$4 ~ pt {print $NF; exit}')"
+    case "$line" in ''|'-'*) return 1 ;; esac
+    pid="${line%%/*}"
+    case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+    test "$pid" = "$self" && return 1
+    return 0
+}
+
+# 管理端口真的在应答了才算"就绪"(进程死了立即返回, 不傻等)
+port_ready() {
+    local p="$1" i=0
+    if ! have curl; then return 0; fi
+    while test "$i" -lt 30; do
+        if ! pid_alive; then
+            oc_log "[start] 进程已退出, 启动失败"
+            return 1
+        fi
+        if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$p/" 2>/dev/null; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    return 1
+}
+
+# 日志摘出来给用户看之前剥掉 ANSI 转义
+plain() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' 2>/dev/null; }
+
+tailerr() { tail -n 3 "$LOG" 2>/dev/null | plain | tr '\n' ' ' | cut -c1-180; }
+
+cmd_start() {
+    local port ap_port pass args
+    test -x "$BIN" || { echo "缺少集客AC程序: $BIN"; return 1; }
+    ensure_dirs
+    log_trim
+    if pid_alive; then
+        echo "集客AC 已在运行 pid=$(cat "$PIDF")"
+        return 0
+    fi
+    port="$(port_get)"
+    ap_port="$(apport_get)"
+    if port_busy_others "$port"; then
+        echo "管理端口 $port 已被其它进程占用, 请换一个"; return 1
+    fi
+    if port_busy_others "$ap_port"; then
+        echo "AP通信端口 $ap_port 已被其它进程占用, 请换一个"; return 1
+    fi
+    args="-p $ap_port -mp $port -f $DATA/upload/ -dbpath $DATA/db/ -piddir $DATA/run/"
+    args="$args -token 0 -lang zh -https 0 -isonlyoneprot 0 -showtip 0"
+    pass="$(cfg_get pass 2>/dev/null)"
+    case "$pass" in '') ;; *) args="$args -passwd $pass" ;; esac
+    ( trap '' HUP; exec "$BIN" $args ) >> "$LOG" 2>&1 &
+    printf '%s' "$!" > "$PIDF" 2>/dev/null
+    date +%s > "$STARTF" 2>/dev/null
+    oc_log "[start] pid=$(cat "$PIDF" 2>/dev/null) mp=$port p=$ap_port passwd=$([ -n "$pass" ] && echo 是 || echo 否)"
+    if test "${1:-}" = "nowait"; then
+        echo "集客AC 已启动 pid=$(cat "$PIDF")"
+        wan_guard_sync
+        return 0
+    fi
+    if port_ready "$port"; then
+        echo "集客AC 已启动 pid=$(cat "$PIDF") 管理端口=$port AP端口=$ap_port"
+        wan_guard_sync
+        return 0
+    fi
+    echo "集客AC 启动失败(端口 $port 未就绪): $(tailerr)"
+    return 1
+}
+
+cmd_stop() {
+    local p i=0
+    # AC 自己维护的 pid 文件也用上(双保险)
+    if test -f "$ACPIDS"; then
+        p="$(cat "$ACPIDS" 2>/dev/null)"
+        case "$p" in ''|*[!0-9]*) ;; *) kill "$p" 2>/dev/null ;; esac
+    fi
+    if test -f "$PIDF"; then
+        p="$(cat "$PIDF" 2>/dev/null)"
+        kill "$p" 2>/dev/null
+    fi
+    # 兜底: pid 文件丢了也要按二进制路径把残留进程清掉
+    for p in $(ps 2>/dev/null | grep -- "$BIN" | grep -v grep | awk '{print $1}'); do
+        kill "$p" 2>/dev/null
+    done
+    # 等它真的退出, 否则马上重启会绑不上端口/拿不到 DB 锁
+    while test "$i" -lt 15; do
+        test -z "$(ps 2>/dev/null | grep -- "$BIN" | grep -v grep)" && break
+        i=$((i + 1))
+        sleep 1
+    done
+    rm -f "$PIDF" "$STARTF" "$ACPIDS" 2>/dev/null
+    oc_log "[stop] 已停止"
+    echo "集客AC 已停止"
+    return 0
+}
+
+cmd_restart() {
+    cmd_stop >/dev/null 2>&1
+    sleep 1
+    cmd_start "${1:-}"
+}
+
+json_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+lan_ip() {
+    local i
+    i="$(ip -o -4 addr show 2>/dev/null | \
+         awk '$4 ~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ {sub(/\/.*/,"",$4); print $4; exit}')"
+    printf '%s' "${i:-127.0.0.1}"
+}
+
+cmd_status_json() {
+    local port ap_port running=false pid=0 up=0 ver="" pass="" ip
+    test -x "$BIN" || {
+        printf '{"installed":false,"running":false,"error":"缺少集客AC程序, 请重新安装插件"}\n'
+        return 0
+    }
+    ensure_dirs
+    port="$(port_get)"
+    ap_port="$(apport_get)"
+    pass="$(cfg_get pass 2>/dev/null)"
+    case "$pass" in '') pass="admin" ;; esac
+    if pid_alive; then
+        running=true
+        pid="$(cat "$PIDF" 2>/dev/null)"
+        if test -f "$STARTF"; then
+            up=$(( $(date +%s) - "$(cat "$STARTF" 2>/dev/null)" ))
+        fi
+        case "$up" in ''|*[!0-9]*) up=0 ;; esac
+        test "$up" -lt 0 && up=0
+    fi
+    ver="$(ver_get)"
+    ip="$(lan_ip)"
+    printf '{"installed":true,"running":%s,"pid":%s,"uptime":%s,"port":%s,"apport":%s,' \
+        "$running" "${pid:-0}" "${up:-0}" "$port" "$ap_port"
+    printf '"version":"%s","web_url":"http://%s:%s/","passwd":"%s","autostart":%s,"wan_access":%s}\n' \
+        "$(json_esc "$ver")" "$ip" "$port" "$(json_esc "$pass")" "$(autostart_get)" "$(wan_access_get)"
+    return 0
+}
+
+cmd_status() { cmd_status_json; }
+
+# 改端口通用逻辑: 先停 -> 写 conf -> 再起 -> 失败回滚
+_setport() {
+    local key="$1" val="$2" def="$3" label="$4" old was_running=no
+    case "$val" in
+        ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;;
+    esac
+    if test "$val" -lt 1 || test "$val" -gt 65535; then
+        echo "端口需在 1~65535 之间"; return 1
+    fi
+    ensure_dirs
+    if test "$key" = "port"; then old="$(port_get)"; else old="$(apport_get)"; fi
+    # 换管理端口前先把旧端口上的公网封锁规则清掉, 否则旧规则会一直挂着
+    if test "$key" = "port"; then wan_guard_remove "$old"; fi
+    pid_alive && was_running=yes
+    if test "$val" = "$old"; then
+        echo "端口未变化($val)"; return 0
+    fi
+    if port_busy_others "$val"; then
+        echo "端口 $val 已被其它进程占用, 请换一个"; return 1
+    fi
+    if test "$was_running" = yes; then
+        cmd_stop >/dev/null 2>&1
+    fi
+    cfg_set "$key" "$val"
+    if test "$was_running" = yes; then
+        if cmd_start wait >/dev/null 2>&1; then
+            oc_log "[$key] $old -> $val"
+            echo "$label已改为 $val 并重启"
+            return 0
+        fi
+        cfg_set "$key" "$old"
+        cmd_start wait >/dev/null 2>&1
+        oc_log "[$key] $old -> $val 失败, 已回滚到 $old"
+        echo "端口 $val 启动失败, 已回滚到 $old: $(tailerr)"
+        return 1
+    fi
+    oc_log "[$key] $old -> $val (未运行, 下次启动生效)"
+    echo "$label已设为 $val(服务未运行, 下次启动生效)"
+    return 0
+}
+
+cmd_port()   { _setport port   "${1:-}" "$DEF_PORT"  "管理端口"; }
+cmd_apport() { _setport apport "${1:-}" "$DEF_APORT" "AP通信端口"; }
+
+cmd_autostart() {
+    case "${1:-}" in
+        0|1) cfg_set autostart "$1"
+             echo "开机自启: $(test "$1" = 1 && echo 开启 || echo 关闭)"; return 0 ;;
+        *)   echo "用法: gecoosctl autostart <0|1>"; return 1 ;;
+    esac
+}
+
+cmd_wan_access() {
+    case "${1:-}" in
+        0|1) ensure_dirs
+             cfg_set wan_access "$1"
+             if test "$1" = "1"; then wan_guard_remove; else wan_guard_apply; fi
+             oc_log "[wan] 公网访问 -> $1"
+             echo "公网访问: $(test "$1" = 1 && echo 已开启 || echo 已关闭)"
+             return 0 ;;
+        *)   echo "用法: gecoosctl wan_access <0|1>"; return 1 ;;
+    esac
+}
+
+cmd_passwd_set() {
+    local p="${1:-}" n was_running=no old
+    test -n "$p" || { echo "密码不能为空"; return 1; }
+    # 参数值不能含空格/引号(lua 侧会拒), 白名单校验
+    if printf '%s\n' "$p" | grep -q '[^0-9A-Za-z!@#$%^*()_+.,:;<>?/~{}-]'; then
+        echo "密码含不允许的字符(不能有空格、引号、反斜杠、方括号)"; return 1
+    fi
+    n="${#p}"
+    if test "$n" -lt 4; then echo "密码至少 4 位"; return 1; fi
+    if test "$n" -gt 64; then echo "密码最多 64 位"; return 1; fi
+    ensure_dirs
+    old="$(cfg_get pass 2>/dev/null)"
+    pid_alive && was_running=yes
+    if test "$was_running" = yes; then
+        cmd_stop >/dev/null 2>&1
+    fi
+    cfg_set pass "$p"
+    if test "$was_running" = yes; then
+        if cmd_start wait >/dev/null 2>&1; then
+            oc_log "[passwd] 管理密码已修改"
+            echo "管理密码已修改并重启, 登录密码即新密码"
+            return 0
+        fi
+        case "$old" in '') cfg_unset pass ;; *) cfg_set pass "$old" ;; esac
+        cmd_start wait >/dev/null 2>&1
+        echo "重启失败, 已恢复原密码: $(tailerr)"
+        return 1
+    fi
+    oc_log "[passwd] 管理密码已修改(未运行, 下次启动生效)"
+    echo "管理密码已修改(下次启动生效)"
+    return 0
+}
+
+cfg_unset() {
+    test -f "$CTLCONF" || return 0
+    sed -i "/^$1=/d" "$CTLCONF" 2>/dev/null
+    return 0
+}
+
+cmd_log() {
+    local n="${1:-60}"
+    case "$n" in ''|*[!0-9]*) n=60 ;; esac
+    log_trim
+    tail -n "$n" "$LOG" 2>/dev/null || echo "(暂无日志)"
+}
+
+cmd_version() { ver_get; }
+
+case "${1:-}" in
+    start)         shift; cmd_start "${1:-wait}" ;;
+    start-nowait)  cmd_start nowait ;;
+    stop)          cmd_stop ;;
+    restart)       cmd_restart wait ;;
+    status)        cmd_status ;;
+    status-json)   cmd_status_json ;;
+    port)          shift; cmd_port "${1:-}" ;;
+    apport)        shift; cmd_apport "${1:-}" ;;
+    autostart)     shift; cmd_autostart "${1:-}" ;;
+    wan_access)    shift; cmd_wan_access "${1:-}" ;;
+    wan-sync)      wan_guard_sync ;;
+    passwd)        shift; cmd_passwd_set "${1:-}" ;;
+    log)           shift; cmd_log "${1:-60}" ;;
+    ensure)        ensure_dirs; log_trim; echo "目录与配置已就位" ;;
+    version)       cmd_version ;;
+    *)             sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

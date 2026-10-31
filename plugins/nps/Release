@@ -1,0 +1,3 @@
+plugin=nps
+version=0.26.39.3
+comment=nps 内网穿透服务端(官方静态二进制) + 开机自启 + Web 管理入口 + 默认端口 81

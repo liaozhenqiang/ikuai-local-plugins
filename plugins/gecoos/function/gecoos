@@ -1,0 +1,141 @@
+#!/bin/bash /etc/ikcommon
+#
+# function/gecoos —— 集客AC 后端接口(框架软链到 /usr/ikuai/function/gecoos)。
+#
+# 分发链: openresty -> /usr/ikuai/function/func_api.sh gecoos <action> k=v...
+#
+# 实测契约(alist/ttyd 插件已踩平, /etc/ikcommon 源码为准):
+#   * 参数变成同名 shell 变量(show TYPE=status -> $TYPE; ctl op=start -> $op)
+#   * 只有 show 动作的输出会进 Data; show() 里只写一句 Show __json_result__,
+#     绝不能再手动 case 分发(否则键重复)
+#   * 其它动作成功时 stdout 被丢弃(ErrMsg 强写 Success); 失败时 stdout 成为
+#     ErrMsg(Result=30002) —— 所以失败原因要原文透传
+#   * 参数值不能含空格/引号(lua 侧校验会拒)
+#
+ROOT="${PLUGIN_DIR:-/etc/mnt/plugins/gecoos}"
+CTL="$ROOT/bin/gecoosctl"
+
+# json_append 的 str 类型只转义双引号, 不转义换行/反斜杠/控制字符。
+# 日志要先剥 ANSI 转义(0x1b 会让浏览器 JSON.parse 报 Bad control character),
+# 再把 \ 转 \\ 、换行转 \n; 双引号留给框架(否则二次转义)。
+json_text() {
+    printf '%s' "$1" | awk -v esc="$(printf '\033')" 'BEGIN{ORS=""}
+        {
+            gsub(esc "\\[[0-9;]*[A-Za-z]", "")
+            gsub(esc, "")
+            gsub(/\r/, "")
+            gsub(/\\/, "\\\\")
+            if (NR > 1) printf "\\n"
+            printf "%s", $0
+        }'
+}
+
+# ---------------------------------------------------------------- show 系列
+
+# TYPE 不传时框架默认取 data, 给个别名兜一下
+__show_data() { __show_status; }
+
+__show_status() {
+    local s
+    if [ ! -x "$CTL" ]; then
+        status='{"installed":false,"running":false,"error":"插件未正确安装, 请重新安装"}'
+        json_append __json_result__ status:json
+        return 0
+    fi
+    s="$("$CTL" status-json 2>/dev/null)"
+    # 后端拿到的一定要是完整 JSON: 半截/空串会让页面报"不是合法 JSON"
+    case "$s" in
+        '{"'*'}') ;;
+        *) s='{"installed":false,"running":false,"error":"状态查询失败"}' ;;
+    esac
+    status="$s"
+    json_append __json_result__ status:json
+}
+
+__show_log() {
+    local t
+    if [ ! -x "$CTL" ]; then
+        logtext='(插件未正确安装)'
+        json_append __json_result__ logtext:str
+        return 0
+    fi
+    t="$("$CTL" log 80 2>/dev/null)"
+    case "$t" in '') t='(暂无日志)' ;; esac
+    logtext="$(json_text "$t")"
+    json_append __json_result__ logtext:str
+}
+
+show()
+{
+    Show __json_result__
+}
+
+# ---------------------------------------------------------------- 动作
+
+ctl()
+{
+    local out
+    case "${op:-}" in
+        start|stop|restart)
+            # 失败时 stdout 会成为 ErrMsg 送到页面, 把控制器的原文透传
+            out="$("$CTL" "$op" 2>&1)" || { echo "${out:-执行 $op 失败, 请查看日志}"; return 1; }
+            return 0 ;;
+        *)
+            echo "不支持的操作: ${op:-空}"; return 1 ;;
+    esac
+}
+
+seting()
+{
+    local out
+    case "${key:-}" in
+        port)
+            case "${value:-}" in
+                ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;;
+            esac
+            if [ "${value}" -lt 1 ] || [ "${value}" -gt 65535 ]; then
+                echo "端口需在 1~65535 之间"; return 1
+            fi
+            out="$("$CTL" port "$value" 2>&1)" || { echo "${out:-修改管理端口失败}"; return 1; }
+            return 0 ;;
+        apport)
+            case "${value:-}" in
+                ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;;
+            esac
+            if [ "${value}" -lt 1024 ] || [ "${value}" -gt 65535 ]; then
+                echo "AP通信端口需在 1024~65535 之间"; return 1
+            fi
+            out="$("$CTL" apport "$value" 2>&1)" || { echo "${out:-修改AP端口失败}"; return 1; }
+            return 0 ;;
+        autostart)
+            case "${value:-}" in
+                0|1) out="$("$CTL" autostart "$value" 2>&1)" || { echo "${out:-保存失败}"; return 1; }
+                     return 0 ;;
+                *)   echo "取值必须是 0 或 1"; return 1 ;;
+            esac ;;
+        wan_access)
+            case "${value:-}" in
+                0|1) out="$("$CTL" wan_access "$value" 2>&1)" || { echo "${out:-保存失败}"; return 1; }
+                     return 0 ;;
+                *)   echo "取值必须是 0 或 1"; return 1 ;;
+            esac ;;
+        *)
+            echo "不支持的配置项: ${key:-空}"; return 1 ;;
+    esac
+}
+
+# 设置 Web 管理密码(AC 的 -passwd 在启动时写入数据库并持久化)
+passwd()
+{
+    local out
+    case "${op:-}" in
+        set)
+            case "${value:-}" in
+                '') echo "密码不能为空"; return 1 ;;
+            esac
+            out="$("$CTL" passwd "$value" 2>&1)" || { echo "${out:-修改密码失败}"; return 1; }
+            return 0 ;;
+        *)
+            echo "不支持的操作: ${op:-空}"; return 1 ;;
+    esac
+}

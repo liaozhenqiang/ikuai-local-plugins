@@ -1,0 +1,1 @@
+{"name":"ttyd","manufacturer":"tsl0922","version":"1.7.7","title":"TTYD 网页终端","author":"tsl0922","description":"在浏览器里直接打开路由器的 root 终端（ttyd 1.7.7 静态构建），支持启停、自定义端口、访问口令与开机自启。"}

@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>向日葵远程控制</title>
+<!--
+  界面用插件统一 UI 套件 ikui（Element Plus + 设计令牌）。
+  ikui.js / ikui.css 跟本页同目录（www/plugins/app/）：
+  根分区空间紧，框架在 /usr/ikuai/www/plugins/ 下建不出新目录，
+  所以资源平铺在 app/ 里，接入也就两行。
+-->
+<link rel="stylesheet" href="./ikui.css">
+</head>
+<body>
+
+<!--
+  模板必须放在 <script type="text/x-template"> 里：HTML 解析器不认自闭合标签，
+  直接写在 body 里的话 <el-table-column/> 会把后面的列全吞进去（表格塌成一列）。
+-->
+<script type="text/x-template" id="tpl">
+<ik-page title="向日葵远程控制">
+  <template #actions>
+    <span class="ik-msg">{{ msg }}</span>
+    <el-button size="small" @click="load()">刷新</el-button>
+  </template>
+
+  <ik-tiles :items="tiles"></ik-tiles>
+
+  <!-- 未绑定账号时显示的连接指引：没有账号也能用识别码 + 验证码连 -->
+  <!-- logged 三态：null=还没问到，别在第一帧就闪"未绑定账号也能远程" -->
+  <el-alert v-if="logged === false" type="error" :closable="false" show-icon>
+    <template #title>
+      <b>未绑定账号：本机识别码没有固定，重启后会变化</b>
+    </template>
+    <div style="line-height:1.7;margin-top:2px">
+      未绑定时向日葵每次启动都会重新领号，所以当前识别码 <b>{{ d.idcode || '-' }}</b> 只是这一次的，
+      连接请以本页显示为准。在向日葵 App / 网页版 <code class="ik-code">i.oray.com</code> 里
+      选「用识别码连接」，填这个识别码 + 下面的验证码即可。
+      <br>想让识别码固定（重启不变、设备列表里直接看到），用下面的「登录并绑定」。
+    </div>
+  </el-alert>
+
+  <ik-sec title="验证码" desc="连接时填这两个">
+    <el-form label-width="110px" @submit.prevent>
+      <el-form-item label="识别码">
+        <span class="ik-code" style="display:inline-block;min-width:160px">{{ d.idcode || '-' }}</span>
+      </el-form-item>
+      <el-form-item label="验证码">
+        <span class="ik-code" style="display:inline-block;min-width:160px">{{ d.code || '（还没解出来）' }}</span>
+        <el-button size="small" plain style="margin-left:8px" :loading="codeBusy"
+                   @click="refreshCode">刷新</el-button>
+      </el-form-item>
+    </el-form>
+    <p class="ik-tip">
+      向日葵 App / <code class="ik-code">i.oray.com</code> 选「用识别码连接」，填识别码 + 验证码。
+      验证码是设备本地的那个码，点「刷新」会现解一次拿最新的（设备换过码时以这里为准）。
+    </p>
+  </ik-sec>
+
+  <ik-sec title="账号登录" desc="密码只交给本机客户端，不落盘">
+    <el-form label-width="110px" @submit.prevent>
+      <el-form-item label="账号">
+        <el-input v-model="lg.account" style="width:320px"
+                  placeholder="向日葵账号 / 手机号 / 邮箱"></el-input>
+      </el-form-item>
+      <el-form-item label="密码">
+        <el-input v-model="lg.pass" type="password" show-password style="width:320px"
+                  placeholder="登录密码（只用于这一次登录，不落盘）"></el-input>
+      </el-form-item>
+      <el-form-item>
+        <el-button type="primary" :loading="lg.busy" @click="doLogin">登录并绑定</el-button>
+        <el-button :disabled="lg.busy" @click="doLogout">解绑账号</el-button>
+        <span class="ik-msg" :class="lg.tone">{{ lg.msg }}</span>
+      </el-form-item>
+    </el-form>
+    <p class="ik-tip">
+      登录是把账号密码交给本机的向日葵客户端（<code class="ik-code">awesuncli bind</code>）完成的，
+      <b>密码不会保存到设备上</b>；成功后会自动把登录身份存一份凭证，重启也不用再登。
+    </p>
+  </ik-sec>
+
+  <ik-sec title="本地密码" desc="在这台设备上设一次就行，长期有效">
+    <el-form label-width="110px" @submit.prevent>
+      <el-form-item label="当前状态">
+        <span class="ik-code">{{ String(d.pwd_set) === '1' ? '已设置' : '未设置' }}</span>
+      </el-form-item>
+      <el-form-item label="设为">
+        <el-input v-model="pw.pass" type="password" show-password style="width:320px"
+                  placeholder="至少 6 位，含两类字符（数字/字母/符号）"></el-input>
+      </el-form-item>
+      <el-form-item>
+        <el-button type="primary" :loading="pw.busy" @click="doSetPwd">设置本地密码</el-button>
+        <span class="ik-msg" :class="pw.tone">{{ pw.msg }}</span>
+      </el-form-item>
+    </el-form>
+    <p class="ik-tip">
+      这是<b>你自己设的那个固定密码</b>，设一次即可、长期有效，主控端连接时填在<b>密码</b>那一栏。
+      （它和「验证码」不是同一个东西：验证码是设备自己生成、会变的那个。）
+      密码在向日葵内部按摘要保存，页面读不回明文，所以只显示"已设置"。
+    </p>
+  </ik-sec>
+
+  <ik-sec title="虚拟屏幕" desc="远端看到的就是这些屏，可在客户端里切换">
+    <template #actions>
+      <el-button size="small" type="primary" plain @click="addScreen">+ 加一块屏</el-button>
+      <el-button size="small" type="primary" :loading="scBusy" @click="applyScreens">应用并重启虚拟桌面</el-button>
+      <span class="ik-msg" :class="scTone">{{ scMsg }}</span>
+    </template>
+
+    <el-table :data="screens" border size="small" style="width:100%">
+      <el-table-column label="屏号" width="70">
+        <template #default="{ $index }">{{ $index }}</template>
+      </el-table-column>
+      <el-table-column label="类型" width="180">
+        <template #default="{ row }">
+          <el-select v-model="row.type" size="small" @change="onType(row)">
+            <el-option v-for="t in TYPES" :key="t[0]" :label="t[0] + '（' + t[1] + '）'" :value="t[0]"></el-option>
+          </el-select>
+        </template>
+      </el-table-column>
+      <el-table-column label="分辨率" width="230">
+        <template #default="{ row }">
+          <el-select v-model="row.size" size="small" @change="onSize(row)">
+            <el-option v-for="s in SIZES" :key="s" :label="s" :value="s"></el-option>
+            <el-option label="自定义…" value="__custom"></el-option>
+          </el-select>
+          <el-input v-if="row.size === '__custom'" v-model="row.custom" size="small"
+                    placeholder="宽x高" style="margin-top:6px"></el-input>
+        </template>
+      </el-table-column>
+      <el-table-column label="内容">
+        <template #default="{ row }">
+          <el-input v-model="row.target" size="small" :placeholder="placeholder(row.type)"></el-input>
+        </template>
+      </el-table-column>
+      <el-table-column label="操作" width="90">
+        <template #default="{ $index }">
+          <el-button size="small" type="danger" plain @click="delScreen($index)">删除</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+
+    <p class="ik-tip">
+      <b>类型</b>：<code class="ik-code">shell</code> 是命令行（内容填 <code class="ik-code">top</code>
+      之类的程序名就是程序界面，留空是交互 shell）；<code class="ik-code">web</code> 是网页
+      （内容填 <code class="ik-code">-</code> 表示爱快自己的后台，也可以填别的网址，必须是
+      <code class="ik-code">http://</code> 或 <code class="ik-code">https://</code> 开头）；
+      <code class="ik-code">blank</code> 是空屏。<br>
+      <b>分辨率</b>：每块屏独立，可以直接从推荐值里选，也可以手填（宽 320–8192）。最多 8 块屏。
+      改动要等「应用」之后生效，会重启虚拟桌面（向日葵会短暂断开）。
+    </p>
+  </ik-sec>
+
+  <ik-sec title="网页屏自动登录" desc="打开后网页屏直接进后台，不需要账号密码">
+    <el-form label-width="110px" @submit.prevent>
+      <el-form-item label="自动登录">
+        <el-switch v-model="wl.on" :loading="wl.busy" @change="saveWebui"></el-switch>
+      </el-form-item>
+    </el-form>
+    <p class="ik-tip">
+      只对<b>本机 iKuai 后台</b>（<code class="ik-code">127.0.0.1</code> 之类的地址）生效，
+      指向外部网址时不会用。关掉这个开关，那个屏就是个普通浏览器。
+    </p>
+  </ik-sec>
+
+  <ik-sec title="运行控制">
+    <div class="ik-toolbar">
+      <el-button type="primary" @click="ctl('start')">启动</el-button>
+      <el-button @click="ctl('restart')">重启</el-button>
+      <el-button type="danger" plain @click="ctl('stop')">停止</el-button>
+      <span class="ik-toolbar__spacer"></span>
+      <span class="ik-msg" :class="msgTone">{{ msg }}</span>
+    </div>
+  </ik-sec>
+
+  <ik-sec title="登录身份凭证" desc="重启 / 换机免登录用">
+    <el-descriptions :column="2" border size="small">
+      <el-descriptions-item label="凭证状态">{{ ident.saved === '1' ? '已保存' : '未保存' }}</el-descriptions-item>
+      <el-descriptions-item label="保存时间">{{ ident.saved_at || '-' }}</el-descriptions-item>
+      <el-descriptions-item label="凭证识别码">{{ ident.fastcode || '-' }}</el-descriptions-item>
+      <el-descriptions-item label="凭证 MAC">{{ ident.mac || '-' }}</el-descriptions-item>
+      <el-descriptions-item label="凭证账号">{{ ident.account || '-' }}</el-descriptions-item>
+    </el-descriptions>
+    <div class="ik-toolbar">
+      <el-button type="primary" @click="identSave">保存当前登录态</el-button>
+      <el-button @click="identRestore">从凭证还原</el-button>
+      <span class="ik-msg">{{ iMsg }}</span>
+    </div>
+    <p class="ik-tip">
+      <b>识别码 = f(本机网卡的 MAC)</b>，配置文件里那个 <code class="ik-code">fastcode</code> 只是缓存。
+      换设备时靠的是把 MAC 带过去（还原凭证时没有同 MAC 的网卡会自动建一张辅助网卡），
+      识别码、授权、账号绑定就整体回来了 —— <b>全程不需要保存你的账号密码</b>。
+    </p>
+    <pre class="ik-pre">awesunctl status                # 看现状
+awesunctl screens show          # 看虚拟屏幕配置
+awesunctl login &lt;账号&gt; &lt;密码&gt;  # 命令行登录（等同页面上那个按钮）
+awesunctl setpwd &lt;验证码&gt;      # 设置本机验证码
+awesunctl console               # 进 awesuncli 交互 shell</pre>
+  </ik-sec>
+</ik-page>
+</script>
+
+<div id="app"></div>
+
+<script src="./ikui.js"></script>
+<script>
+var SIZES = ['1280x720','1366x768','1600x900','1920x1080','1920x1200',
+             '2560x1440','3840x2160','1024x768','800x600'];
+var TYPES = [['shell','命令行'], ['web','网页'], ['blank','空屏']];
+
+IKUI.mount('#app', {
+  tpl: '#tpl',
+  func: 'awesun',
+  data: function () {
+    return {
+      d: {}, tiles: [], logged: null, msg: '',   // null=还不知道
+      codeBusy: false,
+      lg: { account: '', pass: '', busy: false, msg: '', tone: '' },
+      pw: { pass: '', busy: false, msg: '', tone: '' },
+      screens: [], scBusy: false, scMsg: '', scTone: '',
+      wl: { on: true, busy: false },
+      ident: {}, iMsg: '',
+      SIZES: SIZES, TYPES: TYPES,
+      PY: -1      /* 上次的屏数：相同就不重建表格，免得冲掉正在编辑的行 */
+    };
+  },
+  methods: {
+    /* ---------------------------------------------------------- 状态总览 */
+    load: function () {
+      var self = this;
+      this.ik('show').then(function (d) {
+        self.d = d;
+        self.logged = String(d.logged) === '1';   // 这里是布尔，模板按 === false 判
+        var on = String(d.online) === '1';
+        /* 未绑定就别报"离线"：这条路本来就不走账号登录，靠识别码连接 */
+        var bound = String(d.bound) === '1';
+        self.tiles = [
+          { k: '上线状态', v: bound ? (on ? '在线' : '离线') : '未绑定',
+            tone: bound ? (on ? 'ok' : 'warn') : 'warn' },
+          { k: '本机识别码', v: d.idcode || '获取中…', size: 'big', mono: true },
+          /* 不用 wide：那会让这张卡占两格、把整行顶歪。网格列宽够放 24 字符了 */
+          { k: '葵码', v: d.kuaima || d.fastcode || '-', size: 'sm', mono: true },
+          { k: '绑定账号', v: d.account || '（未绑定账号）', size: 'sm' },
+          { k: '本机密码', v: String(d.pwd_set) === '1' ? '已设置' : '未设置',
+            tone: String(d.pwd_set) === '1' ? 'ok' : 'warn' },
+          { k: '远端会话', v: self.sessText(d.sess_state),
+            tone: String(d.sess_state) === 'active' ? 'ok' : 'warn' },
+          { k: '每屏内容', v: String(d.content) === '1' ? '运行中' : '未运行',
+            tone: String(d.content) === '1' ? 'ok' : 'mut' }
+        ];
+
+        /* 表单回填：正在输入的控件别动，免得把用户改了一半的内容冲掉 */
+        self.wl.on = String(d.autologin || '1') === '1';
+
+        self.fillScreens(String(d.screens || ''), Number(d.screen_count || 0));
+      }).catch(function (e) { self.msg = e.message; });
+
+      /* 凭证详情也走 show（框架只给 action=show 的返回包 Data） */
+      this.ik('show', { TYPE: 'ident' }).then(function (d) { self.ident = d; }).catch(function () {});
+    },
+    sessText: function (s) {
+      s = String(s || 'none');
+      return s === 'active' ? '有人在远控' : (s === 'closed' ? '已断开' : '无');
+    },
+
+    /* ---------------------------------------------------------- 屏幕表格 */
+    placeholder: function (t) {
+      if (t === 'web') { return '网址，填 - 表示爱快后台'; }
+      if (t === 'shell') { return '留空=交互 shell，或填 top 等程序名'; }
+      return '空屏不用填';
+    },
+    fillScreens: function (str, n) {
+      var self = this;
+      if (n === this.PY) { return; }        /* 屏数没变就别动表格 */
+      this.PY = n;
+      var lines = String(str || '').split(';').filter(function (x) { return x.indexOf('|') >= 0; });
+      if (!lines.length) { this.screens = []; this.addScreen(); return; }
+      this.screens = lines.map(function (l) {
+        var p = l.split('|');
+        var size = p[2] || '1280x720';
+        var custom = SIZES.indexOf(size) < 0;
+        return { type: p[1] || 'shell', size: custom ? '__custom' : size,
+                 custom: custom ? size : '', target: p[3] || '-' };
+      });
+      self.screens.forEach(function (r) { self.onType(r); });
+    },
+    onType: function (row) {
+      if (row.type === 'blank') { row.target = '-'; }
+      if (row.type === 'web' && (row.target === '' || row.target === 'shell' || row.target === 'top')) {
+        row.target = '-';
+      }
+    },
+    onSize: function (row) { row.custom = ''; },
+    addScreen: function () {
+      if (this.screens.length >= 8) { this.scMsg = '最多 8 块屏'; this.scTone = 'ik-err'; return; }
+      var i = this.screens.length;
+      this.screens.push({ type: i === 0 ? 'web' : 'shell', size: '1280x720',
+                          custom: '', target: '-' });
+    },
+    delScreen: function (i) { this.screens.splice(i, 1); },
+    collectScreens: function () {
+      var p = {}, err = '';
+      this.screens.forEach(function (r, i) {
+        var t = r.type;
+        var sz = (r.size === '__custom') ? String(r.custom || '').trim() : r.size;
+        var tg = String(r.target || '').trim().replace(/\s/g, '');
+        if (t === 'blank') { tg = '-'; }
+        if (tg === '') { tg = '-'; }
+        if (!/^\d+x\d+$/.test(sz)) { err = '第 ' + i + ' 屏的分辨率要写成 宽x高（例如 1280x720）'; return; }
+        if (t === 'web' && tg !== '-' && !/^https?:\/\//.test(tg) && !/^file:\/\//.test(tg)) {
+          err = '第 ' + i + ' 屏是网页类型，内容要么填 -（爱快后台）要么填 http(s):// 开头的地址'; return;
+        }
+        p['t' + i] = t; p['s' + i] = sz; p['g' + i] = tg;
+      });
+      if (err) { return { err: err }; }
+      if (!this.screens.length) { return { err: '至少要留一块屏' }; }
+      p.n = String(this.screens.length);
+      return { params: p };
+    },
+    applyScreens: function () {
+      var r = this.collectScreens();
+      if (r.err) { this.scMsg = r.err; this.scTone = 'ik-err'; return; }
+      var self = this;
+      this.scBusy = true;
+      this.scMsg = '正在应用并重启虚拟桌面…'; this.scTone = 'ik-mut';
+      var p = r.params; p.op = 'set';
+      this.ik('screens', p).then(function () {
+        self.scMsg = '已应用，虚拟桌面正在重启'; self.scTone = 'ik-ok';
+        self.PY = -1;                        /* 让下次刷新重新读一遍 */
+        setTimeout(function () { self.load(); }, 4000);
+      }).catch(function (e) { self.scMsg = e.message; self.scTone = 'ik-err'; })
+        .then(function () { self.scBusy = false; });
+    },
+
+    /* 现解一次验证码：钩子在向日葵进程里解好写文件，这里只是触发 + 读回 */
+    refreshCode: function () {
+      var self = this;
+      this.codeBusy = true;
+      this.ik('show', { TYPE: 'code' }).then(function (r) {
+        self.d.code = (r && r.code) || '';
+        self.msg = self.d.code ? ('当前验证码: ' + self.d.code) : '取码失败（看 hook.log 的 [验证码] 行）';
+      }).catch(function (e) {
+        self.msg = e.message;
+      }).then(function () { self.codeBusy = false; });
+    },
+
+    /* ---------------------------------------------------------- 登录 / 验证码 */
+    /* 登录 / 设验证码 / 解绑都是后端异步执行（要几十秒，超过框架给动作的等待时间），
+       动作只回一句"已开始"，结果通过轮询 show 里的 login_state/login_msg 拿。 */
+    pollAct: function (slot, onOk) {
+      var self = this;
+      var n = 0;
+      return new Promise(function (resolve) {
+        var timer = setInterval(function () {
+          n++;
+          self.ik('show').then(function (d) {
+            var st = String(d.login_state || '');
+            if (st === 'running' || st === '') {
+              if (n > 45) { clearInterval(timer); slot.busy = false;
+                slot.msg = '超时了，稍后点刷新看看'; slot.tone = 'ik-err'; resolve(false); }
+              return;
+            }
+            clearInterval(timer);
+            var msg = d.login_msg || (st === 'ok' ? '完成' : '失败');
+            slot.msg = msg; slot.tone = st === 'ok' ? 'ik-ok' : 'ik-err';
+            slot.busy = false;
+            if (st === 'ok' && onOk) { onOk(); }
+            self.load();
+            resolve(st === 'ok');
+          }).catch(function (e) {
+            clearInterval(timer); slot.busy = false;
+            slot.msg = e.message; slot.tone = 'ik-err'; resolve(false);
+          });
+        }, 2000);
+      });
+    },
+    doLogin: function () {
+      var self = this;
+      var a = String(this.lg.account || '').trim();
+      var p = this.lg.pass || '';
+      if (!a || !p) { this.lg.msg = '账号和密码都要填'; this.lg.tone = 'ik-err'; return; }
+      this.lg.busy = true; this.lg.msg = '正在登录…'; this.lg.tone = 'ik-mut';
+      this.ik('login', { account: a, password: p }).then(function () {
+        self.lg.pass = '';
+        self.lg.msg = '已提交，正在登录…';
+        self.pollAct(self.lg, function () { self.lg.account = ''; });
+      }).catch(function (e) { self.lg.busy = false; self.lg.msg = e.message; self.lg.tone = 'ik-err'; });
+    },
+    doLogout: function () {
+      var self = this;
+      IKUI.confirm('确定解绑账号吗？解绑后要用识别码+验证码连接，本机保存的登录凭证也会一起清掉。').then(function (yes) {
+        if (!yes) { return; }
+        self.lg.busy = true; self.lg.msg = '正在解绑…'; self.lg.tone = 'ik-mut';
+        self.ik('logout').then(function () { self.pollAct(self.lg, null); })
+          .catch(function (e) { self.lg.busy = false; self.lg.msg = e.message; self.lg.tone = 'ik-err'; });
+      });
+    },
+    doSetPwd: function () {
+      var self = this;
+      var p = this.pw.pass || '';
+      if (p.length < 6) { this.pw.msg = '验证码至少 6 位'; this.pw.tone = 'ik-err'; return; }
+      var kinds = 0;
+      if (/[0-9]/.test(p)) { kinds++; }
+      if (/[A-Za-z]/.test(p)) { kinds++; }
+      if (/[^0-9A-Za-z]/.test(p)) { kinds++; }
+      if (kinds < 2) { this.pw.msg = '验证码要含两类字符（数字/字母/符号）'; this.pw.tone = 'ik-err'; return; }
+      this.pw.busy = true; this.pw.msg = '正在设置…'; this.pw.tone = 'ik-mut';
+      this.ik('setpwd', { password: p }).then(function () {
+        self.pw.pass = '';
+        self.pollAct(self.pw, function () { self.load(); });
+      }).catch(function (e) { self.pw.busy = false; self.pw.msg = e.message; self.pw.tone = 'ik-err'; });
+    },
+
+    /* ---------------------------------------------------------- 设置保存 */
+    /* 开关即存。免密不需要账号密码，所以这里只提交一个 autologin。 */
+    saveWebui: function () {
+      var self = this;
+      this.wl.busy = true;
+      this.ik('webui', { autologin: this.wl.on ? '1' : '0' }).then(function () {
+        IKUI.toast(self.wl.on ? '已开启：打开网页屏就直接进后台' : '已关闭：网页屏不注入会话', 'success');
+        setTimeout(function () { self.load(); }, 1200);
+      }).catch(function (e) { IKUI.toast('保存失败: ' + e.message, 'error'); })
+        .then(function () { self.wl.busy = false; });
+    },
+
+    /* ---------------------------------------------------------- 运行控制 / 凭证 */
+    ctl: function (op) {
+      var self = this;
+      this.msg = '执行中…';
+      this.ik('control', { op: op }).then(function () {
+        self.msg = '已执行 ' + op; setTimeout(function () { self.load(); }, 2000);
+      }).catch(function (e) { self.msg = e.message; });
+    },
+    identSave: function () {
+      var self = this;
+      this.iMsg = '保存中…';
+      this.ik('identsave').then(function () { self.iMsg = '已保存'; self.load(); })
+        .catch(function (e) { self.iMsg = e.message; });
+    },
+    identRestore: function () {
+      var self = this;
+      this.iMsg = '还原中…';
+      this.ik('identrestore').then(function () {
+        self.iMsg = '已还原，正在重启服务'; setTimeout(function () { self.load(); }, 3000);
+      }).catch(function (e) { self.iMsg = e.message; });
+    }
+  },
+  mounted: function () {
+    var self = this;
+    this.PY = -1;
+    this.load();
+    this.timer = setInterval(function () { self.load(); }, 15000);
+  },
+  unmounted: function () { if (this.timer) { clearInterval(this.timer); } }
+});
+</script>
+</body>
+</html>

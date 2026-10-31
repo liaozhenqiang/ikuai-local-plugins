@@ -1,0 +1,131 @@
+#!/bin/bash
+#
+# ddnsgo —— 插件命令行包装器(框架把 pkg/bin/* 软链到 /usr/sbin/, 去掉 .sh 后缀)。
+#
+# 职责: 管理 ddns-go 官方静态二进制(share/ddns-go)的启动/停止/状态/日志。
+# 真正的 DNS 配置(服务商/域名/密钥)由 ddns-go 自带 Web 界面管理, 存于
+#   $ROOT/data/.ddns_go_config.yaml (持久分区, 重启/升级不丢)。
+#
+# 命令:
+#   init            初始化数据目录与环境文件(幂等)
+#   start           后台启动(抗挂断 + pid 文件去重)
+#   stop            停止
+#   restart         重启
+#   status          输出一行 JSON 状态
+#   log [n]         查看最近 n 行日志(默认 100)
+#   run             前台运行(调试用)
+#   get-listen      读取生效的监听地址
+#   get-interval    读取生效的同步间隔(秒)
+#
+set -u
+
+# 通过软链(/usr/sbin/ddnsgo)调用时解析真实路径, 保证 ROOT 指向插件本体
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+ROOT="${PLUGIN_DIR:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+BIN="$ROOT/share/ddns-go"
+CONF="$ROOT/data/.ddns_go_config.yaml"
+ENVFILE="$ROOT/data/ddnsgo.env"
+PIDFILE="$ROOT/data/ddnsgo.pid"
+LOG=/etc/log/ddnsgo.log
+
+get_listen() {
+    local v=":9876"
+    [ -f "$ENVFILE" ] && { . "$ENVFILE"; v="${LISTEN:-:9876}"; }
+    printf '%s' "$v"
+}
+
+get_interval() {
+    local v="300"
+    [ -f "$ENVFILE" ] && { . "$ENVFILE"; v="${INTERVAL:-300}"; }
+    case "$v" in ''|*[!0-9]*) v=300 ;; esac
+    printf '%s' "$v"
+}
+
+get_version() {
+    sed -n 's/^version=//p' "$ROOT/Release" 2>/dev/null | head -n1
+}
+
+is_running() {
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+}
+
+cmd_init() {
+    mkdir -p "$ROOT/data" "$(dirname "$LOG")" 2>/dev/null
+    [ -f "$ENVFILE" ] || printf 'LISTEN=:9876\nINTERVAL=300\n' > "$ENVFILE"
+    # 自愈: 补回自身与真实二进制的执行位(框架只 chmod function/, 不管 bin/)
+    [ -n "$SELF" ] && chmod +x "$SELF" "$BIN" 2>/dev/null
+    return 0
+}
+
+cmd_start() {
+    cmd_init
+    if is_running; then
+        echo "已在运行 pid=$(cat "$PIDFILE" 2>/dev/null)"
+        return 0
+    fi
+    [ -x "$BIN" ] || { echo "缺少二进制文件: $BIN" >&2; return 1; }
+    # 设备没有 nohup/setsid: 用子 shell + 忽略 HUP; exec 让 $! 就是最终进程 pid
+    ( trap '' HUP; exec "$BIN" -l "$(get_listen)" -f "$(get_interval)" -c "$CONF" >> "$LOG" 2>&1 ) &
+    echo $! > "$PIDFILE"
+    sleep 1
+    if is_running; then
+        echo "已启动 pid=$(cat "$PIDFILE" 2>/dev/null) listen=$(get_listen)"
+        return 0
+    fi
+    rm -f "$PIDFILE"
+    echo "启动失败, 详见 $LOG" >&2
+    return 1
+}
+
+cmd_stop() {
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+        sleep 1
+        kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && kill -9 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+    fi
+    rm -f "$PIDFILE" 2>/dev/null
+    echo "已停止"
+    return 0
+}
+
+cmd_restart() {
+    cmd_stop >/dev/null
+    cmd_start
+}
+
+cmd_status() {
+    local running=false pid="" listen port code=""
+    listen="$(get_listen)"
+    if is_running; then running=true; pid="$(cat "$PIDFILE" 2>/dev/null)"; fi
+    port="${listen##*:}"
+    case "$port" in ''|*[!0-9]*) port=9876 ;; esac
+    # 进程活着不等于端口在听: 本地探一次 Web 端口, 000 表示没监听/连不上
+    if [ "$running" = true ] && command -v curl >/dev/null 2>&1; then
+        code="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null)"
+    fi
+    printf '{"running":%s,"pid":"%s","listen":"%s","port":"%s","web_code":"%s","interval":"%s","version":"%s","conf":"%s","log":"%s"}\n' \
+        "$running" "$pid" "$listen" "$port" "$code" "$(get_interval)" "$(get_version)" "$CONF" "$LOG"
+}
+
+cmd_log() {
+    tail -n "${1:-100}" "$LOG" 2>/dev/null || true
+    return 0
+}
+
+cmd_run() {
+    cmd_init
+    exec "$BIN" -l "$(get_listen)" -f "$(get_interval)" -c "$CONF"
+}
+
+case "${1:-}" in
+    init)         cmd_init ;;
+    start)        cmd_start ;;
+    stop)         cmd_stop ;;
+    restart)      cmd_restart ;;
+    status)       cmd_status ;;
+    log)          shift; cmd_log "${1:-}" ;;
+    run)          cmd_run ;;
+    get-listen)   get_listen ;;
+    get-interval) get_interval ;;
+    *)            echo "用法: ddnsgo {init|start|stop|restart|status|log [n]|run|get-listen|get-interval}" >&2; exit 1 ;;
+esac

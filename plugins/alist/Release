@@ -1,0 +1,3 @@
+plugin=alist
+version=3.65.0
+comment=AList 网盘聚合：阿里云盘/115/天翼云盘/夸克/OneDrive 等聚合为统一 Web 站点与 WebDAV，可按需开启 FTP/SFTP/S3 服务端

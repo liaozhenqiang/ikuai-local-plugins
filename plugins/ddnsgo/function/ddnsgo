@@ -1,0 +1,71 @@
+#!/bin/bash /etc/ikcommon
+#
+# function/ddnsgo —— Web 后端接口(框架软链到 /usr/ikuai/function/ddnsgo)。
+#
+# 分发链: openresty -> /usr/ikuai/function/func_api.sh ddnsgo <action> k=v...
+# 动作: show / start / stop / restart / seting
+# 约定:
+#   * 动作必须是 name() 形式(不能以下划线开头), 否则 func_api 判 invalid action
+#   * show 动作把数据塞进 __json_result__, 由 Show 包成 {"Result":30000,"Data":{...}}
+#   * 失败: 向 stdout 打印错误并 return 1 -> 前端收到 Result=30002
+#
+ROOT="/etc/mnt/plugins/ddnsgo"
+CLI="$ROOT/bin/ddnsgo"
+ENVFILE="$ROOT/data/ddnsgo.env"
+
+# 用 bash 调用包装器(而不是靠执行位直接执行): 即使 zip 权限位丢失,
+# 后端接口依然可用(框架只对 function/ 做 chmod, 不管 bin/)。
+cli() { bash "$CLI" "$@"; }
+
+__show_data() {
+    local status
+    status="$(cli status 2>/dev/null)"; [ -n "$status" ] || status='{}'
+    json_append __json_result__ status:json
+}
+
+show()
+{
+    Show __json_result__
+}
+
+start()
+{
+    cli start >/dev/null 2>&1 && { echo "已启动"; return 0; }
+    echo "启动失败"; return 1
+}
+
+stop()
+{
+    cli stop >/dev/null 2>&1 && { echo "已停止"; return 0; }
+    echo "停止失败"; return 1
+}
+
+restart()
+{
+    cli restart >/dev/null 2>&1 && { echo "已重启"; return 0; }
+    echo "重启失败"; return 1
+}
+
+seting()
+{
+    local l i
+    l=":9876"; i="300"
+    [ -f "$ENVFILE" ] && . "$ENVFILE"
+    l="${LISTEN:-:9876}"; i="${INTERVAL:-300}"
+
+    case "$key" in
+        listen)
+            case "$value" in ''|-*) echo "监听地址不合法"; return 1 ;; esac
+            l="$value" ;;
+        interval)
+            case "$value" in ''|*[!0-9]*) echo "间隔必须是整数秒"; return 1 ;; esac
+            [ "$value" -ge 10 ] && [ "$value" -le 86400 ] || { echo "间隔需在 10~86400 秒之间"; return 1; }
+            i="$value" ;;
+        *) echo "不支持的配置项: $key"; return 1 ;;
+    esac
+
+    mkdir -p "$ROOT/data" 2>/dev/null
+    printf 'LISTEN=%s\nINTERVAL=%s\n' "$l" "$i" > "$ENVFILE"
+    cli restart >/dev/null 2>&1
+    echo "已保存并重启"; return 0
+}

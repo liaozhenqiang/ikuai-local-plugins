@@ -1,0 +1,117 @@
+#!/bin/bash /etc/ikcommon
+#
+# function/adguardhome —— Web 后端接口(框架软链到 /usr/ikuai/function/adguardhome)。
+#
+# 分发链: openresty -> /usr/ikuai/function/func_api.sh adguardhome <action> k=v...
+# 动作: show / start / stop / restart / seting
+#
+ROOT="/etc/mnt/plugins/adguardhome"
+CLI="$ROOT/bin/adgctl"
+
+# 用 bash 调用包装器(而不是靠执行位直接执行): 即使 zip 权限位丢失, 后端依然可用
+cli() { bash "$CLI" "$@"; }
+
+# 把一段多行文本转成 **带引号的 JSON 字符串**(日志里有 ESC/控制字符/引号, 必须转义)。
+# 注意: 设备上的 ocd_text 是 openclash 私有的, 不能依赖; 这里自带一份。
+#   * tr -d "\r" 只删回车; 其余控制字符交给 awk 的 gsub(用 tr -d "\000-\037" 会连
+#     日期里的 '-' 一起删掉, 实测踩过)。
+#   * awk 把所有行拼成一行, 行间用字面 \n 连接。
+json_str() {
+    # 控制字符用 awk gsub(/[\001-\037\177]/,"") 删:
+    #   * busybox awk 正则里写 \000 会变真 NUL 字节把正则源截断(报 bad regex '[');
+    #   * busybox tr 的八进制转义不能做范围端点(\000-\011 的 - 变字面量, 误删 '-');
+    #   * 高位字节(中文)不删 —— 老写法 [^\n\040-\176] 会把中文全删掉(之前踩过)。
+    printf '%s' "$1" | awk '
+        { gsub(/[\001-\037\177]/, "");
+          gsub(/\\/, "\\\\"); gsub(/"/, "\\\"");
+          printf "%s%s", (NR>1 ? "\\n" : ""), $0 }' | sed -e 's/^/"/' -e 's/$/"/'
+}
+
+__show_status() {
+    local status
+    status="$(cli status 2>/dev/null)"; [ -n "$status" ] || status='{}'
+    json_append __json_result__ status:json
+}
+
+__show_log() {
+    local n="${1:-60}"
+    # 变量名必须与键名一致(json_append 按名字取), 写成 txt 会传出空值
+    log="$(json_str "$(cli log "$n" 2>&1)")"
+    json_append __json_result__ log:json
+}
+
+show()
+{
+    Show __json_result__
+}
+
+# 把包装器 stderr 上的失败原因清洗成一行, 直接显示在插件页面上
+__reason() {
+    printf '%s' "$1" | tr '\n' ' ' | tr -d '"\\' | sed 's/  */ /g' | cut -c1-180
+}
+
+start()
+{
+    local out rc msg
+    out="$(cli start 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ]; then echo "已启动"; return 0; fi
+    msg="$(__reason "$out")"
+    [ -n "$msg" ] || msg="启动失败(无输出, 见 /etc/log/adguardhome/adguardhome.log)"
+    echo "$msg"; return 1
+}
+
+stop()
+{
+    cli stop >/dev/null 2>&1 && { echo "已停止"; return 0; }
+    echo "停止失败"; return 1
+}
+
+restart()
+{
+    local out rc msg
+    out="$(cli restart 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ]; then echo "已重启"; return 0; fi
+    msg="$(__reason "$out")"
+    [ -n "$msg" ] || msg="重启失败(无输出, 见 /etc/log/adguardhome/adguardhome.log)"
+    echo "$msg"; return 1
+}
+
+seting()
+{
+    local out
+    case "$key" in
+        dnsport|webport)
+            case "$value" in ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;; esac
+            [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || { echo "端口需在 1~65535 之间"; return 1; }
+            case "$value" in 80|443) echo "80/443 为 iKuai 控制台端口, 请换端口"; return 1 ;; esac
+            out="$(cli "$key" "$value" 2>&1)" || { echo "${out:-修改失败}"; return 1; }
+            return 0 ;;
+        hijack|autostart)
+            case "$value" in
+                0|1) cli "$key" "$value" >/dev/null 2>&1 || { echo "保存失败"; return 1; }
+                     echo "已保存"; return 0 ;;
+                *)   echo "取值必须是 0 或 1"; return 1 ;;
+            esac ;;
+        upstream)
+            case "$value" in
+                auto|doh|oc)
+                    cli upstream "$value" >/dev/null 2>&1 || { echo "设置失败"; return 1; }
+                    echo "已设置"; return 0 ;;
+                custom:*)
+                    addr="${value#custom:}"
+                    [ -n "$addr" ] || { echo "自定义地址不能为空"; return 1; }
+                    cli upstream custom "$addr" >/dev/null 2>&1 || { echo "设置失败"; return 1; }
+                    echo "已设置"; return 0 ;;
+                *)
+                    echo "上游取值: auto / doh / oc / custom:地址"; return 1 ;;
+            esac ;;
+        *)
+            echo "不支持的配置项: $key"; return 1 ;;
+    esac
+}
+
+logclear()
+{
+    cli logclear >/dev/null 2>&1 && { echo "已清空"; return 0; }
+    echo "清空失败"; return 1
+}

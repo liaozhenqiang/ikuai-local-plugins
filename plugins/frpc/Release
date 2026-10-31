@@ -1,0 +1,5 @@
+plugin=frpc
+version=0.71.1.1
+author=fatedier/WorkBuddy
+title=FRP 内网穿透(客户端)
+description=frp 客户端(frpc) V0.71.1 独立运行版：填写服务端地址与 Token 即可穿透，支持多条 tcp/udp/http/https 代理规则增删、管理界面与开机自启，静态 Go 二进制无需依赖。

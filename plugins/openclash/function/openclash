@@ -1,0 +1,665 @@
+#!/bin/bash /etc/ikcommon
+#
+# openclash - OpenClash for iKuai 后端接口
+# 页面: 系统设置 -> 插件管理 -> OpenClash (前端 /plugins/app/openclash.html)
+#
+# 动作:
+#   show    TYPE=data,conf,logs,rules,doctor,sub,proxies,delay
+#                                                  读取状态/配置/日志/规则/自检/订阅原文/节点/单节点延迟
+#   seting  key=<配置项> value=<值>                 改 data/openclash.conf(需要时自动重启内核)
+#   ctl     op=start|stop|restart|reload|test|rules|unrules|bypass-refresh|render|bootstrap|doctor
+#   sub     op=update|preview|save|clear           订阅: 下载 / 取回原文(供前端转换) / 导入结果
+#   imp     op=custom|config name=<上传的文件>      导入自定义配置(先经 /Action/upload 上传)
+#   node    op=select|mode                         选用节点 / 切换运行模式(写操作)
+#   core    op=import name=<上传的文件>|fetch|status
+#           离线安装内核: 先经 /Action/upload 上传, 再 op=import 落到 data/mihomo.gz
+#           并调用 occtl core-fetch(它会优先使用本地文件, 不联网)
+#
+# 约定与注意事项:
+#   * 本文件通过 /usr/ikuai/function/openclash 软链被 func_api.sh 分发,
+#     show 的 stdout 必须是合法 JSON, 其它动作返回提示文本(失败时 return 1)。
+#   * 请求参数值不能含空格/引号: 空格在前端编码成 '+' 或 %20, 这里统一 urldecode。
+#   * 需要 URL 里带节点名的动作(delay/select), 节点名由前端做 encodeURIComponent
+#     再传过来(bash 侧对多字节 UTF-8 做百分号编码不可靠), 后端只在需要还原成
+#     原字符串的地方解码。
+#   * 非 show 动作的输出统一追加记录到 data/log/last-op.txt, 前端通过
+#     show TYPE=data 的 lastop 字段回读。
+#   * 注意 shellcheck 的 SC2034/SC2154 在这里是"误报": $key/$value/$group/$name
+#     是 /etc/ikcommon 的 func_api 分发时注入的 shell 变量; rules/doctor/proxies/delay
+#     这些局部变量是被 json_append 按"变量名=键名"直接展开消费的(见 rustdemo 的说明)。
+
+PLUGIN_DIR="/etc/mnt/plugins/openclash"
+DATA="$PLUGIN_DIR/data"
+RENDERED="$DATA/config.yaml"
+OCTL="$PLUGIN_DIR/bin/occtl"
+IMPORT_DIR="/tmp/iktmp/import"
+LASTOP="$DATA/log/last-op.txt"
+RAWSUB="$DATA/sub/raw.txt"
+SUBYAML="$DATA/cache/providers/sub.yaml"
+
+# 诊断日志: 本文件每次被 /etc/ikcommon 加载都记一行参数。
+# 用途: 如果出现"动作全部无效(invalid action)"之类的问题, 看这里是否有记录就能
+# 判断是"文件没被加载"还是"加载了但动作名/分发约定不对"。
+OCD_DIAG="$DATA/log/backend.log"
+mkdir -p "$DATA/log" 2>/dev/null
+printf '%s argv=%s\n' "$(date '+%F %T')" "$*" >> "$OCD_DIAG" 2>/dev/null
+if test "$(wc -l < "$OCD_DIAG" 2>/dev/null)" -gt 200 2>/dev/null; then
+    tail -n 200 "$OCD_DIAG" > "$OCD_DIAG.tmp" 2>/dev/null && mv -f "$OCD_DIAG.tmp" "$OCD_DIAG" 2>/dev/null
+fi
+
+# 自愈引导(bootstrap)
+#
+# 背景: 框架的 lib/plugin.sh:plugin_run 是用 `test -x` 判断有没有安装脚本的 ——
+#       如果设备上的 unzip 没有还原权限位(zip 里的 0755 丢了), install.sh 就不会被
+#       执行: 既不会补 chmod, 也不会建 data/、生成配置、下载内核, 于是页面能打开,
+#       但所有写操作都会失败("写入配置失败")。
+#       而 function/<名字> 一定会被框架 chmod +x 并调用, 所以把补做逻辑放在这里最可靠。
+ocd_bootstrap() {
+    # 快速路径: 配置在、引擎可执行、cron 守护在、geo/面板软链在、模板在 -> 什么都不做
+    if test -f "$DATA/openclash.conf" && test -x "$OCTL" && test -f /etc/mnt/cron.d/openclash_guard \
+       && test -f /etc/mnt/openclash-guard.sh && test -e "$DATA/cache/Country.mmdb" \
+       && test -f "$PLUGIN_DIR/share/conf/template.yaml"; then
+        return 0
+    fi
+    mkdir -p "$DATA/log" 2>/dev/null
+    printf '%s bootstrap: 补做安装初始化\n' "$(date '+%F %T')" >> "$OCD_DIAG" 2>/dev/null
+    # 安装不完整(例如框架跨分区 mv 因空间不足半途失败)时明确标记, 并在页面上提示
+    local miss="" f
+    for f in bin/occtl share/conf/template.yaml www/plugins/app/openclash.html function/openclash; do
+        test -e "$PLUGIN_DIR/$f" || miss="$miss $f"
+    done
+    if test -n "$miss"; then
+        printf '%s [incomplete] 缺少:%s\n' "$(date '+%F %T')" "$miss" >> "$OCD_DIAG" 2>/dev/null
+        echo "$miss" > "$DATA/INCOMPLETE" 2>/dev/null
+        return 0
+    fi
+    rm -f "$DATA/INCOMPLETE" 2>/dev/null
+    chmod +x "$PLUGIN_DIR/bin/"* "$PLUGIN_DIR/function/"* "$PLUGIN_DIR"/*.sh 2>/dev/null
+    test -x "$OCTL" || return 0          # 引擎本身缺失(解包不全), 只能重装
+    bash "$OCTL" setup    >> "$DATA/log/bootstrap.log" 2>&1
+    bash "$OCTL" conf-init >> "$DATA/log/bootstrap.log" 2>&1
+    bash "$OCTL" render   >> "$DATA/log/bootstrap.log" 2>&1
+    mkdir -p /etc/mnt/cron.d 2>/dev/null
+    # 守护脚本必须在这里补齐: install.sh 很可能因权限位被框架跳过, 而快速路径要求它存在 ——
+    # 否则每次请求(含 15s 轮询)都会重复 setup+render, 造成闪存写放大且永不收敛。
+    if test -f "$PLUGIN_DIR/share/openclash-guard.sh"; then
+        cp -f "$PLUGIN_DIR/share/openclash-guard.sh" /etc/mnt/openclash-guard.sh 2>/dev/null
+        chmod +x /etc/mnt/openclash-guard.sh 2>/dev/null
+    fi
+    printf '# OpenClash for iKuai: 内核存活 + 规则自愈 + 卸载残留清理(用 bash 调用, 不依赖权限位)\n* * * * * /bin/bash /etc/mnt/openclash-guard.sh >/dev/null 2>&1\n' \
+        > /etc/mnt/cron.d/openclash_guard 2>/dev/null
+    chmod 644 /etc/mnt/cron.d/openclash_guard 2>/dev/null
+    for s in /usr/ikuai/include/crond.sh /usr/ikuai/script/utils/crond.sh; do
+        if test -f "$s"; then ( . "$s"; crond_commit >/dev/null 2>&1 ); break; fi
+    done
+    # 订阅定时更新: 根分区每次重启还原 /etc/crontabs/root, 所以这里也要重铺一次
+    bash "$OCTL" sub-auto >> "$DATA/log/bootstrap.log" 2>&1
+    # 内核只走页面上传(离线上传安装), 这里不做任何联网下载;
+    # 上传安装由 core import 动作触发(见本文件末尾的 core())
+    find "$DATA/.core-fetch.lock" -mmin +30 -exec rm -f {} \; 2>/dev/null
+    printf '%s bootstrap: 完成(occtl=%s)\n' "$(date '+%F %T')" "$(test -x "$OCTL" && echo ok || echo missing)" >> "$OCD_DIAG" 2>/dev/null
+    return 0
+}
+
+ocd_bootstrap
+
+# 改这些键之后需要让内核重新生效
+OCD_RUNTIME_KEYS=" mode cfg_mode clash_mode mixed_port redir_port tproxy_port dns_port dns_enable dns_hijack fakeip ipv6 routing_mark fwmark route_table lan_if proxy_self ui_name sub_url log_level ctrl secret "
+
+# ---------------------------------------------------------------- 工具
+
+# JSON 字符串转义(必须自己来: 框架的 json_append ...:str 不处理控制字符,
+# iptables/ip 的输出里可能带 \v \f \x1b 之类, 会让前端 JSON.parse 直接报
+# "Bad control character in string literal")
+ocd_esc() {
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr -d '\r' | \
+    tr -d '\000-\010\013\014\016-\037' | \
+    awk 'BEGIN{ORS=""} {printf "%s%s", (NR>1?"\\n":""), $0}'
+}
+ocd_text() { printf '"%s"' "$(printf '%s' "$1" | ocd_esc)"; }
+ocd_kv()   { printf '"%s":%s' "$1" "$(ocd_text "$2")"; }
+ocd_num()  { case "$2" in ''|*[!0-9-]*) printf '"%s":0' "$1" ;; *) printf '"%s":%s' "$1" "$2" ;; esac; }
+
+ocd_urldecode() { printf '%b' "$(printf '%s' "$1" | sed -e 's/+/ /g' -e 's/%/\\x/g')"; }
+
+ocd_safe_name() { case "$1" in ''|*/*|*..*|*[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
+
+ocd_record() {
+    mkdir -p "$(dirname "$LASTOP")" 2>/dev/null
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" > "$LASTOP" 2>/dev/null
+}
+
+ocd_running() { "$OCTL" status-json 2>/dev/null | grep -q '"running":1'; }
+
+# 运行 occtl: 输出记录到 last-op 并回显, 返回 occtl 的退出码
+ocd_run() {
+    local out rc
+    out="$("$OCTL" "$@" 2>&1)"; rc=$?
+    ocd_record "$* => ${out:-（无输出）}"
+    printf '%s\n' "$out"
+    return $rc
+}
+
+# ---------------------------------------------------------------- stdout 守卫
+#
+# json_append 只写变量、不写 stdout, 所以"收集数据"这段逻辑本不该有任何 stdout。
+# 但只要有子命令把东西打到 stdout(踩过的坑: 响应里混进一段路径, 前端 JSON.parse 直接失败),
+# 整个响应就废了。这里用 fd 4 暂存真正的 stdout, 收集期间把 stdout 引到日志,
+# 收集完再恢复 —— 既保证响应干净, 又能从 backend-noise.log 看到到底是谁在乱输出。
+ocd_quiet() {
+    exec 4>&1
+    if exec 1>>"$DATA/log/backend-noise.log"; then
+        printf '%s [noise] ---- 本次请求收集期间的 stdout: ----\n' "$(date '+%F %T')" >&2
+        return 0
+    fi
+    exec 1>&4
+    return 1
+}
+
+ocd_loud() {
+    exec 1>&4 4>&-
+    return 0
+}
+
+# ---------------------------------------------------------------- show
+
+# 注意: show 只调用 Show, 由框架按 TYPE(逗号分隔)分发到下面的 __show_<t>()。
+# 不要在这里再手动调用 __show_*(框架的 Show 自己会分发, 手动调 = 每个都跑两遍,
+# 第二遍在 ocd_loud 之后 stdout 已恢复, 任何输出都会混进 HTTP 响应导致前端
+# JSON.parse 失败 —— 踩过的坑)。
+__show_data() {
+    local status lastop runtime
+    status="$("$OCTL" status-json 2>/dev/null)"
+    test -n "$status" || status='{}'
+    lastop="$(ocd_text "$(cat "$LASTOP" 2>/dev/null)")"
+    # 运行时体检: 引擎是否可执行、data 是否可写、引导日志位置
+    runtime="{"
+    runtime+="$(ocd_num occtl "$(test -x "$OCTL" && echo 1 || echo 0)"),"
+    runtime+="$(ocd_num data "$(test -d "$DATA" && test -w "$DATA" && echo 1 || echo 0)"),"
+    runtime+="$(ocd_num conf "$(test -f "$DATA/openclash.conf" && echo 1 || echo 0)"),"
+    if test -f "$DATA/INCOMPLETE"; then
+        runtime+="$(ocd_kv incomplete "$(cat "$DATA/INCOMPLETE" 2>/dev/null)"),"
+    else
+        runtime+="$(ocd_kv incomplete ""),"
+    fi
+    runtime+="$(ocd_kv dir "$DATA"),"
+    runtime+="$(ocd_kv bootstrap_log "$DATA/log/bootstrap.log")"
+    runtime+="}"
+    json_append __json_result__ status:json
+    json_append __json_result__ runtime:json
+    json_append __json_result__ lastop:json
+}
+
+__show_conf() {
+    local conf
+    conf="$("$OCTL" conf-dump 2>/dev/null)"
+    test -n "$conf" || conf='{}'
+    json_append __json_result__ conf:json
+}
+
+__show_logs() {
+    local core lastop logs noise boot
+    core="$(test -f "$DATA/log/openclash.log" && tail -n 150 "$DATA/log/openclash.log" 2>/dev/null)"
+    lastop="$(cat "$LASTOP" 2>/dev/null)"
+    # 野输出/自愈过程/框架告警都留在这些文件里, 页面上也要能看到(否则只能 SSH)
+    noise="$(tail -n 60 "$DATA/log/backend-noise.log" 2>/dev/null)"
+    boot="$(tail -n 40 "$DATA/log/bootstrap.log" 2>/dev/null)"
+    logs="{"
+    logs+="$(ocd_kv core "$core"),"
+    logs+="$(ocd_kv lastop "$lastop"),"
+    logs+="$(ocd_kv noise "$noise"),"
+    logs+="$(ocd_kv bootstrap "$boot"),"
+    logs+="$(ocd_kv file "$DATA/log/openclash.log")"
+    logs+="}"
+    json_append __json_result__ logs:json
+}
+
+# 运行配置内容(页面「配置」页签直接显示前 200 行, 不用 SSH)
+__show_config() {
+    local cfg
+    cfg="$(head -n 200 "$RENDERED" 2>/dev/null)"
+    test -n "$cfg" || cfg="(尚未生成运行配置, 先点「重新渲染配置」)"
+    config="$(ocd_text "$cfg")"
+    json_append __json_result__ config:json
+}
+
+__show_rules() {
+    # 变量名 = 键名, 值是"已经带引号并转义好的 JSON 字符串", 用 :json 原样贴出
+    rules="$(ocd_text "$("$OCTL" rules-show 2>&1)")"
+    json_append __json_result__ rules:json
+}
+
+__show_doctor() {
+    doctor="$(ocd_text "$("$OCTL" doctor 2>&1)")"
+    json_append __json_result__ doctor:json
+}
+
+__show_bypass() {
+    bypass="$(ocd_text "$("$OCTL" bypass-list 2>&1)")"
+    json_append __json_result__ bypass:json
+}
+
+# 订阅原文(供前端 JS 转换): 最多回传 512KB
+__show_sub() {
+    local raw kind size sub
+    raw=""; size=0; kind="empty"
+    if test -f "$RAWSUB"; then
+        size="$(wc -c < "$RAWSUB" 2>/dev/null | tr -d ' ')"
+        raw="$(head -c 524288 "$RAWSUB" 2>/dev/null)"
+        kind="$("$OCTL" sub-detect "$RAWSUB" 2>/dev/null)"
+    fi
+    sub="{"
+    sub+="$(ocd_kv raw "$raw"),"
+    sub+="$(ocd_kv kind "$kind"),"
+    sub+="$(ocd_num size "${size:-0}"),"
+    # 只回传前 512KB: 明确告知是否被截断, 避免用户以为"全部节点都转换了"
+    sub+="$(ocd_num truncated "$(test "${size:-0}" -gt 524288 2>/dev/null && echo 1 || echo 0)"),"
+    sub+="$(ocd_kv file "$RAWSUB"),"
+    sub+="$(ocd_num imported "$(test -f "$SUBYAML" && echo 1 || echo 0)")"
+    sub+="}"
+    json_append __json_result__ sub:json
+}
+
+# 节点数据必须走 show+TYPE 通道: 框架只把 show 的 stdout 包成 Data,
+# 非 show 动作(旧版 node list/delay 里调 Show)的输出进不了 Data —— 这就是
+# "读取节点点了没反应/后端成功5346字节但前端拿不到"的根因(与 loadSub 的
+# show TYPE=sub 同理, 那条路一直是通的)。
+__show_proxies() {
+    local out
+    out="$("$OCTL" api GET /proxies 2>/dev/null)"
+    if test -z "$out"; then
+        ocd_record "show proxies => 失败: 内核控制接口无响应(内核未运行?)"
+        proxies='{"error":"内核控制接口无响应(内核未运行?)"}'
+    else
+        # 必须是 JSON: 控制接口被打不开的东西占用/返回 HTML 错误页时,
+        # 原样拼进响应会让整份 JSON 失效(前端所有动作一起报错)
+        case "$out" in
+            '{'*|'['*)
+                ocd_record "show proxies => 成功: $(printf '%s' "$out" | wc -c | tr -d ' ') 字节"
+                proxies="$out" ;;
+            *)
+                ocd_record "show proxies => 失败: 控制接口返回的不是 JSON: $(printf '%s' "$out" | head -c 120)"
+                proxies="{\"error\":\"控制接口返回的不是 JSON(端口被占用/密钥不匹配/custom 配置?): $(printf '%s' "$out" | head -c 120 | sed 's/"/\\"/g')\"}" ;;
+        esac
+    fi
+    json_append __json_result__ proxies:json
+}
+
+__show_delay() {
+    # name 由前端 enc() 过(percent-encoded), 原样拼进 URL 路径即可(旧 node delay 同款)
+    local n t out
+    n="${name:-}"
+    t="${timeout:-3000}"
+    case "$t" in ''|*[!0-9]*) t=3000 ;; esac
+    if test -z "$n"; then
+        delay='{"message":"缺少 name"}'
+    else
+        out="$("$OCTL" api GET "/proxies/$n/delay?timeout=$t&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204" 2>/dev/null)"
+        test -n "$out" || out='{"message":"无响应"}'
+        case "$out" in
+            '{'*|'['*) ;;
+            *) out='{"message":"控制接口返回的不是 JSON"}' ;;
+        esac
+        delay="$out"
+    fi
+    json_append __json_result__ delay:json
+}
+
+show()
+{
+    Show __json_result__
+}
+
+# ---------------------------------------------------------------- seting
+
+seting()
+{
+    local k v apply=0
+    k="$key"; v="$(ocd_urldecode "$value")"
+    test -n "$k" || { echo "缺少 key"; return 1; }
+
+    case "$k" in
+        enable|mode|cfg_mode|clash_mode|log_level|ctrl|secret|mixed_port|redir_port|tproxy_port|\
+        dns_port|dns_enable|dns_hijack|fakeip|geosite|ipv6|routing_mark|fwmark|route_table|lan_if|\
+        proxy_self|sub_url|sub_interval|sub_auto|sub_auto_h|sub_conv|sub_conv_enable|panel|ui_name|core_auto|core_dir) ;;
+        *) echo "不支持的配置项: $k"; return 1 ;;
+    esac
+
+    case "$k" in
+        mode)       case "$v" in redirect|tproxy|tun|off) ;; *) echo "mode 只能是 redirect/tproxy/tun/off"; return 1 ;; esac ;;
+        cfg_mode)   case "$v" in auto|url|file|custom) ;; *) echo "cfg_mode 只能是 auto/url/file/custom"; return 1 ;; esac ;;
+        clash_mode) case "$v" in rule|global|direct) ;; *) echo "clash_mode 只能是 rule/global/direct"; return 1 ;; esac ;;
+        log_level)  case "$v" in silent|error|warning|info|debug) ;; *) echo "log_level 不合法"; return 1 ;; esac ;;
+        geosite)    case "$v" in auto|1|0|true|false) ;; *) echo "geosite 只能是 auto / 1 / 0"; return 1 ;; esac ;;
+        mixed_port|redir_port|tproxy_port|dns_port|routing_mark|fwmark|route_table)
+            case "$v" in ''|*[!0-9]*) echo "$k 必须是数字"; return 1 ;; esac
+            if test "$v" -lt 1 || test "$v" -gt 65535; then echo "$k 超出范围(1-65535)"; return 1; fi ;;
+        sub_interval)
+            # 0 = 不自动更新(页面文案如此), 所以不能套用 1-65535 的端口范围校验
+            case "$v" in ''|*[!0-9]*) echo "sub_interval 必须是数字(0=不自动更新)"; return 1 ;; esac ;;
+        sub_auto_h)
+            # 定时更新间隔(小时): 0=关(由 sub_auto 控制开关), 1-24 有效
+            case "$v" in ''|*[!0-9]*) echo "sub_auto_h 必须是数字(小时)"; return 1 ;; esac
+            if test "$v" -lt 0 || test "$v" -gt 24; then echo "sub_auto_h 只能是 0-24"; return 1; fi ;;
+        sub_auto)
+            case "$v" in 0|1) ;; *) echo "sub_auto 只能是 0 或 1"; return 1 ;; esac ;;
+        enable|dns_enable|dns_hijack|fakeip|ipv6|proxy_self|panel|core_auto|sub_conv_enable)
+            case "$v" in 0|1) ;; *) echo "$k 只能是 0 或 1"; return 1 ;; esac ;;
+        secret)
+            case "$v" in *[\'\"\\]*|*[[:space:]]*|*'$'*)
+                echo "secret 不能含引号/反斜杠/空白/\$ (会让生成的 YAML 语法错误)"; return 1 ;;
+            esac
+            case "$v" in ?*) ;; *) echo "secret 不能为空"; return 1 ;; esac ;;
+        sub_url)
+            case "$v" in http://*|https://*|"") ;; *) echo "订阅地址必须是 http(s):// 开头"; return 1 ;; esac ;;
+        sub_conv)
+            # 转换服务地址: 留空表示用内置默认(api.asailor.org/sub)
+            case "$v" in ""|http://*|https://*) ;; *) echo "转换服务地址必须是 http(s):// 开头或留空"; return 1 ;; esac ;;
+        core_dir)
+            case "$v" in ""|/*) ;; *) echo "core_dir 必须是绝对路径(如 /etc/log/openclash)或留空"; return 1 ;; esac ;;
+    esac
+
+    "$OCTL" conf-set "$k" "$v" >/dev/null 2>&1
+    # cfg_set 内部无论成败都返回 0, 所以必须回读确认(43MB 的 /etc/mnt 写满时会静默失败)
+    if test "$("$OCTL" conf-get "$k" 2>/dev/null)" != "$v"; then
+        echo "写入配置失败: $DATA 只读或空间不足(用「工具→清理空间」腾地方)"
+        return 1
+    fi
+    ocd_record "seting $k=$v"
+
+    # 定时更新开关: 改完立刻把 cron 装/卸掉(这两个键不影响内核配置, 不需要重启)
+    case "$k" in
+        sub_auto|sub_auto_h)
+            local ao
+            ao="$("$OCTL" sub-auto 2>&1)"
+            ocd_record "sub-auto => ${ao:-（无输出）}"
+            printf '%s\n' "${ao:-定时更新设置已保存}"
+            return 0 ;;
+    esac
+
+    case "$OCD_RUNTIME_KEYS" in
+        *" $k "*) apply=1 ;;
+    esac
+
+    # 页面「保存所有改动」会带 defer=1 逐项保存, 由页面最后统一重启一次, 避免 N 次重启
+    if test "$apply" = "1" && test "${defer:-0}" = "1"; then
+        echo "$k=$v 已保存(稍后统一重启生效)"
+        return 0
+    fi
+
+    if test "$apply" = "1" && ocd_running; then
+        local out
+        if test "$k" = "clash_mode"; then
+            out="$("$OCTL" api PATCH /configs "{\"mode\":\"$v\"}" 2>/dev/null)"
+            test -n "$out" || out="运行模式已热切换为 $v"
+        elif test "$k" = "enable"; then
+            out="开关已保存(开机自启状态=$v)"
+        else
+            out="$("$OCTL" restart 2>&1)"
+        fi
+        ocd_record "apply $k=$v => ${out:-（无输出）}"
+        printf '%s\n' "${out:-已应用}"
+        return 0
+    fi
+
+    echo "$k=$v 已保存"
+    return 0
+}
+
+# 后台执行长任务(下载内核/geo/面板): Web 请求不能被分钟级 curl 阻塞,
+# 带同名锁去重 + 过期锁清理, 完成后把结果写回 lastop 供页面回读
+ocd_bg() {
+    local tag="$1"; shift
+    local lock="$DATA/.$tag.lock"
+    find "$lock" -mmin +30 -exec rm -f {} \; 2>/dev/null
+    if test -f "$lock"; then
+        echo "$tag 任务已在进行中, 请稍后看「日志」页签"
+        return 0
+    fi
+    : > "$lock" 2>/dev/null
+    (
+        trap '' HUP
+        out="$("$OCTL" "$@" 2>&1)"
+        printf '%s %s(后台) => %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$tag" "${out:-（无输出）}" > "$LASTOP" 2>/dev/null
+        printf '%s\n' "$out" >> "$DATA/log/$tag.log" 2>/dev/null
+        rm -f "$lock" 2>/dev/null
+    ) &
+    ocd_record "$tag(后台) 已开始: occtl $*"
+    echo "已在后台开始($tag); 进度与结果见「日志」页签的“最后一次操作”"
+    return 0
+}
+
+# ---------------------------------------------------------------- ctl
+
+ctl()
+{
+    local op="${op:-status}"
+    case "$op" in
+        # 分钟级下载任务一律后台执行(否则页面/反代先超时, 用户重复点还会并发写同一个临时文件)
+        core-fetch) ocd_bg core-fetch core-fetch ;;
+        geo-fetch)  ocd_bg geo-fetch geo-fetch ;;
+        ui-fetch)   ocd_bg ui-fetch ui-fetch ;;
+        start|stop|restart|reload|render|rules|unrules|bypass-refresh|test|bootstrap|doctor|\
+        core-status|cleanup|ports|sub-auto|log-clear|bypass-list)
+            ocd_run "$op"
+            return $? ;;
+        bypass-add|bypass-del)
+            # 框架已拦截空格/引号, 这里再挡一层只接受 IP/CIDR
+            case "${value:-}" in
+                *[!0-9./]*) echo "value 只能是 IPv4 地址或 CIDR"; return 1 ;;
+            esac
+            ocd_run "$op" "${value:-}"
+            return $? ;;
+        *) echo "不支持的 op: $op"; return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------- sub
+
+sub()
+{
+    local op="${op:-update}" name="$name" out
+    case "$op" in
+        update)
+            local o rc
+            # mode: auto(默认, 一次点击: 先直连, 失败自动改走转换服务) / direct / converter
+            local m="${mode:-auto}"
+            case "$m" in auto|direct|converter) ;; *) m=auto ;; esac
+            o="$("$OCTL" sub-update "$m" 2>&1)"; rc=$?
+            ocd_record "sub update($m) => $o"
+            printf '%s\n' "$o"
+            test "$rc" = "0" || return 1
+            # 下载成功且内核在跑 -> 立即重启生效(检查退出码, 不能无脑报成功)
+            if ocd_running; then
+                if ocd_run restart >/dev/null; then
+                    echo "已重启内核使新订阅生效"
+                else
+                    echo "订阅已下载, 但内核重启失败(见「日志」页签)"
+                fi
+            fi
+            return 0 ;;
+        direct)
+            # 只做直连探测(失败不落盘、不套转换服务): 页面用它判断要不要提示用户
+            ocd_run sub-update direct
+            return $? ;;
+        preview)
+            __show_sub
+            Show __json_result__
+            return 0 ;;
+        save)
+            ocd_safe_name "$name" || { echo "非法文件名"; return 1; }
+            test -f "$IMPORT_DIR/$name" || { echo "未找到上传的文件: $name(请先上传)"; return 1; }
+            out="$("$OCTL" sub-import "$IMPORT_DIR/$name" 2>&1)"
+            ocd_record "sub save $name => $out"
+            case "$out" in
+                *已导入*) : ;;
+                *) printf '%s\n' "$out"; return 1 ;;
+            esac
+            if ocd_running; then
+                if ocd_run restart >/dev/null; then
+                    printf '%s\n已重启内核使新订阅生效\n' "$out"
+                else
+                    printf '%s\n订阅已更新, 但内核重启失败(见「日志」页签)\n' "$out"
+                fi
+            else
+                printf '%s\n(内核未运行, 启动后生效)\n' "$out"
+            fi
+            return 0 ;;
+        clear)
+            rm -f "$RAWSUB" "$SUBYAML" "$SUBYAML.stale" "$DATA/providers/sub.yaml" 2>/dev/null
+            rm -f "$DATA/cache/providers/sub.yaml" "$DATA/cache/providers/sub.yaml.stale" 2>/dev/null
+            "$OCTL" conf-set sub_format "" >/dev/null 2>&1
+            # 订阅地址若已被自动回退改写成转换服务地址, 清空时一并复位回直连语义,
+            # 否则用户会一直挂在第三方转换服务上而不自知
+            "$OCTL" conf-set sub_url "" >/dev/null 2>&1
+            # cfg_mode=url 时 render 会继续按 sub_url 下 provider —— 也要复位, 否则"清空"没意义
+            "$OCTL" conf-set cfg_mode auto >/dev/null 2>&1
+            ocd_record "sub clear"
+            # 清空后必须重启, 否则运行中的内核仍持有旧 provider
+            if ocd_running; then
+                if ocd_run restart >/dev/null; then echo "订阅数据已清空并已重启内核"; else echo "订阅数据已清空, 但内核重启失败"; fi
+            else
+                echo "订阅数据已清空"
+            fi
+            return 0 ;;
+        *) echo "不支持的 op: $op"; return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------- imp
+
+imp()
+{
+    local op="${op:-custom}" name="$name" out rc
+    ocd_safe_name "$name" || { echo "非法文件名"; return 1; }
+    test -f "$IMPORT_DIR/$name" || { echo "未找到上传的文件: $name(请先上传)"; return 1; }
+    case "$op" in
+        custom) out="$("$OCTL" sub-import-custom "$IMPORT_DIR/$name" 2>&1)"; rc=$? ;;
+        config) out="$("$OCTL" sub-import "$IMPORT_DIR/$name" 2>&1)"; rc=$? ;;
+        *) echo "不支持的 op: $op"; return 1 ;;
+    esac
+    ocd_record "imp $op $name => $out"
+    test "$rc" = "0" || { printf '%s\n' "$out"; return 1; }
+    if ocd_running; then
+        ocd_run restart >/dev/null
+        printf '%s\n已重启内核生效\n' "$out"
+    else
+        printf '%s\n' "$out"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- core(离线安装内核)
+
+core()
+{
+    local op="${op:-status}" name="$name" src out rc
+    case "$op" in
+        status)
+            corestatus="$(ocd_text "$("$OCTL" core-status 2>&1)")"
+            json_append __json_result__ corestatus:json
+            Show __json_result__
+            return 0 ;;
+        import)
+            ocd_safe_name "$name" || { echo "非法文件名"; return 1; }
+            src="$IMPORT_DIR/$name"
+            test -f "$src" || { echo "未找到上传的文件: $name(请先在页面上选择并上传)"; return 1; }
+            # 直接拿上传的文件解压, 不再往 data/ 复制第二份(省 23MB)
+            ocd_record "core import $name ($(wc -c < "$src" 2>/dev/null) 字节)"
+            out="$("$OCTL" core-fetch "$src" 2>&1)"; rc=$?
+            ocd_record "core import $name => $out"
+            printf '%s\n' "$out"
+            test "$rc" = "0" || return 1
+            # 装好内核后如果开着自启且还没跑, 直接拉起来(省一次点击)
+            if test "$("$OCTL" conf-get enable)" = "1" && ! ocd_running; then
+                ocd_run start >/dev/null
+                echo "内核已安装并已启动"
+            else
+                echo "内核已安装; 可在概览页点「启动」"
+            fi
+            return 0 ;;
+        fetch)
+            ocd_run core-fetch
+            return $? ;;
+        cleanup)
+            ocd_run cleanup
+            return $? ;;
+        *) echo "不支持的 op: $op"; return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------- geo(离线导入 GeoSite.dat)
+
+geo()
+{
+    local op="${op:-status}" name="$name" src out rc free
+    case "$op" in
+        import)
+            ocd_safe_name "$name" || { echo "非法文件名"; return 1; }
+            src="$IMPORT_DIR/$name"
+            test -f "$src" || { echo "未找到上传的文件: $name(请先在页面上选择并上传)"; return 1; }
+            free="$(df -k "$DATA" 2>/dev/null | tail -n1 | awk '{print $4}')"
+            case "$free" in
+                ''|*[!0-9]*) ;;
+                *) if test "$free" -lt 20480; then
+                       echo "/etc/mnt 可用空间不足 20MB(GeoSite.dat 约 11MB), 请先「工具→清理空间」"
+                       return 1
+                   fi ;;
+            esac
+            out="$("$OCTL" geo-import "$src" 2>&1)"; rc=$?
+            ocd_record "geo import $name => $out"
+            printf '%s\n' "$out"
+            test "$rc" = "0" || return 1
+            if ocd_running; then
+                if ocd_run restart >/dev/null; then echo "已重启内核使 GEOSITE 规则生效"; else echo "已导入, 但内核重启失败"; fi
+            fi
+            return 0 ;;
+        status)
+            geostatus="$(ocd_text "$("$OCTL" core-status 2>&1)")"
+            json_append __json_result__ geostatus:json
+            Show __json_result__
+            return 0 ;;
+        *) echo "不支持的 op: $op"; return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------- node
+
+node()
+{
+    # 读取节点/单节点测速的数据已改走 show + TYPE=proxies/delay(见 __show_proxies/
+    # __show_delay): 框架只把 show 的 stdout 包成 Data, 在非 show 动作里调 Show
+    # 前端永远拿不到(「读取节点点了没反应」的根因)。这里只留写操作。
+    local op="${op:-list}" n g t out
+    case "$op" in
+        select)
+            g="$group"; n="$name"
+            test -n "$g" && test -n "$n" || { echo "缺少 group/name"; return 1; }
+            local gn nn nn_esc
+            gn="$(ocd_urldecode "$g")"
+            nn="$(ocd_urldecode "$n")"
+            # 只做转义, 不能用 tr -d 删字符(会把名称里的引号/反斜杠吃掉导致选错节点)
+            nn_esc="${nn//\\/\\\\}"
+            nn_esc="${nn_esc//\"/\\\"}"
+            out="$("$OCTL" api PUT "/proxies/$g" "{\"name\":\"$nn_esc\"}" 2>/dev/null)"
+            ocd_record "select $gn -> $nn => ${out:-（无响应）}"
+            case "$out" in
+                *'"message"'*)
+                    printf '%s\n' "$out"
+                    echo "切换失败: $gn(内核返回了错误)"
+                    return 1 ;;
+            esac
+            test -n "$out" && printf '%s\n' "$out"
+            echo "已切换: $gn -> $nn"
+            return 0 ;;
+        mode)
+            n="${name:-${mode:-rule}}"
+            case "$n" in rule|global|direct) ;; *) echo "mode 只能是 rule/global/direct"; return 1 ;; esac
+            "$OCTL" conf-set clash_mode "$n" >/dev/null 2>&1
+            out="$("$OCTL" api PATCH /configs "{\"mode\":\"$n\"}" 2>/dev/null)"
+            ocd_record "clash mode => $n"
+            echo "运行模式已切换: $n"
+            return 0 ;;
+        *) echo "不支持的 op: $op"; return 1 ;;
+    esac
+}

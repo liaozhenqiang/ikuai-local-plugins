@@ -1,0 +1,123 @@
+#!/bin/bash /etc/ikcommon
+#
+# function/aria2 —— 下载插件 Web 后端接口(框架软链到 /usr/ikuai/function/aria2)。
+#
+# 分发链: openresty -> /usr/ikuai/function/func_api.sh aria2 <action> k=v...
+# 动作: show / ctl / seting / logclear
+#
+# 契约(与 ttyd/alist 一致):
+#   * 只有 show 动作的输出会进 Data; show() 里只写一句 Show __json_result__,
+#     由框架按 TYPE 自动调 __show_<TYPE>()(TYPE 不传默认 data)
+#   * 其它动作成功时 stdout 被丢弃(ErrMsg 强写 Success); 失败时 stdout 成为
+#     ErrMsg(Result=30002) —— 失败原因要原文透传
+#   * 参数值不能含空格/引号(lua 侧校验会拒)
+#
+ROOT="${PLUGIN_DIR:-/etc/mnt/plugins/aria2}"
+CLI="$ROOT/bin/aria2ctl"
+
+cli() { bash "$CLI" "$@"; }
+
+# json_append 的 str 类型只转义双引号, 不转义换行/反斜杠/控制字符。
+# 日志要先剥 ANSI 转义, 再把 \ 转 \\ 、换行转 \n; 双引号留给框架(否则二次转义)。
+json_text() {
+    printf '%s' "$1" | awk -v esc="$(printf '\033')" 'BEGIN{ORS=""}
+        {
+            gsub(esc "\\[[0-9;]*[A-Za-z]", "")
+            gsub(esc, "")
+            gsub(/\r/, "")
+            gsub(/\\/, "\\\\")
+            if (NR > 1) printf "\\n"
+            printf "%s", $0
+        }'
+}
+
+# ---------------------------------------------------------------- show 系列
+
+# TYPE 不传时框架默认取 data, 给个别名兜一下
+__show_data() { __show_status; }
+
+__show_status() {
+    local status
+    if [ ! -x "$CLI" ]; then
+        status='{"installed":true,"running":false,"error":"插件未正确安装, 请重新安装"}'
+        json_append __json_result__ status:json
+        return 0
+    fi
+    status="$(cli status-json 2>/dev/null)"
+    # 前端拿到的一定要是完整 JSON: 半截/空串会让页面报"不是合法 JSON"
+    case "$status" in
+        '{"'*'}') ;;
+        *) status='{"installed":true,"running":false,"error":"状态查询失败"}' ;;
+    esac
+    json_append __json_result__ status:json
+}
+
+__show_log() {
+    local t
+    if [ ! -x "$CLI" ]; then
+        logtext='(插件未正确安装)'
+        json_append __json_result__ logtext:str
+        return 0
+    fi
+    t="$(cli log 80 2>/dev/null)"
+    case "$t" in '') t='(暂无日志)' ;; esac
+    logtext="$(json_text "$t")"
+    json_append __json_result__ logtext:str
+}
+
+show()
+{
+    Show __json_result__
+}
+
+# ---------------------------------------------------------------- 动作
+
+__reason() {
+    printf '%s' "$1" | tr '\n' ' ' | tr -d '"\\' | sed 's/  */ /g' | cut -c1-180
+}
+
+ctl()
+{
+    local out rc msg
+    case "${op:-}" in
+        start|stop|restart)
+            # 失败时 stdout 会成为 ErrMsg 送到页面, 把控制器的原文透传
+            out="$(cli "$op" 2>&1)"; rc=$?
+            if [ "$rc" -eq 0 ]; then
+                case "$op" in
+                    start) echo "已启动" ;;
+                    stop)  echo "已停止" ;;
+                    restart) echo "已重启" ;;
+                esac
+                return 0
+            fi
+            msg="$(__reason "$out")"
+            [ -n "$msg" ] || msg="操作失败(见 /etc/log/aria2/aria2.log)"
+            echo "$msg"; return 1 ;;
+        *)
+            echo "不支持的操作: ${op:-空}"; return 1 ;;
+    esac
+}
+
+# 配置: port / secret / dir / autostart / dht / seed_ratio
+# dir 特殊值: auto = 重新探测最大数据盘(换设备/换盘后一键恢复默认)
+# 完整校验在 aria2ctl seting 里做(单一事实源), 这里只做白名单与透传
+seting()
+{
+    local out rc msg
+    case "${key:-}" in
+        port|secret|dir|autostart|dht|seed_ratio) ;;
+        *) echo "不支持的配置项: ${key:-空}"; return 1 ;;
+    esac
+    out="$(cli seting "$key" "${value:-}" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ]; then echo "已保存"; return 0; fi
+    msg="$(__reason "$out")"
+    [ -n "$msg" ] || msg="保存失败(见 /etc/log/aria2/aria2.log)"
+    echo "$msg"; return 1
+}
+
+logclear()
+{
+    cli logclear >/dev/null 2>&1 && { echo "已清空"; return 0; }
+    echo "清空失败"; return 1
+}

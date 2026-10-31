@@ -1,0 +1,455 @@
+#!/bin/bash
+# aria2ctl —— aria2 下载器控制器(随插件分发)
+#
+# 用法:
+#   aria2ctl ensure            初始化目录/默认配置
+#   aria2ctl start             启动(已运行则提示)
+#   aria2ctl stop              停止
+#   aria2ctl restart           重启
+#   aria2ctl status            人类可读状态
+#   aria2ctl status-json       JSON 状态(页面消费)
+#   aria2ctl seting <k> <v>    改配置(port/secret/dir/autostart/dht/seed_ratio)
+#   aria2ctl log [n]           最近 n 行日志(默认 80)
+#   aria2ctl logclear          清空日志
+#   aria2ctl version           插件版本号
+#
+# 二进制: abcfy2/aria2-static-build 的 musl 静态构建(aria2 1.37.0),
+#         无 glibc/动态库依赖, 内置 c-ares(异步 DNS, 不依赖系统 NSS)。
+# 前端:   mayswind/AriaNg 1.3.15 AllInOne(单文件, 见 www/plugins/app/aria2ng.html)。
+set -u
+DEF_VER="1.0.4"
+ARIA2_VER="1.37.0"
+ROOT="${PLUGIN_DIR:-/etc/mnt/plugins/aria2}"
+DATA="$ROOT/data"
+BIN="$ROOT/bin/aria2c"
+LOG=/etc/log/aria2/aria2.log
+CTLCONF="$DATA/aria2ctl.conf"      # 插件自己的设置(key=value)
+RUNTIME="$DATA/aria2.runtime.conf" # 由本脚本生成, aria2 实际读取
+SESSION="$DATA/aria2.session"      # BT 任务持久化(重启后恢复做种/下载)
+PIDFILE="$DATA/aria2.pid"
+
+# ------------------------------------------------------------ 基础
+log_line() {
+    local dir sz
+    dir="$(dirname "$LOG")"
+    mkdir -p "$dir" 2>/dev/null
+    # 超过 512KB 自动轮换(只保留最近 100 行)。
+    # 注意: 必须"写回同一文件"而不是 mv —— aria2 持有日志 fd, mv 会换 inode 导致
+    # 轮换后 aria2 继续写旧文件。
+    if [ -f "$LOG" ]; then
+        sz="$(wc -c < "$LOG" 2>/dev/null)"
+        case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+        if [ "$sz" -gt 524288 ]; then
+            tail -n 100 "$LOG" > "$LOG.tmp" 2>/dev/null && cat "$LOG.tmp" > "$LOG" 2>/dev/null
+            rm -f "$LOG.tmp" 2>/dev/null
+        fi
+    fi
+    printf '%s %s\n' "$(date '+%F %T')" "$1" >> "$LOG" 2>/dev/null
+}
+
+rand_hex() {
+    # 设备上没有 od, 优先 hexdump -C 提十六进制(ttydctl 同款手法);
+    # hexdump 不在时退回 od(本地/其他环境自测用)
+    local out=""
+    if command -v hexdump >/dev/null 2>&1; then
+        out="$(head -c "${1:-16}" /dev/urandom 2>/dev/null | \
+            hexdump -C 2>/dev/null | \
+            awk '{ sub(/\|.*/,""); sub(/^[^ ]+ */,""); gsub(/ /,""); printf "%s", $0 }')"
+    fi
+    if [ -z "$out" ] && command -v od >/dev/null 2>&1; then
+        out="$(head -c "${1:-16}" /dev/urandom 2>/dev/null | \
+            od -An -tx1 2>/dev/null | \
+            awk '{ sub(/^[^ ]+ */,""); gsub(/ /,""); printf "%s", $0 }')"
+    fi
+    printf '%s' "$out"
+}
+
+cfg_get() { sed -n "s/^$1=//p" "$CTLCONF" 2>/dev/null | head -n1; }
+cfg_set() {
+    local k="$1" v="$2"
+    mkdir -p "$DATA" 2>/dev/null
+    test -f "$CTLCONF" || : > "$CTLCONF" 2>/dev/null
+    if grep -q "^$k=" "$CTLCONF" 2>/dev/null; then
+        sed -i "s|^$k=.*|$k=$v|" "$CTLCONF" 2>/dev/null
+    else
+        printf '%s=%s\n' "$k" "$v" >> "$CTLCONF" 2>/dev/null
+    fi
+}
+
+ensure_dirs() {
+    mkdir -p "$DATA" "$(dirname "$LOG")" 2>/dev/null
+    chmod +x "$BIN" "$SELF" 2>/dev/null
+    [ -f "$SESSION" ] || : > "$SESSION" 2>/dev/null
+}
+
+# 下载目录默认值: 在"真实挂载的数据盘"里挑最大的, 没有则退回 /etc/mnt。
+# 必须是挂载点——/etc/disk 下可能有爱快的临时/备份目录(如时间戳目录),
+# 不是挂载点(实测测试机踩过: 选中了个临时目录, 还被爱快清掉, 下载必失败)。
+is_mountpoint() {
+    awk -v m="$1" '$2 == m {f=1} END{exit !f}' /proc/mounts 2>/dev/null
+}
+
+detect_dir() {
+    local d best="" sz=0 cur
+    for d in /etc/disk/*/ /etc/mnt/; do
+        [ -d "$d" ] || continue
+        d="${d%/}"
+        is_mountpoint "$d" || continue
+        cur="$(df -k "$d" 2>/dev/null | awk 'NR==2{print $2}')"
+        case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+        if [ "$cur" -gt "$sz" ]; then sz="$cur"; best="$d"; fi
+    done
+    [ -n "$best" ] || best="/etc/mnt"
+    printf '%s/downloads' "$best"
+}
+
+# 系统 CA 证书(HTTPS 下载需要); abcfy2 构建按 --openssldir=/etc/ssl 编的,
+# 优先 /etc/ssl/cert.pem, 再 Debian 常见路径, 都没有就留空(aria2 报证书错时
+# 用户可在设置里排查)
+detect_cacert() {
+    local f
+    for f in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt \
+             /etc/pki/tls/certs/ca-bundle.crt; do
+        [ -f "$f" ] && { printf '%s' "$f"; return; }
+    done
+    printf ''
+}
+
+cmd_ensure() {
+    ensure_dirs
+    # 首次: 补默认配置
+    [ -n "$(cfg_get rpc_port)" ]   || cfg_set rpc_port 6800
+    [ -n "$(cfg_get rpc_secret)" ] || cfg_set rpc_secret "$(rand_hex 16)"
+    [ -n "$(cfg_get dir)" ]        || cfg_set dir "$(detect_dir)"
+    [ -n "$(cfg_get autostart)" ]  || cfg_set autostart 1
+    [ -n "$(cfg_get dht)" ]        || cfg_set dht 1
+    [ -n "$(cfg_get seed_ratio)" ] || cfg_set seed_ratio 0
+    # 注意: 下载目录不在这里建 —— 留给 cmd_start 判断(盘换了要重新探测,
+    # 盲目 mkdir 会把旧 UUID 路径凭空建出来, 反而绕过自愈)
+    return 0
+}
+
+# ------------------------------------------------------------ 运行时配置
+gen_runtime_conf() {
+    local port secret dir dht ratio cacert
+    port="$(cfg_get rpc_port)";   [ -n "$port" ] || port=6800
+    secret="$(cfg_get rpc_secret)"
+    dir="$(cfg_get dir)"
+    dht="$(cfg_get dht)";         [ -n "$dht" ] || dht=1
+    ratio="$(cfg_get seed_ratio)";[ -n "$ratio" ] || ratio=0
+    cacert="$(detect_cacert)"
+    mkdir -p "$DATA" 2>/dev/null
+    cat > "$RUNTIME" <<EOF
+# aria2 运行时配置 —— 由 aria2ctl 自动生成, 勿手改(改了会被覆盖)
+# 插件设置见 $CTLCONF
+dir=$dir
+continue=true
+input-file=$SESSION
+save-session=$SESSION
+save-session-interval=30
+
+# User-Agent: 默认的 aria2/x.y.z 会被国内 CDN 当爬虫拦(阿里云镜像实测 403),
+# 用浏览器 UA 兼容性最好
+user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36
+
+# RPC(AriaNg 通过它管理任务)
+enable-rpc=true
+rpc-listen-all=true
+rpc-allow-origin-all=true
+rpc-listen-port=$port
+rpc-secret=$secret
+rpc-save-upload-metadata=true
+
+# BT
+bt-enable-lpd=true
+bt-max-peers=50
+bt-seed-unverified=true
+seed-ratio=$ratio
+check-integrity=false
+EOF
+    if [ "$dht" = "1" ]; then
+        cat >> "$RUNTIME" <<EOF
+enable-dht=true
+enable-dht6=false
+dht-listen-port=6881-6999
+EOF
+    else
+        printf 'enable-dht=false\n' >> "$RUNTIME"
+    fi
+    if [ -n "$cacert" ]; then
+        printf 'ca-certificate=%s\n' "$cacert" >> "$RUNTIME"
+    fi
+    cat >> "$RUNTIME" <<EOF
+
+# 日志(插件页面/ctl 都读这个文件)
+log=$LOG
+log-level=notice
+EOF
+    return 0
+}
+
+# ------------------------------------------------------------ 进程
+proc_pid() {
+    local p
+    [ -f "$PIDFILE" ] || return 1
+    p="$(cat "$PIDFILE" 2>/dev/null)"
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    [ -d "/proc/$p" ] || return 1
+    # 防 pid 复用: 确认进程真是 aria2c
+    grep -q "aria2c" "/proc/$p/cmdline" 2>/dev/null || return 1
+    printf '%s' "$p"
+}
+
+proc_alive() { proc_pid >/dev/null 2>&1; }
+
+# RPC 探活: 通了返回 aria2 版本号, 不通返回空
+rpc_ping() {
+    local port secret resp
+    port="$(cfg_get rpc_port)"; [ -n "$port" ] || port=6800
+    secret="$(cfg_get rpc_secret)"
+    command -v curl >/dev/null 2>&1 || return 1
+    resp="$(curl -s -m 3 -X POST "http://127.0.0.1:$port/jsonrpc" \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"aria2.getVersion","id":"aria2ctl","params":["token:'"$secret"'"]}' 2>/dev/null)"
+    case "$resp" in
+        *'"version"'*)
+            printf '%s' "$resp" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -n1 ;;
+    esac
+    return 0
+}
+
+proc_uptime() {
+    local p st hz up s
+    p="$(proc_pid)" || return 1
+    st="$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)"
+    case "$st" in ''|*[!0-9]*) return 1 ;; esac
+    hz=100   # x86 内核 USER_HZ
+    up="$(awk '{print int($1)}' /proc/uptime 2>/dev/null)"
+    case "$up" in ''|*[!0-9]*) return 1 ;; esac
+    s=$(( up - st/hz ))
+    [ "$s" -lt 0 ] && s=0
+    printf '%d天%d时%d分' $((s/86400)) $(( (s%86400)/3600 )) $(( (s%3600)/60 ))
+}
+
+# ------------------------------------------------------------ 启停
+cmd_start() {
+    cmd_ensure
+    if proc_alive; then echo "aria2 已在运行(pid $(proc_pid))"; return 0; fi
+    [ -x "$BIN" ] || { echo "缺少可执行的 aria2c: $BIN"; return 1; }
+    local dir root nd
+    dir="$(cfg_get dir)"
+    case "$dir" in
+        /etc/disk/*|/etc/mnt/*|/etc/disk_user/*) ;;
+        *) echo "下载目录不在允许范围(/etc/disk、/etc/mnt 或 /etc/disk_user 下): $dir"; return 1 ;;
+    esac
+    # 校验下载目录的"挂载根"是否真实有效——始终执行(不只是目录不存在时):
+    # 换设备/盘换了/UUID 变了根会没; 旧版本探测逻辑没验挂载点, 可能把
+    # /etc/disk 下的爱快临时目录(在根文件系统上, 容量小)选成下载盘,
+    # 这种"目录存在但盘不对"的情况也要纠正。
+    # 取根: 先剥前缀、再按 / 截第一段、最后拼回(不能对绝对路径用 %%/*, 会切出空串)
+    local stale=0
+    case "$dir" in
+        /etc/disk/*)
+            local seg="${dir#/etc/disk/}"
+            root="/etc/disk/${seg%%/*}"
+            { [ -d "$root" ] && is_mountpoint "$root"; } || stale=1 ;;
+        /etc/disk_user/*)
+            local seg2="${dir#/etc/disk_user/}"
+            root="/etc/disk_user/${seg2%%/*}"
+            [ -d "$root" ] || stale=1 ;;
+        *)
+            root="$(dirname "$dir")"
+            [ -d "$root" ] || stale=1 ;;
+    esac
+    if [ "$stale" = 1 ]; then
+        nd="$(detect_dir)"
+        if [ -n "$nd" ] && [ "$nd" != "$dir" ]; then
+            log_line "[start] 下载目录 $dir 的挂载根无效($root), 自动切换到: $nd"
+            cfg_set dir "$nd"
+            dir="$nd"
+        fi
+    fi
+    [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null
+    [ -d "$dir" ] || { echo "下载目录不可用: $dir"; return 1; }
+    gen_runtime_conf
+    [ -f "$SESSION" ] || : > "$SESSION" 2>/dev/null
+    rm -f "$PIDFILE" 2>/dev/null
+    # 后台拉起: 设备没有 setsid/nohup, 用子 shell 脱离(charon 同款手法);
+    # $! 在子 shell 里取到的就是 aria2c 的 pid
+    ( "$BIN" --conf-path="$RUNTIME" >>"$LOG" 2>&1 & echo $! > "$PIDFILE" ) 2>/dev/null
+    sleep 1
+    if proc_alive; then
+        log_line "[start] aria2 启动成功 pid=$(proc_pid) port=$(cfg_get rpc_port) dir=$dir"
+        echo "aria2 已启动"
+        return 0
+    fi
+    log_line "[start] aria2 启动失败, 请检查日志(常见原因: RPC 端口被占用)"
+    echo "启动失败(常见原因: RPC 端口 $(cfg_get rpc_port) 被占用), 详见 $LOG"
+    return 1
+}
+
+cmd_stop() {
+    if ! proc_alive; then
+        rm -f "$PIDFILE" 2>/dev/null
+        echo "aria2 未在运行"
+        return 0
+    fi
+    local p i
+    p="$(proc_pid)"
+    kill "$p" 2>/dev/null
+    i=0
+    while [ "$i" -lt 10 ] && [ -d "/proc/$p" ]; do
+        sleep 1
+        i=$((i+1))
+    done
+    # aria2 收到 TERM 会先存 session 再退; 超时未退再 KILL
+    if [ -d "/proc/$p" ]; then
+        kill -9 "$p" 2>/dev/null
+        sleep 1
+    fi
+    rm -f "$PIDFILE" 2>/dev/null
+    log_line "[stop] aria2 已停止(pid $p)"
+    echo "aria2 已停止"
+    return 0
+}
+
+cmd_restart() {
+    cmd_stop >/dev/null 2>&1
+    sleep 1
+    cmd_start
+}
+
+# ------------------------------------------------------------ 状态
+json_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+cmd_status_json() {
+    cmd_ensure
+    local run=false pid="" up="" aver="" port secret dir as dht ratio up_esc web_http
+    if proc_alive; then
+        run=true
+        pid="$(proc_pid)"
+        up="$(proc_uptime)"
+        aver="$(rpc_ping)"
+    fi
+    [ -n "$aver" ] || aver="$ARIA2_VER"
+    port="$(cfg_get rpc_port)"
+    secret="$(cfg_get rpc_secret)"
+    dir="$(cfg_get dir)"
+    as="$(cfg_get autostart)"
+    dht="$(cfg_get dht)"
+    ratio="$(cfg_get seed_ratio)"
+    # 爱快的 HTTP 管理端口(只读配置库): HTTPS 访问页面时, 用来提示/跳转 HTTP 地址
+    # (HTTPS 页面内嵌 AriaNg 连 HTTP RPC 会被浏览器混合内容策略拦截)
+    web_http="$(sqlite3 /etc/mnt/ikuai/config.db "SELECT http_port FROM remote_control WHERE id=1" 2>/dev/null)"
+    case "$web_http" in ''|*[!0-9]*) web_http=0 ;; esac
+    case "$up" in '') up_esc='""' ;; *) up_esc="\"$(json_esc "$up")\"" ;; esac
+    # 目录是否存在: 服务在跑但盘被拔掉/目录被清的情况, 页面要能提示
+    local dir_ok=true
+    [ -d "$dir" ] || dir_ok=false
+    printf '{"installed":true,"running":%s,"pid":"%s","uptime":%s,"version":"%s","aria2_version":"%s","port":%s,"secret":"%s","dir":"%s","dir_ok":%s,"autostart":%s,"dht":%s,"seed_ratio":%s,"web_http_port":%s}\n' \
+        "$run" "$pid" "$up_esc" "$DEF_VER" "$(json_esc "$aver")" "${port:-6800}" \
+        "$(json_esc "$secret")" "$(json_esc "$dir")" "$dir_ok" "${as:-1}" "${dht:-1}" "${ratio:-0}" "$web_http"
+    return 0
+}
+
+cmd_status() { cmd_status_json; }
+
+# ------------------------------------------------------------ 配置
+cmd_seting() {
+    local k="$1" v="$2" out
+    [ -n "$k" ] || { echo "用法: seting <key> <value>"; return 1; }
+    cmd_ensure
+    case "$k" in
+        port)
+            case "$v" in ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;; esac
+            [ "$v" -ge 1 ] && [ "$v" -le 65535 ] || { echo "端口需在 1~65535 之间"; return 1; }
+            # 端口占用检查(自己占用的不算冲突): /proc/net/tcp 第 2 列是本地地址
+            # IP:端口(十六进制), 只匹配这一列, 防止把"远端端口恰好是 6800"的连接误判
+            if [ "$(cfg_get rpc_port)" != "$v" ]; then
+                if awk -v p=":$(printf '%04X' "$v")\$" '$2 ~ p {f=1} END{exit !f}' \
+                        /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+                    echo "端口 $v 已被其他程序占用"; return 1
+                fi
+            fi
+            cfg_set rpc_port "$v" ;;
+        secret)
+            if [ "$v" = "auto" ]; then
+                v="$(rand_hex 16)"
+                [ -n "$v" ] || { echo "随机密钥生成失败"; return 1; }
+            fi
+            case "$v" in
+                ''|*[!a-zA-Z0-9]*) echo "密钥只能含字母数字(或填 auto 随机生成)"; return 1 ;;
+            esac
+            [ "${#v}" -ge 6 ] || { echo "密钥至少 6 位"; return 1; }
+            cfg_set rpc_secret "$v" ;;
+        dir)
+            # auto = 重新探测(换设备/换盘后一键恢复默认路径)
+            if [ "$v" = "auto" ]; then
+                v="$(detect_dir)"
+                [ -n "$v" ] || { echo "自动探测失败: 没有可用数据盘"; return 1; }
+            fi
+            case "$v" in
+                ''|*[!a-zA-Z0-9._/-]*) echo "目录含非法字符"; return 1 ;;
+                /*) ;;
+                *) echo "目录必须是绝对路径"; return 1 ;;
+            esac
+            case "$v" in
+                /etc/disk/*|/etc/mnt/*|/etc/disk_user/*) ;;
+                *) echo "目录必须在 /etc/disk、/etc/mnt 或 /etc/disk_user 下(数据盘)"; return 1 ;;
+            esac
+            mkdir -p "$v" 2>/dev/null
+            [ -d "$v" ] || { echo "目录创建失败: $v"; return 1; }
+            cfg_set dir "$v" ;;
+        autostart|dht)
+            case "$v" in 0|1) cfg_set "$k" "$v" ;; *) echo "取值必须是 0 或 1"; return 1 ;; esac ;;
+        seed_ratio)
+            case "$v" in ''|*[!0-9.]*) echo "分享率必须是非负数字(0=无限做种)"; return 1 ;; esac
+            cfg_set seed_ratio "$v" ;;
+        *)
+            echo "不支持的配置项: $k"; return 1 ;;
+    esac
+    log_line "[set] $k=$v"
+    # 运行中改了配置: 自动重启生效(与 ttyd 行为一致)
+    if proc_alive; then
+        out="$(cmd_restart 2>&1)"
+        echo "已保存并重启生效"
+        return 0
+    fi
+    echo "已保存(下次启动生效)"
+    return 0
+}
+
+# ------------------------------------------------------------ 日志
+cmd_log() {
+    local n="${1:-80}"
+    case "$n" in ''|*[!0-9]*) n=80 ;; esac
+    [ -f "$LOG" ] || { echo "(暂无日志)"; return 0; }
+    tail -n "$n" "$LOG" 2>/dev/null || echo "(暂无日志)"
+}
+
+cmd_logclear() {
+    mkdir -p "$(dirname "$LOG")" 2>/dev/null
+    : > "$LOG" 2>/dev/null
+    log_line "[log] 日志已清空"
+    echo "已清空"
+}
+
+# ------------------------------------------------------------ main
+SELF="$0"
+main() {
+    case "${1:-}" in
+        ensure)      cmd_ensure ;;
+        start)       cmd_start ;;
+        stop)        cmd_stop ;;
+        restart)     cmd_restart ;;
+        status)      cmd_status ;;
+        status-json) cmd_status_json ;;
+        seting)      shift; cmd_seting "$@" ;;
+        log)         shift; cmd_log "$@" ;;
+        logclear)    cmd_logclear ;;
+        version)     printf '%s\n' "$DEF_VER" ;;
+        *)           echo "用法: aria2ctl {ensure|start|stop|restart|status|status-json|seting <k> <v>|log [n]|logclear|version}"; return 1 ;;
+    esac
+}
+
+main "$@"

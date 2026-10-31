@@ -1,0 +1,187 @@
+#!/bin/bash
+#
+# miot-panel —— 米家面板在爱快上的命令行。
+#
+# 框架把 bin/* 软链到 /usr/sbin/，所以设备上可以直接 `miot-panel status`。
+#
+set -u
+
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+ROOT="${PLUGIN_DIR:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+DATA="$ROOT/data"
+APP="$ROOT/app"
+RT="$ROOT/runtime"
+PY="$RT/python/bin/python3"
+LD="$RT/lib/ld-linux-x86-64.so.2"
+SITE="$ROOT/site"
+LOGDIR=/etc/log/miot-panel
+LOG="$LOGDIR/panel.log"
+PIDFILE="$DATA/panel.pid"
+DEFAULT_PORT=8088
+
+mkdir -p "$DATA" "$LOGDIR" 2>/dev/null
+
+note() { echo "$(date '+%F %T') $*" >> "$LOGDIR/cli.log" 2>/dev/null; }
+port() { local p; p="$(cat "$DATA/port" 2>/dev/null)"; case "$p" in ''|*[!0-9]*) p=$DEFAULT_PORT;; esac; printf '%s' "$p"; }
+version() { sed -n 's/^APP_VERSION *= *"\([^"]*\)".*/\1/p' "$APP/miot-cloud.py" 2>/dev/null | head -n1; }
+is_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
+lan_ip() {
+    local ip
+    ip="$(ip -4 addr show lan1 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -n1)"
+    if [ -z "$ip" ]; then
+        ip="$(ip -4 addr show 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' \
+             | grep -E '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | head -n1)"
+    fi
+    printf '%s' "$ip"
+}
+
+cmd_init() {
+    mkdir -p "$DATA" "$LOGDIR" 2>/dev/null
+    [ -s "$DATA/port" ] || echo "$DEFAULT_PORT" > "$DATA/port"
+    chmod 700 "$DATA" 2>/dev/null
+    note "init version=$(version) port=$(port)"
+    return 0
+}
+
+cmd_status() {
+    local p v running=false pid="" api="" devices="" online="" rt=false glibc=false uptime=""
+    p="$(port)"; v="$(version)"
+    if is_running; then running=true; pid="$(cat "$PIDFILE")"; fi
+    api="$(curl -s -m 3 "http://127.0.0.1:$p/api/status" 2>/dev/null)"
+    if [ -n "$api" ]; then
+        devices="$(printf '%s' "$api" | jq -r '.device_count // empty' 2>/dev/null)"
+        online="$(printf '%s' "$api" | jq -r '.supported_count // empty' 2>/dev/null)"
+        [ -n "$v" ] || v="$(printf '%s' "$api" | jq -r '.version // empty' 2>/dev/null)"
+    fi
+    [ -x "$PY" ] && rt=true
+    [ -f "$RT/lib/libc.so.6" ] && glibc=true
+    printf '{"running":%s,"pid":"%s","port":%s,"version":"%s","devices":"%s","online":"%s","runtime":%s,"glibc":%s,"ip":"%s"}\n' \
+        "$running" "${pid:-}" "$p" "${v:-}" "${devices:-}" "${online:-}" "$rt" "$glibc" "$(lan_ip)"
+}
+
+cmd_url() {
+    printf 'http://%s:%s/\n' "$(lan_ip)" "$(port)"
+}
+
+cmd_start() {
+    if is_running; then echo "已在运行 pid=$(cat "$PIDFILE")"; return 0; fi
+    if [ ! -x "$PY" ]; then echo "缺少 Python 运行时，请重新安装插件"; return 1; fi
+    local p; p="$(port)"
+    ( trap '' HUP
+      exec env LD_LIBRARY_PATH="$RT/lib" PYTHONPATH="$SITE" \
+        MIOT_ROOT="$DATA" MIOT_APP_DIR="$APP" MIOT_PORT="$p" \
+        MIOT_LOG_FILE="$LOG" MIOT_DISCOVERY_PORT=37020 \
+        "$PY" "$APP/miot-cloud.py" >> "$LOG" 2>&1 ) &
+    echo $! > "$PIDFILE"
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        sleep 1
+        if ! is_running; then break; fi
+        curl -s -m 2 -o /dev/null "http://127.0.0.1:$p/api/status" 2>/dev/null && break
+    done
+    if is_running; then
+        note "start pid=$(cat "$PIDFILE") port=$p"
+        echo "已启动 pid=$(cat "$PIDFILE") 端口 $p"
+        return 0
+    fi
+    rm -f "$PIDFILE" 2>/dev/null
+    echo "启动失败，日志：$LOG"
+    return 1
+}
+
+cmd_stop() {
+    if ! is_running; then rm -f "$PIDFILE" 2>/dev/null; echo "未在运行"; return 0; fi
+    local pid; pid="$(cat "$PIDFILE")"
+    kill "$pid" 2>/dev/null
+    local i
+    for i in 1 2 3 4 5; do
+        is_running || break
+        sleep 1
+    done
+    if is_running; then kill -9 "$pid" 2>/dev/null; sleep 1; fi
+    rm -f "$PIDFILE" 2>/dev/null
+    note "stop pid=$pid"
+    echo "已停止"
+    return 0
+}
+
+cmd_restart() {
+    cmd_stop >/dev/null 2>&1
+    cmd_start
+}
+
+cmd_setport() {
+    local p="${1:-}"
+    case "$p" in ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;; esac
+    [ "$p" -ge 1024 ] && [ "$p" -le 65535 ] || { echo "端口需在 1024~65535"; return 1; }
+    echo "$p" > "$DATA/port"
+    note "setport $p"
+    echo "端口已改为 $p（重启面板后生效）"
+    return 0
+}
+
+cmd_log() {
+    local n="${1:-80}"
+    case "$n" in ''|*[!0-9]*) n=80 ;; esac
+    tail -n "$n" "$LOG" 2>/dev/null
+}
+
+# 输出一段 JSON 字符串字面量（含换行转义），给后端接口拼 __json_result__
+cmd_logquote() {
+    local n="${1:-100}"
+    case "$n" in ''|*[!0-9]*) n=100 ;; esac
+    "$LD" --library-path "$RT/lib" "$PY" -c '
+import json, sys
+path, n = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()[-n:]
+except OSError:
+    lines = []
+sys.stdout.write(json.dumps("".join(lines), ensure_ascii=False))
+' "$LOG" "$n" 2>/dev/null
+}
+
+cmd_logclear() {
+    : > "$LOG" 2>/dev/null
+    rm -f "$LOG".1 "$LOG".2 "$LOG".3 2>/dev/null
+    note "log cleared"
+    echo "日志已清空"
+    return 0
+}
+
+cmd_menu() {
+    local sub="${1:-status}"
+    local script="$ROOT/share/menu_patch.sh"
+    if [ ! -x "$script" ]; then echo "缺少 menu_patch.sh"; return 1; fi
+    case "$sub" in
+        on)  PLUGIN_DIR="$ROOT" "$script" apply; echo "已尝试写入左侧菜单（若前端不刷新，重启路由后才会按新数据渲染）" ;;
+        off) PLUGIN_DIR="$ROOT" "$script" remove; echo "已移除左侧菜单补丁" ;;
+        *)   echo "用法: miot-panel menu on|off" ;;
+    esac
+}
+cmd_diag() {
+    echo "root=$ROOT"
+    echo "python=$PY ($([ -x "$PY" ] && "$LD" --library-path "$RT/lib" "$PY" -V 2>&1 || echo missing))"
+    echo "libc=$RT/lib/libc.so.6 ($([ -f "$RT/lib/libc.so.6" ] && echo ok || echo missing))"
+    echo "site=$([ -d "$SITE" ] && echo ok || echo missing)"
+    echo "log=$(ls -l "$LOG" 2>/dev/null | awk '{print $5}')"
+    tail -n 12 "$LOG" 2>/dev/null
+}
+
+case "${1:-status}" in
+    init)     cmd_init ;;
+    status)   cmd_status ;;
+    start)    cmd_start ;;
+    stop)     cmd_stop ;;
+    restart)  cmd_restart ;;
+    setport)  shift; cmd_setport "${1:-}" ;;
+    port)     port; echo ;;
+    url)      cmd_url ;;
+    log)      shift; cmd_log "${1:-80}" ;;
+    logquote) shift; cmd_logquote "${1:-100}" ;;
+    logclear) cmd_logclear ;;
+    diag)     cmd_diag ;;
+    menu)     shift; cmd_menu "${1:-status}" ;;
+    *) echo "用法: miot-panel {status|start|stop|restart|setport <端口>|url|log [行数]|logclear|diag|menu on|off}"; exit 1 ;;
+esac

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>米家面板</title>
+<link rel="stylesheet" href="./ikui.css">
+</head>
+<body>
+
+<script type="text/x-template" id="tpl">
+  <ik-page title="米家面板" tag="miot-panel">
+    <template #actions>
+      <el-button size="small" @click="load">刷新</el-button>
+      <el-button size="small" type="primary" :disabled="!ready" @click="openPanel">打开面板</el-button>
+    </template>
+
+    <ik-tiles :items="tiles"></ik-tiles>
+
+    <ik-sec title="运行控制" desc="面板跑在路由器本机，改端口会自动重启">
+      <div class="ik-row">
+        <el-button type="success" size="small" :disabled="s.running" @click="act('start','已启动')">启动</el-button>
+        <el-button size="small" :disabled="!s.running" @click="act('stop','已停止')">停止</el-button>
+        <el-button size="small" :disabled="!s.running" @click="act('restart','已重启')">重启</el-button>
+        <el-button size="small" @click="openPanel" :disabled="!ready">打开面板</el-button>
+      </div>
+      <el-form label-width="110px" style="margin-top:14px">
+        <el-form-item label="面板端口">
+          <el-input v-model.number="portInput" style="width:160px"></el-input>
+          <el-button size="small" style="margin-left:10px" @click="savePort">保存并重启</el-button>
+        </el-form-item>
+      </el-form>
+      <div class="ik-hint">
+        面板地址：<b>{{ urlText }}</b>（手机/平板在同一 Wi-Fi 下也能打开）
+      </div>
+    </ik-sec>
+
+    <ik-sec title="首次使用" desc="面板第一次打开会进入设置向导">
+      <div class="ik-hint">
+        1. 打开面板 → 设置管理员 PIN（保护面板后台）<br>
+        2. 登录小米账号（设备列表来自米家云端）<br>
+        3. 需要摄像头/音乐中心时，再在面板后台里装对应组件
+      </div>
+    </ik-sec>
+
+    <ik-sec title="运行日志" desc="最近 100 行，打开页面自动加载">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <el-button size="small" @click="loadLog">刷新</el-button>
+        <el-button size="small" type="danger" plain @click="clearLog">清空日志</el-button>
+        <span class="ik-hint">{{ logHint }}</span>
+      </div>
+      <pre class="ik-pre" style="margin-top:10px;max-height:360px;overflow:auto" v-if="logText">{{ logText }}</pre>
+    </ik-sec>
+  </ik-page>
+</script>
+
+<div id="app"></div>
+
+<script src="./ikui.js"></script>
+<script>
+IKUI.mount('#app', {
+  tpl: '#tpl',
+  func: 'miot-panel',
+  data: function () {
+    return {
+      s: {},
+      tiles: [],
+      portInput: 8088,
+      logText: '',
+      logHint: ''
+    };
+  },
+  computed: {
+    ready: function () {
+      return !!(this.s && this.s.running);
+    },
+    urlText: function () {
+      var ip = (this.s && this.s.ip) || location.hostname;
+      var port = (this.s && this.s.port) || 8088;
+      return 'http://' + ip + ':' + port + '/';
+    }
+  },
+  methods: {
+    load: function () {
+      var self = this;
+      this.ik('show', { TYPE: 'data' }).then(function (d) {
+        var s = (d && d.status) || {};
+        self.s = s;
+        self.portInput = Number(s.port) || 8088;
+        self.tiles = [
+          { k: '状态', v: s.running ? '运行中' : '已停止', tone: s.running ? 'ok' : 'err' },
+          { k: '版本', v: s.version || '-' },
+          { k: '设备', v: (s.devices || '-') + (s.online ? '（在线 ' + s.online + '）' : '') },
+          { k: '端口', v: s.port || '-' },
+          { k: '运行时', v: s.runtime ? (s.glibc ? 'Python 就绪' : '缺 glibc') : '未安装',
+            tone: s.runtime && s.glibc ? 'ok' : 'err' }
+        ];
+      }).catch(function (e) { IKUI.toast(e.message, 'error'); });
+    },
+    act: function (action, okText) {
+      var self = this;
+      this.ik(action, {}).then(function () {
+        IKUI.toast(okText, 'success');
+        setTimeout(function () { self.load(); }, 1200);
+      }).catch(function (e) { IKUI.toast(e.message, 'error'); });
+    },
+    savePort: function () {
+      var self = this;
+      this.ik('setport', { value: String(this.portInput) }).then(function () {
+        IKUI.toast('端口已保存，面板正在重启', 'success');
+        setTimeout(function () { self.load(); }, 3000);
+      }).catch(function (e) { IKUI.toast(e.message, 'error'); });
+    },
+    openPanel: function () {
+      window.open(this.urlText, '_blank');
+    },
+    loadLog: function () {
+      var self = this;
+      this.ik('logshow', {}).then(function (d) {
+        var t = (d && d.text) || '';
+        self.logText = t || '（暂无日志）';
+        self.logHint = t ? (t.split(String.fromCharCode(10)).length + ' 行 · ' + Math.ceil(t.length / 1024) + ' KB') : '';
+      }).catch(function (e) { IKUI.toast(e.message, 'error'); });
+    },
+    clearLog: function () {
+      var self = this;
+      if (!window.confirm('清空面板运行日志？（不影响设备配置）')) return;
+      this.ik('logclear', {}).then(function () {
+        IKUI.toast('日志已清空', 'success');
+        self.loadLog();
+      }).catch(function (e) { IKUI.toast(e.message, 'error'); });
+    }
+  },
+  mounted: function () {
+    try {
+      if (window.parent !== window && window.parent.document) {
+        window.parent.document.title = '米家面板';
+      }
+    } catch (e) { /* 跨域时忽略 */ }
+    this.load();
+    this.loadLog();
+  }
+});
+</script>
+</body>
+</html>

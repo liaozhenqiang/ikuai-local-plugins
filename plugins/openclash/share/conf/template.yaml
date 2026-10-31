@@ -1,0 +1,91 @@
+# OpenClash for iKuai - 运行配置模板
+#
+# 本文件是"模板", __XXX__ 占位符由 bin/occtl 的 render 子命令替换后写到
+# data/config.yaml。请不要直接改这里的值(改了会被覆盖), 要改配置请用:
+#   网页: 系统设置 -> 插件管理 -> OpenClash -> 配置
+#   命令行: occtl conf-set <键> <值>  &&  occtl restart
+#
+# 如果需要完全自己的配置: 用页面导入自定义 config.yaml(会把 cfg_mode 设为 custom),
+# 之后本模板不再参与渲染。
+
+mixed-port: __MIXED_PORT__
+redir-port: __REDIR_PORT__
+tproxy-port: __TPROXY_PORT__
+allow-lan: true
+bind-address: '*'
+mode: __MODE__
+log-level: __LOG_LEVEL__
+ipv6: __IPV6__
+
+external-controller: __CTRL__
+# 用双引号并在渲染时转义: 密钥里若含单引号会让整份 YAML 语法错误(启用时会撤规则)
+secret: "__SECRET__"
+external-ui: __UI_DIR__
+external-ui-name: __UI_NAME__
+
+# 内核自身出站流量打上 SO_MARK, 供 iptables 的 `-m mark --mark` 规则放行, 防止回环
+routing-mark: __MARK__
+unified-delay: true
+tcp-concurrent: true
+keep-alive-interval: 30
+find-process-mode: off
+
+# geo 数据: 随插件包提供(Country.mmdb + GeoSite.dat), 不做自动更新
+# geodata-mode 必须为 false, 这样 GEOIP 规则用 MaxMind 的 Country.mmdb
+# (设为 true 会改用 v2ray 的 geoip.dat, 包内没有那个文件)
+geodata-mode: false
+geodata-loader: standard
+geo-auto-update: false
+geo-update-interval: 168
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+sniffer:
+  enable: false
+
+dns:
+  enable: true
+  listen: 0.0.0.0:__DNS_PORT__
+  ipv6: __IPV6__
+  enhanced-mode: __DNS_MODE__
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - '+.msftconnecttest.com'
+    - '+.msftncsi.com'
+    - 'localhost.ptlogin2.qq.com'
+    - 'time.*.com'
+    - 'ntp.*.com'
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  # 上游统一用 DoH: 避免"内核自己的 53 查询又被自己的 TUN/DNS 劫持"造成回环
+  nameserver:
+    - https://223.5.5.5/dns-query
+    - https://1.12.12.12/dns-query
+  # 这里刻意不配 fallback: 国内网络下 8.8.8.8/1.1.1.1 的 DoH 不可达, 而
+  # fallback-filter.geoip=true 规定"nameserver 结果不是 CN 就必须等 fallback",
+  # 于是每次解析都挂起约 2 分钟, 连接越堆越多把内核 fd 耗光
+  # (too many open files), 表现为"国内站正常、所有走代理的站全挂"。
+  # 上面两个国内 DoH 足够, 不再配 fallback。
+__NS_POLICY__
+tun:
+  enable: __TUN_ENABLE__
+  stack: system
+  device: oc-tun
+  mtu: 1500
+  dns-hijack:
+    - 'any:53'
+  auto-route: true
+  auto-detect-interface: true
+  auto-redirect: false
+  strict-route: false
+
+__PROVIDERS__
+
+__PROXY_GROUPS__
+
+__RULES__

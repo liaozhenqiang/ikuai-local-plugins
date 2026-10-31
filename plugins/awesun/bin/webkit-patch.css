@@ -1,0 +1,83 @@
+/* iKuai 后台在 WebKitGTK 下的兼容补丁。
+ *
+ * 这份文件由 awesun-shell 通过 `webkit_user_content_manager_add_style_sheet`
+ * 注入成**用户样式表**：每个页面、每个 frame 都生效，而且优先级高于页面自身的
+ * 普通规则 —— 正好用来盖掉那些"在 Chrome 上没事、在 WebKitGTK 上错位"的样式。
+ *
+ * 为什么单独放文件：**改规则不用重编二进制**。装插件时就铺到
+ * /etc/log/awesun/bin/webkit-patch.css，改完重启一次虚拟桌面就生效。
+ * （宿主里 install_compat_css() 读的就是它。）
+ *
+ * 每一条都写清楚"为什么加"，出问题了好判断能不能删。
+ */
+
+/* ---------------------------------------------------------------- 输入框 */
+/*
+ * 现象：输入框被拉得异常长（比它所在的表单容器还宽）。
+ *
+ * 原因：WebKit 的 UA 样式表给 input 一个基于 size 属性的**首选宽度**，
+ * 而很多后台框架（Element UI 这类）只写了 `width: 100%`，
+ * 没写 `min-width: 0`/`max-width`。在 flex/grid 容器里，
+ * 子项的 min-width 默认是 auto（按内容撑），于是 input 把容器顶宽。
+ * Chrome 对这个场景的处理和 WebKit 不一致，所以只在 WebKit 上看得见。
+ */
+input,
+textarea,
+select {
+    box-sizing: border-box !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+}
+
+/* Element UI 的输入框是套了一层的 div，撑宽通常发生在内层 */
+.el-input,
+.el-input__inner,
+.el-textarea,
+.el-textarea__inner,
+.el-select,
+.el-date-editor {
+    box-sizing: border-box !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+}
+
+/* ---------------------------------------------------------------- 布局 */
+/*
+ * 没有窗口管理器时，页面里冒出来的横向滚动条会把整页推歪；
+ * 后台是左固定侧栏 + 右内容区，横向溢出基本都是上一条引起的连锁反应。
+ */
+html,
+body {
+    max-width: 100% !important;
+    overflow-x: hidden;
+}
+
+/* flex 容器里的直接子项也允许收缩（不写这个，上面的 min-width:0 会被父级顶住） */
+[class*="flex"] > * {
+    min-width: 0;
+}
+
+/* ---------------------------------------------------------------- 表格 */
+/*
+ * 表头/表体错位：WebKit 对 `border-collapse: collapse` + 固定布局的
+ * 列宽计算和 Chrome 有细微差异，显式给 table-layout 更稳。
+ */
+.el-table table {
+    table-layout: fixed;
+}
+
+/* ---------------------------------------------------------------- 滚动条 */
+/*
+ * WebKitGTK 的覆盖式滚动条会和固定侧栏重叠。给个不占位的细滚动条。
+ */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+::-webkit-scrollbar-thumb {
+    background: rgba(144, 147, 153, 0.4);
+    border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}

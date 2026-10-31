@@ -1,0 +1,2212 @@
+#!/bin/bash
+#
+# occtl - OpenClash for iKuai (插件版) 引擎控制
+#
+# 设计说明(与示例插件 rustdemo / 框架 ikguard 的写法保持一致):
+#   * 插件本体在持久盘 /etc/mnt/plugins/openclash, 根分区每次重启还原, 因此
+#     bin/ www/ function/ 的软链由框架(lib/plugin.sh)负责, 本脚本只管"引擎"。
+#   * 所有可变数据都在 <PLUGIN_DIR>/data 下(框架升级插件时会保留该目录):
+#       data/openclash.conf   运行配置(key=value, 一行一项, 值不含空格)
+#       data/config.yaml      渲染出来的运行配置(交给 mihomo -f)
+#       data/config.custom.yaml  自定义完整配置(cfg_mode=custom 时使用)
+#       data/cache/providers/sub.yaml  订阅(Clash YAML 格式; 由 occtl 下载或页面转换后导入)
+#         (必须放在内核工作目录 data/cache 下, 否则内核的安全路径校验会拒绝)
+#       data/sub/raw.txt      订阅原文(非 Clash 格式时保留, 供页面转换)
+#       data/cache/           内核工作目录(-d): geo 数据库、provider 缓存、面板数据
+#       data/log/openclash.log 运行日志
+#       data/run/openclash.pid 进程号 + 启动时间
+#
+# 子命令(供 function/openclash 后端与 SSH 命令行共用):
+#   conf-init / conf-get <k> / conf-set <k> <v> / conf-dump
+#   setup                         建目录、geo 软链、可执行位
+#   render                        渲染 data/config.yaml
+#   rules / unrules               安装/清理透明代理与 DNS 劫持规则
+#   start / stop / restart / reload
+#   status / status-json / log [n] / doctor / ports
+#   ports                         诊断: 配置端口 vs 内核实际监听端口 + 规则状态
+#   test                          内核配置语法检查(mihomo -t)
+#   sub-update [auto|direct|converter]  下载订阅(auto=直连失败自动改走转换服务)
+#   sub-detect / sub-import <file>
+#   sub-auto                      按 sub_auto / sub_auto_h 安装或移除订阅定时更新 cron
+#   sub-auto-run                  cron 入口: 拉订阅, 有变化才重启内核(不要手动执行)
+#   log-clear                     清空运行日志(openclash.log / backend-noise / bootstrap / last-op)
+#   bypass-refresh                从内核 API 提取代理服务器 IP, 免回环
+#   api <method> <path> [body]    转发到 external-controller(页面用)
+#
+# 兼容性: 只用 bash + busybox 常见命令(curl/sed/awk/grep/iptables/ip),
+#         没有 python/ruby/lua/uci/procd 依赖。
+
+PLUGIN_DIR="${PLUGIN_DIR:-/etc/mnt/plugins/openclash}"
+DATA="$PLUGIN_DIR/data"
+SHARE="$PLUGIN_DIR/share"
+CONF="$DATA/openclash.conf"
+CACHE="$DATA/cache"
+PROV="$CACHE/providers"
+SUBDIR="$DATA/sub"
+RUNDIR="$DATA/run"
+LOGDIR="$DATA/log"
+RLOG="$LOGDIR/openclash.log"
+PIDF="$RUNDIR/openclash.pid"
+TFILE="$RUNDIR/started"
+CORE_PKG="$PLUGIN_DIR/bin/mihomo"
+CORE="$CORE_PKG"
+TEMPLATE="$SHARE/conf/template.yaml"
+CUSTOM="$DATA/config.custom.yaml"
+RENDERED="$DATA/config.yaml"
+BYPASS="$DATA/rules/bypass.ips"
+# 自定义(用户手动加的)条目放在这两个标记之间, bypass-refresh 只重建标记之上的自动段,
+# 不会再把用户加的白名单冲掉 —— 以前整份覆盖, 加了也没用。
+BYPASS_MARK_BEGIN="# --- custom begin ---"
+BYPASS_MARK_END="# --- custom end ---"
+CUSTOMRULES="$DATA/rules/custom.list"
+
+# 面板下载源(zashboard, 可选功能, 由用户在页面上手动触发)
+UI_URL="https://codeload.github.com/Zephyruso/zashboard/zip/refs/heads/gh-pages-cdn-fonts"
+# 订阅转换服务(机场域名被 DNS 污染/SNI 阻断时, 由墙外服务代取并返回标准 provider 格式)。
+# 可用配置 sub_conv 覆盖, 或用 sub_conv_enable=0 彻底关闭自动回退。
+CONV_DEFAULT="https://api.asailor.org/sub"
+UI_INNER="zashboard-gh-pages-cdn-fonts"
+DL_MIRRORS="https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/ https://github.moeyy.xyz/"
+
+NAT_CHAIN="OPENCLASH"
+MANGLE_CHAIN="OPENCLASH"
+DNS_CHAIN="OPENCLASH_DNS"
+MARK_CHAIN="OPENCLASH_MARK"
+
+# 私有/保留地址(必须直连, 不走代理)。注意不要包含 fake-ip 段 198.18.0.0/15,
+# 因为 redirect 模式下客户端访问 fake-ip 必须被 REDIRECT 进内核。
+PRIVATE_V4="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
+
+# ------------------------------------------------------------------ 通用
+
+oc_log() {
+    mkdir -p "$LOGDIR" 2>/dev/null
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$RLOG" 2>/dev/null
+    return 0
+}
+
+oc_echo() { printf '%s\n' "$*"; }
+
+oc_err() { printf '%s\n' "$*" >&2; oc_log "ERR $*"; }
+
+# JSON 字符串转义(与 ikguard 的 ikg_esc 一致: 反斜杠/引号/制表符/换行)
+oc_esc() {
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr -d '\r' | \
+    awk 'BEGIN{ORS=""} {printf "%s%s", (NR>1?"\\n":""), $0}'
+}
+
+# JSON 键值(字符串)
+oc_kv() { printf '"%s":"%s"' "$1" "$(printf '%s' "$2" | oc_esc)"; }
+
+# JSON 键值(数字, 非数字按 0)
+oc_num() {
+    case "$2" in ''|*[!0-9-]*) printf '"%s":0' "$1" ;; *) printf '"%s":%s' "$1" "$2" ;; esac
+}
+
+# sed 替换用的转义(| 为分隔符)
+oc_sedesc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+
+# URL 解码(页面把空格编码成 %20 或 +, 参数里不能直接带空格)
+oc_urldecode() {
+    printf '%b' "$(printf '%s' "$1" | sed -e 's/+/ /g' -e 's/%/\\x/g')"
+}
+
+# URL 编码: 把订阅地址作为转换服务的 url= 参数时必须编码(地址自带 & ? = 不编码会被截断)。
+#
+# 走 od 按**字节**编码, 而不是 `printf '%%%02X' "'$c"` 那种逐字符写法: 后者依赖
+# printf 对多字节字符取"首字节"的隐式行为, 在 busybox 上行为不一致(机场订阅地址可能
+# 带中文/emoji 路径)。od 是设备必备命令(doctor 里就在检查它), 按十六进制字节走最稳。
+oc_urlencode() {
+    local s="$1"
+    if have od; then
+        # 统一转小写十六进制, 与下面的 case 分支对应(%xx 大小写等价, 但统一后不易看错)
+        printf '%s' "$s" | od -An -v -tx1 | tr -d '\n' | tr ' ' '\n' | tr 'A-F' 'a-f' | {
+            while IFS= read -r hx; do
+                test -n "$hx" || continue
+                case "$hx" in
+                    # 原样保留 unreserved 字符, 其余一律 %XX
+                    41|42|43|44|45|46|47|48|49|4a|4b|4c|4d|4e|4f|\
+                    50|51|52|53|54|55|56|57|58|59|5a|\
+                    61|62|63|64|65|66|67|68|69|6a|6b|6c|6d|6e|6f|\
+                    70|71|72|73|74|75|76|77|78|79|7a|\
+                    30|31|32|33|34|35|36|37|38|39|2d|2e|5f|7e)
+                        printf '%b' "\\x$hx" ;;
+                    *) printf '%%%s' "$hx" ;;
+                esac
+            done
+        }
+        return 0
+    fi
+    # 兜底: 纯 ASCII 逐字符(od 缺失时, 多字节字符可能编码不准)
+    local out="" c i n
+    n=${#s}; i=0
+    while test "$i" -lt "$n"; do
+        c="${s:$i:1}"
+        case "$c" in
+            [A-Za-z0-9.~_-]) out="$out$c" ;;
+            *) out="$out$(printf '%%%02X' "'$c")" ;;
+        esac
+        i=$((i + 1))
+    done
+    printf '%s' "$out"
+}
+
+# ------------------------------------------------------------------ 配置
+
+cfg_defaults() {
+    cat <<'EOF'
+# OpenClash for iKuai 运行配置(由 occfg/occtl 维护, 一行一项, 值不含空格)
+enable=1
+mode=redirect
+cfg_mode=auto
+clash_mode=rule
+log_level=info
+ctrl=0.0.0.0:9090
+secret=
+mixed_port=7890
+redir_port=7892
+tproxy_port=7893
+dns_port=7874
+dns_enable=1
+dns_hijack=1
+fakeip=1
+geosite=auto
+ipv6=0
+routing_mark=6666
+fwmark=1
+route_table=100
+lan_if=
+proxy_self=1
+quic_block=1
+sub_url=
+sub_interval=0
+sub_auto=0
+sub_auto_h=12
+sub_format=
+sub_time=
+sub_conv=
+sub_conv_enable=1
+panel=1
+ui_name=zashboard
+core_auto=1
+core_dir=
+core_version=
+EOF
+}
+
+cfg_init() {
+    mkdir -p "$DATA" "$CACHE" "$PROV" "$SUBDIR" "$RUNDIR" "$LOGDIR" "$DATA/rules" 2>/dev/null
+    test -f "$CONF" || cfg_defaults > "$CONF"
+    local k v
+    cfg_defaults | while IFS='=' read -r k v; do
+        case "$k" in ''|\#*) continue ;; esac
+        grep -q "^$k=" "$CONF" 2>/dev/null || printf '%s=%s\n' "$k" "$v" >> "$CONF"
+    done
+    # 首次生成随机 secret
+    if test -z "$(cfg_get secret)"; then
+        local s
+        # 不依赖 od: 直接从 /dev/urandom 抽十六进制字符(32 位)
+        s="$(tr -dc 'a-f0-9' < /dev/urandom 2>/dev/null | head -c 32)"
+        test -n "$s" || s="$(date +%s)$RANDOM"
+        cfg_set secret "${s:0:24}"
+    fi
+    return 0
+}
+
+cfg_get() { sed -n "s/^$1=//p" "$CONF" 2>/dev/null | head -n1; }
+
+cfg_set() {
+    local k="$1" v="$2"
+    test -f "$CONF" || cfg_init
+    # 只去掉换行(一行一项); 空格保留 —— 空格由后端/页面用 %XX 编码后传入, 到这里已经解码
+    v="$(printf '%s' "$v" | tr -d '\r\n')"
+    if grep -q "^$k=" "$CONF" 2>/dev/null; then
+        sed -i "s|^$k=.*|$k=$(oc_sedesc "$v")|" "$CONF"
+    else
+        printf '%s=%s\n' "$k" "$v" >> "$CONF"
+    fi
+    # 回读校验: /etc/mnt 写满时 sed -i/追写会静默失败, 调用方却以为设置成功
+    # (踩过的坑: core_dir 没写进去 -> 内核被装到只剩 28MB 的 /etc/mnt 上)
+    if test "$(cfg_get "$k")" != "$v"; then
+        oc_log "ERR cfg_set 写入失败: $k=$v (分区可用 $(( $(free_kb "$(dirname "$CONF")") / 1024 ))MB)"
+        return 1
+    fi
+    return 0
+}
+
+cfg_dump_json() {
+    local out="{" k v first=1
+    while IFS='=' read -r k v; do
+        case "$k" in ''|\#*) continue ;; esac
+        test "$first" = 1 || out="$out,"
+        first=0
+        out="$out$(oc_kv "$k" "$v")"
+    done < "$CONF"
+    printf '%s}' "$out"
+}
+
+# ------------------------------------------------------------------ 探测
+
+core_port() { cfg_get ctrl | awk -F: '{print $NF}'; }
+
+lan_if_detect() {
+    local cfg_i wan_dev hits
+    cfg_i="$(cfg_get lan_if)"
+    test -n "$cfg_i" && { printf '%s' "$cfg_i"; return 0; }
+    # 默认网关所在网卡是 WAN, 必须排除(否则多拨/多 WAN 时 DNS 劫持会装错口)
+    wan_dev="$(ip route show default 2>/dev/null | awk '{for(j=1;j<=NF;j++) if($j=="dev") print $(j+1)}' | head -n1)"
+    # 取全部 LAN 口(逗号分隔), 而不是只取第一个 —— 多 LAN/网桥时只装一个口会导致
+    # 其余 LAN 段完全不走代理。同时排除 iKuai 的 WAN 系接口名(多拨/虚拟 WAN 也是私网地址)。
+    hits="$(ip -o -4 addr show 2>/dev/null | awk -v wdev="$wan_dev" '
+        $2 == "lo" { next }
+        $2 == wdev { next }
+        $2 ~ /^(wan|vwan|adsl|pptp|l2tp|ovpn|iked|wwan)/ { next }
+        $4 ~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ { print $2 }
+    ' | awk '!seen[$0]++ { printf "%s%s", (n++ ? "," : ""), $0 }')"
+    test -n "$hits" || hits="$(ip -o -4 addr show 2>/dev/null | awk '
+        $2 == "lo" { next }
+        $4 ~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ { print $2; exit }')"
+    printf '%s' "$hits"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# 内核是否真的在监听某个 TCP 端口。
+#
+# 必须同时查 tcp 和 tcp6: 渲染模板里写的是 `bind-address: '*'`, Go 的 net 在
+# dual-stack 上会绑成 IPv6 通配(`:::PORT`), 此时条目只出现在 /proc/net/tcp6。
+# 老实现只 grep /proc/net/tcp, 于是"内核明明在监听"却判定未监听 ->
+# rules_apply 在安全前置处直接 return 1 -> 透明代理规则/DNS 劫持全部装不上,
+# 页面上永久显示「透明代理规则: 未安装」, 而且报错被调用方吞掉, 用户完全看不到原因。
+listen_ok() {
+    local h
+    h="$(printf '%04X' "$1" 2>/dev/null)"
+    # 端口不合法(空/非数字)时不要误判成"在监听"
+    test -n "$h" || return 1
+    grep -qi ":$h " /proc/net/tcp  2>/dev/null && return 0
+    grep -qi ":$h " /proc/net/tcp6 2>/dev/null && return 0
+    return 1
+}
+
+# 列出内核当前实际监听的端口(用于把"为什么规则装不上"讲清楚)
+listen_ports() {
+    local f l hex
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        test -r "$f" || continue
+        while read -r l; do
+            hex="$(printf '%s' "$l" | awk '{print $2}' | awk -F: '{print $2}')"
+            case "$hex" in ''|*[!0-9A-Fa-f]*) continue ;; esac
+            printf '%d ' "$((0x$hex))" 2>/dev/null
+        done < "$f"
+    done
+}
+
+has_tproxy() {
+    iptables -t mangle -N OC_TPROXY_TEST 2>/dev/null
+    if iptables -t mangle -A OC_TPROXY_TEST -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port 1 2>/dev/null; then
+        iptables -t mangle -F OC_TPROXY_TEST 2>/dev/null
+        iptables -t mangle -X OC_TPROXY_TEST 2>/dev/null
+        return 0
+    fi
+    iptables -t mangle -F OC_TPROXY_TEST 2>/dev/null
+    iptables -t mangle -X OC_TPROXY_TEST 2>/dev/null
+    return 1
+}
+
+tun_ok() {
+    test -c /dev/net/tun && return 0
+    have modprobe && modprobe tun 2>/dev/null
+    test -c /dev/net/tun && return 0
+    return 1
+}
+
+core_alive() {
+    local p
+    p="$(cat "$PIDF" 2>/dev/null)"
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    # PID 文件在持久分区, 重启后 PID 可能被别的进程复用 —— 必须核对 cmdline,
+    # 否则会误杀无辜进程(甚至 iKuai 自己的服务)
+    test -r "/proc/$p/cmdline" || return 1
+    grep -qa 'mihomo' "/proc/$p/cmdline" 2>/dev/null || return 1
+    grep -qa -- "$CACHE" "/proc/$p/cmdline" 2>/dev/null || return 1
+    printf '%s' "$p"
+    return 0
+}
+
+# 快速探活(2 秒): 内核挂死时不能让 status/表单保存卡 8 秒×N 次
+api_ping() {
+    local p s
+    p="$(core_port)"; s="$(cfg_get secret)"
+    curl -sf -m 2 -H "Authorization: Bearer $s" "http://127.0.0.1:$p/version" 2>/dev/null | grep -q '"version"'
+}
+
+api_alive() { api_ping; }
+
+oc_curl_api() {
+    local method="$1" path="$2" body="$3" p s url
+    p="$(core_port)"
+    s="$(cfg_get secret)"
+    url="http://127.0.0.1:$p$path"
+    if test -n "$body"; then
+        curl -sf -m 5 -X "$method" -H "Authorization: Bearer $s" \
+            -H 'Content-Type: application/json' -d "$body" "$url" 2>/dev/null
+    else
+        curl -sf -m 5 -X "$method" -H "Authorization: Bearer $s" "$url" 2>/dev/null
+    fi
+}
+
+# ------------------------------------------------------------------ geo / UI
+
+# 插件分区放不下内核时(常见: iKuai /etc/mnt 只有 40~50MB), 自动把内核目录
+# 指到更大的持久分区 —— 只在"首次安装内核之前"判断, 且用户没手动指定过 core_dir。
+auto_core_dir() {
+    local cur here f kb chosen="" chosen_kb=0
+    cur="$(cfg_get core_dir)"
+    test -n "$cur" && return 0          # 用户已指定, 尊重用户
+    test -x "$CORE" && return 0         # 插件目录里已经有内核(完整包), 不动
+    here="$(free_kb "$PLUGIN_DIR")"
+    case "$here" in ''|*[!0-9]*) return 0 ;; esac
+    test "$here" -lt $((150 * 1024)) || return 0   # 插件分区够大就不折腾
+    # 按优先顺序挑第一个可用 >500MB 的持久分区:
+    #   /etc/log(框架自己的持久分区, 路径稳定) -> /etc/disk/*(iKuai 数据盘, 按 UUID 挂载)
+    for f in /etc/log /etc/disk/*; do
+        test -d "$f" || continue
+        kb="$(free_kb "$f")"
+        case "$kb" in ''|*[!0-9]*) continue ;; esac
+        if test "$kb" -gt $((500 * 1024)); then chosen="$f"; chosen_kb="$kb"; break; fi
+    done
+    if test -n "$chosen"; then
+        cfg_set core_dir "$chosen/openclash"
+        oc_log "自动选择内核目录: $chosen/openclash (插件分区仅 $((here / 1024)) MB 可用, 该分区可用 $((chosen_kb / 1024)) MB)"
+    fi
+    return 0
+}
+
+# 内核允许读取的路径: 插件内 share/ 加上"数据目录的真实位置"。
+# 后者是为 ikstorage 扩容准备的: data/cache 被换成软链后(指向普通存储),
+# 如果内核的安全路径检查解析了软链, 只写插件内路径会被拒绝。
+oc_safe_paths() {
+    local p="$PLUGIN_DIR/share" r
+    r="$(readlink -f "$CACHE" 2>/dev/null)"
+    test -n "$r" && test "$r" != "$CACHE" && p="$p $r"
+    r="$(readlink -f "$DATA" 2>/dev/null)"
+    test -n "$r" && test "$r" != "$DATA" && p="$p $r"
+    printf '%s' "$p"
+}
+
+# geo 数据是否可用(踩过的坑: 残留的 GeoSite.dat 是半个文件/错误页, 内核报
+# "proto: cannot parse invalid wireformat data", 删掉后又会去 GitHub 下载并超时 90 秒)
+geo_ok() {
+    local f="$1" sz first
+    test -f "$f" || return 1
+    sz="$(wc -c < "$f" 2>/dev/null)"
+    case "$sz" in ''|*[!0-9]*) return 1 ;; esac
+    case "$(basename "$f")" in
+        GeoSite.dat)
+            test "$sz" -gt 100000 || return 1                      # 正常约 11MB
+            # v2ray geosite 是 protobuf: GeoSiteList 的字段标签必须是 0x0a。
+            # 只比大小挡不住"截断/半截下载", 而截断文件会让内核报
+            # "proto: cannot parse invalid wireformat data" 并联网重下(卡 90 秒)
+            # 首字节必须是 0x0a(GeoSiteList 的 protobuf 标签)。
+            # 不能依赖 od: 部分 iKuai 固件没编译 od(busybox 也没有), hexdump 也不支持 -e,
+            # 会让本函数恒失败 -> GEOSITE 规则与 nameserver-policy 被整段丢弃
+            # (实测就是这样翻车的: 只剩 GeoIP(cn), 域名解析还会走不可达的 fallback DoH)。
+            # 0x0a 就是换行, 而 grep -q . 匹配不到换行 -> 用它判断"首字节是不是换行"。
+            if head -c 1 "$f" 2>/dev/null | grep -q .; then return 1; fi
+            ;;
+        Country.mmdb)
+            test "$sz" -gt 1000 || return 1                        # 正常约 260KB
+            grep -qa 'MaxMind.com' "$f" 2>/dev/null || return 1    # mmdb 的元数据标记
+            ;;
+        *) test "$sz" -gt 1000 || return 1 ;;
+    esac
+    # HTML/JSON 错误页: mihomo/镜像出错时会存成这种东西
+    # 用 od 而不是 $(head -c1)(二进制首字节是 NUL 时 bash 会打 "ignored null byte in input")
+    # 同样不依赖 od: 直接看首字符是不是 HTML/JSON 的开头
+    case "$(head -c 1 "$f" 2>/dev/null | tr -d '\000')" in
+        '<'|'{'|'[') return 1 ;;
+    esac
+    return 0
+}
+
+# 有效的 geo 文件路径: 优先内核工作目录(data/cache, 可由 geo-fetch 写入/替换,
+# 且不受插件包 MANIFEST 校验约束), 其次包内 share/geo。
+# 这条规则很重要: 完整包的 GeoSite.dat 是被 MANIFEST 列出的, 任何改名/覆盖都会让
+# 框架在下次开机校验失败并跳过整个插件。
+geo_path() {
+    local n
+    n="$(basename "$1")"
+    if test -e "$CACHE/$n"; then printf '%s' "$CACHE/$n"; else printf '%s' "$SHARE/geo/$n"; fi
+}
+
+# 内核只读工作目录($CACHE), 所以判定"规则能不能写 GEOSITE"必须看工作目录里
+# 是否真有可用文件 —— 没有就把包内的复制/软链过去(否则内核会联网下载并卡 90 秒)
+geo_active_ok() {
+    local n f
+    n="$(basename "$1")"
+    f="$CACHE/$n"
+    if ! geo_ok "$f"; then
+        if geo_ok "$SHARE/geo/$n"; then
+            ln -sf "$SHARE/geo/$n" "$f" 2>/dev/null || cp -f "$SHARE/geo/$n" "$f" 2>/dev/null
+        fi
+    fi
+    geo_ok "$f"
+}
+
+# 清理坏的 geo 文件: 包内文件若被 MANIFEST 收录则"只撤软链不改文件"(否则开机校验失败),
+# 工作目录里的坏文件直接删掉。
+geo_sanitize() {
+    local f n
+    for f in "$SHARE/geo/GeoSite.dat" "$SHARE/geo/Country.mmdb"; do
+        n="$(basename "$f")"
+        if test -f "$f" && ! geo_ok "$f"; then
+            if grep -q "^Name: share/geo/$n\$" "$PLUGIN_DIR/MANIFEST.MF" 2>/dev/null; then
+                oc_log "geo 数据无效但被 MANIFEST 收录, 保持原文件不动(仅停用): $f"
+            else
+                oc_log "geo 数据无效, 已隔离留证: $f -> $f.bad ($(wc -c < "$f" 2>/dev/null) 字节)"
+                mv -f "$f" "$f.bad" 2>/dev/null
+            fi
+            # 只撤自己建的软链, 不要删用户/geo-fetch 放进工作目录的有效文件
+            test -L "$CACHE/$n" && rm -f "$CACHE/$n" 2>/dev/null
+        fi
+    done
+    # 工作目录里残留的坏文件直接删(不在 MANIFEST 里)
+    for f in "$CACHE/GeoSite.dat" "$CACHE/geosite.dat" "$CACHE/Country.mmdb"; do
+        test -e "$f" || continue
+        test -L "$f" && continue
+        if ! geo_ok "$f"; then
+            oc_log "删除工作目录里的无效 geo 文件: $f ($(wc -c < "$f" 2>/dev/null) 字节)"
+            rm -f "$f" 2>/dev/null
+        fi
+    done
+    return 0
+}
+
+setup() {
+    cfg_init
+    mkdir -p "$CACHE" "$PROV" "$SUBDIR" "$RUNDIR" "$LOGDIR" "$DATA/rules" 2>/dev/null
+    chmod +x "$PLUGIN_DIR/bin/"* 2>/dev/null
+    chmod +x "$PLUGIN_DIR/function/"* 2>/dev/null
+    # geo 数据库: 内核从 -d 目录(即 $CACHE)读取 Country.mmdb / GeoSite.dat
+    geo_sanitize
+    local f b
+    for f in "$SHARE"/geo/*.mmdb "$SHARE"/geo/*.dat "$SHARE"/geo/*.metadb; do
+        test -f "$f" || continue
+        geo_ok "$f" || continue
+        b="$(basename "$f")"
+        # 工作目录里已有真实文件(例如 geo-fetch 下的)就不要用软链覆盖
+        test -e "$CACHE/$b" && test ! -L "$CACHE/$b" && continue
+        ln -sf "$f" "$CACHE/$b" 2>/dev/null
+    done
+    # 面板: $CACHE/ui 是工作目录里的真实目录; 包内自带的面板用软链挂进来,
+    # 下载的面板直接写进 $CACHE/ui(不碰包内文件 —— 否则下次开机 MANIFEST 校验失败,
+    # 框架会跳过整个插件, 表现为"能上网但插件页全废")
+    mkdir -p "$CACHE/ui" 2>/dev/null
+    if test -d "$SHARE/ui/zashboard" && test ! -e "$CACHE/ui/zashboard"; then
+        ln -sfn "$SHARE/ui/zashboard" "$CACHE/ui/zashboard" 2>/dev/null
+    fi
+    # 自定义规则文件占位
+    test -f "$CUSTOMRULES" || : > "$CUSTOMRULES"
+    test -f "$BYPASS" || : > "$BYPASS"
+    # 兼容旧版本: 订阅文件原先放 data/providers/, 现在必须在 data/cache/providers/
+    # (内核只允许读工作目录内的路径), 升级时自动搬过去
+    if test -f "$DATA/providers/sub.yaml" && test ! -f "$PROV/sub.yaml"; then
+        mkdir -p "$PROV" 2>/dev/null
+        if mv -f "$DATA/providers/sub.yaml" "$PROV/sub.yaml" 2>/dev/null; then
+            oc_log "已把订阅文件迁移到 $PROV/sub.yaml"
+        fi
+    fi
+    # 内核目录自动选址(插件分区太小时改到 /etc/log)
+    auto_core_dir
+    return 0
+}
+
+# ------------------------------------------------------------------ 渲染
+
+template_value() {
+    # $1 = 模板里的占位符名, $2 = 值
+    printf '%s' "$2" | sed -e 's/[\\&|"]/\\&/g'
+}
+
+render() {
+    setup
+    local mode cfg_mode fake dnsmode tpl v6
+    mode="$(cfg_get mode)"
+    cfg_mode="$(cfg_get cfg_mode)"
+    fake="$(cfg_get fakeip)"
+    tpl="$TEMPLATE"
+
+    # YAML 布尔值必须是 true/false —— conf 里的开关是 0/1, 这里显式换算
+    # (踩过的坑: 直接渲染成 `ipv6: 0` 会让内核报 "cannot unmarshal !!int 0 into bool")
+    case "$(cfg_get ipv6)" in 1|true|yes|on) v6="true" ;; *) v6="false" ;; esac
+
+    if test "$cfg_mode" = "custom"; then
+        if test -f "$CUSTOM"; then
+            cp -f "$CUSTOM" "$RENDERED"
+            oc_echo "已使用自定义配置: $CUSTOM -> $RENDERED"
+            return 0
+        fi
+        oc_err "cfg_mode=custom 但缺少 $CUSTOM, 回退到模板模式"
+    fi
+
+    test -f "$tpl" || { oc_err "缺少模板: $tpl"; return 1; }
+
+    # DNS 工作模式
+    if test "$fake" = "1"; then dnsmode="fake-ip"; else dnsmode="redir-host"; fi
+
+    # provider 段
+    local providers groups sub_url sub_format
+    sub_url="$(cfg_get sub_url)"
+    sub_format="$(cfg_get sub_format)"
+    providers=""
+    groups=""
+    if test -f "$PROV/sub.yaml" && test "$cfg_mode" != "url"; then
+        providers="proxy-providers:
+  ocsub:
+    type: file
+    path: $PROV/sub.yaml
+    health-check: {enable: true, url: 'https://www.gstatic.com/generate_204', interval: 300}"
+    elif test -n "$sub_url" && { test "$cfg_mode" = "url" || test "$sub_format" = "yaml"; }; then
+        # 双引号 + 转义: 订阅地址里带引号不会破坏 YAML
+        local sub_esc
+        sub_esc="$(printf '%s' "$sub_url" | sed -e 's/[\\"]/\\&/g')"
+        providers="proxy-providers:
+  ocsub:
+    type: http
+    url: \"$sub_esc\"
+    path: $PROV/sub.yaml
+    interval: $(cfg_get sub_interval)
+    health-check: {enable: true, url: 'https://www.gstatic.com/generate_204', interval: 300}"
+    fi
+
+    if test -n "$providers"; then
+        groups="proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    use: [ocsub]
+    proxies: [♻️ 自动选择, DIRECT]
+  - name: ♻️ 自动选择
+    type: url-test
+    use: [ocsub]
+    url: 'http://www.gstatic.com/generate_204'
+    interval: 300
+    tolerance: 50
+  - name: 🎯 全球直连
+    type: select
+    proxies: [DIRECT, 🚀 节点选择]
+  - name: 🐟 漏网之鱼
+    type: select
+    proxies: [🚀 节点选择, DIRECT, 🎯 全球直连]"
+    else
+        groups="proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies: [DIRECT]
+  - name: 🎯 全球直连
+    type: select
+    proxies: [DIRECT]
+  - name: 🐟 漏网之鱼
+    type: select
+    proxies: [DIRECT]"
+    fi
+
+    # rules 段: 只在 geo 数据"确实可用"时才写对应规则。
+    # 关键: 规则里出现 GEOSITE 而数据缺失/损坏时, 内核会自己删文件并联网下载,
+    # 在墙内必然超时(90 秒)导致整个配置检查失败 —— 所以这里必须严格判断。
+    # conf geosite=1 强制启用 / =0 强制关闭 / =auto(默认) 按数据可用性决定。
+    local rules hg=0 hm=0 gs_mode
+    gs_mode="$(cfg_get geosite)"
+    geo_active_ok GeoSite.dat && hg=1
+    geo_active_ok Country.mmdb && hm=1
+    case "$gs_mode" in
+        1|true|yes|on)  hg=1 ;;
+        0|false|no|off) hg=0 ;;
+    esac
+    rules="rules:"
+    if test "$hg" = 1; then
+        rules="$rules
+  - GEOSITE,category-ads-all,REJECT
+  - GEOSITE,private,DIRECT"
+    fi
+    if test "$hm" = 1; then
+        rules="$rules
+  - GEOIP,private,DIRECT,no-resolve"
+    fi
+    if test "$hg" = 1; then
+        rules="$rules
+  - GEOSITE,cn,🎯 全球直连"
+    fi
+    if test "$hm" = 1; then
+        rules="$rules
+  - GEOIP,CN,🎯 全球直连"
+    fi
+    if test "$hg" = 0 && test "$hm" = 0; then
+        rules="$rules
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve"
+    fi
+    if test -s "$CUSTOMRULES"; then
+        rules="$rules
+$(grep -v '^[[:space:]]*$' "$CUSTOMRULES" | grep -v '^[[:space:]]*#' | sed 's/^/  - /')"
+    fi
+    rules="$rules
+  - MATCH,🐟 漏网之鱼"
+
+    # DNS 段的 geo 引用与 rules 同样必须按数据可用性降级:
+    #   nameserver-policy 里出现 geosite: 就会迫使内核加载 GeoSite.dat,
+    #   数据缺失时内核自己去 GitHub 下载, 墙内必然 TLS 超时(10 秒) ->
+    #   整个配置检查失败 -> 内核起不来(踩过的坑: geosite=auto 已降级,
+    #   但 DNS 段仍引用 geosite, 表现为"规则显示已降级但内核就是启动不了")。
+    #   fallback-filter 的 geoip 依赖 Country.mmdb, 同理。
+    local ns_policy fb_geoip
+    if test "$hg" = "1"; then
+        ns_policy="  nameserver-policy:
+    'geosite:cn,private':
+      - 223.5.5.5
+      - 119.29.29.29"
+    else
+        ns_policy="  # GeoSite 数据缺失, nameserver-policy 已停用(引用 geosite 会迫使内核联网下载并超时)"
+    fi
+    if test "$hm" = "1"; then fb_geoip="true"; else fb_geoip="false"; fi
+
+    local tun_enable
+    if test "$mode" = "tun"; then tun_enable="true"; else tun_enable="false"; fi
+
+    if ! sed \
+        -e "s|__MIXED_PORT__|$(template_value x "$(cfg_get mixed_port)")|g" \
+        -e "s|__REDIR_PORT__|$(template_value x "$(cfg_get redir_port)")|g" \
+        -e "s|__TPROXY_PORT__|$(template_value x "$(cfg_get tproxy_port)")|g" \
+        -e "s|__MODE__|$(template_value x "$(cfg_get clash_mode)")|g" \
+        -e "s|__LOG_LEVEL__|$(template_value x "$(cfg_get log_level)")|g" \
+        -e "s|__IPV6__|$v6|g" \
+        -e "s|__CTRL__|$(template_value x "$(cfg_get ctrl)")|g" \
+        -e "s|__SECRET__|$(template_value x "$(cfg_get secret)")|g" \
+        -e "s|__DNS_PORT__|$(template_value x "$(cfg_get dns_port)")|g" \
+        -e "s|__DNS_MODE__|$(template_value x "$dnsmode")|g" \
+        -e "s|__MARK__|$(template_value x "$(cfg_get routing_mark)")|g" \
+        -e "s|__TUN_ENABLE__|$tun_enable|g" \
+        -e "s|__FB_GEOIP__|$fb_geoip|g" \
+        -e "s|__UI_DIR__|$CACHE/ui|g" \
+        -e "s|__UI_NAME__|$(template_value x "$(cfg_get ui_name)")|g" \
+        "$tpl" > "$RENDERED.tmp" 2>"$LOGDIR/render.err"; then
+        oc_err "渲染失败(sed): $(head -n 3 "$LOGDIR/render.err" 2>/dev/null | tr '\n' ' ')"
+        return 1
+    fi
+    if test ! -s "$RENDERED.tmp"; then
+        oc_err "渲染失败: 模板处理结果为空(模板 $tpl 是否存在?)"
+        return 1
+    fi
+
+    # provider / 代理组 / 规则是整段替换。这里用纯 shell 逐行处理(不用 awk):
+    # 不依赖外部 awk 的行为差异, 出错也能定位到具体是哪一段。
+    local line
+    : > "$RENDERED"
+    while IFS= read -r line || test -n "$line"; do
+        case "$line" in
+            "__PROVIDERS__")    test -n "$providers" && printf '%s\n' "$providers" ;;
+            "__PROXY_GROUPS__") printf '%s\n' "$groups" ;;
+            "__RULES__")        printf '%s\n' "$rules" ;;
+            "__NS_POLICY__")    printf '%s\n' "$ns_policy" ;;
+            *)                  printf '%s\n' "$line" ;;
+        esac
+    done < "$RENDERED.tmp" >> "$RENDERED"
+    rm -f "$RENDERED.tmp"
+    if test ! -s "$RENDERED"; then
+        oc_err "渲染失败: 输出为空($RENDERED)"
+        return 1
+    fi
+    oc_echo "已生成运行配置: $RENDERED ($(wc -l < "$RENDERED" 2>/dev/null) 行)"
+    return 0
+}
+
+# ------------------------------------------------------------------ 规则
+
+rules_private() {
+    # $1 = 表(nat|mangle), $2 = 链
+    local t="$1" c="$2" net mark
+    mark="$(cfg_get routing_mark)"
+    iptables -t "$t" -A "$c" -m mark --mark "$mark" -j RETURN 2>/dev/null
+    # 目标是"本机自己"的流量一律不代理 —— 含公网 WAN IP 与端口映射回环。
+    # 少了这条: 路由器上跑的 nps/npc 等服务连自己的公网地址时会被 REDIRECT 进 clash,
+    # 实测 npc 日志是 write tcp ...->198.18.0.x(fake-ip): connection reset by peer,
+    # 表现就是"外网客户端连不上"。PRIVATE_V4 只覆盖私网, 公网 WAN IP 漏了。
+    iptables -t "$t" -A "$c" -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null
+    for net in $PRIVATE_V4; do
+        iptables -t "$t" -A "$c" -d "$net" -j RETURN 2>/dev/null
+    done
+    while read -r net; do
+        case "$net" in ''|\#*) continue ;; esac
+        iptables -t "$t" -A "$c" -d "$net" -j RETURN 2>/dev/null
+    done < "$BYPASS"
+}
+
+# 把 -j $chain 装进 PREROUTING, 并限定为 LAN 口(与 DNS 劫持的做法保持一致)。
+# 历史 bug: 这里曾不加 -i, 于是把 WAN 入站流量也劫进 clash —— iKuai 自己的端口映射
+# 链 NATRULE_DNAT 排在后面, 一旦被前面的 REDIRECT 吃掉就再也轮不到它, 结果是
+# 端口映射失效、nps 一类对外服务从外网连不上。
+rules_install_prerouting() {
+    local tbl="$1" proto="$2" chain="$3" pos="$4" lans="$5" one
+    for one in ${lans:-ALL}; do
+        if test "$one" = "ALL"; then
+            oc_log "WARN 未识别到 LAN 网卡, 透明代理只能不限接口安装(可能影响 WAN 入站服务与端口映射)"
+            iptables -t "$tbl" -C PREROUTING -p "$proto" -j "$chain" 2>/dev/null || \
+                iptables -t "$tbl" -I PREROUTING "$pos" -p "$proto" -j "$chain" 2>/dev/null
+        else
+            iptables -t "$tbl" -C PREROUTING -i "$one" -p "$proto" -j "$chain" 2>/dev/null || \
+                iptables -t "$tbl" -I PREROUTING "$pos" -i "$one" -p "$proto" -j "$chain" 2>/dev/null
+        fi
+    done
+    return 0
+}
+
+# 记录"上一次规则安装失败的原因", 供页面直接显示 —— 以前原因只进日志,
+# 用户看到「未安装」却不知道为什么, 只能猜。
+RRFILE="$RUNDIR/rules-reason"
+rules_note() { printf '%s' "$1" > "$RRFILE" 2>/dev/null; }
+
+# ---------------------------------------------------------------- WAN 端口防护
+# allow-lan: true + bind-address: '*' 时, 内核的 mixed/控制/DNS 端口监听在 0.0.0.0,
+# 也就**公网可达**。外部扫描器连上 7890 后, 内核按 GeoIP(cn) 把它判成 DIRECT,
+# 于是又回连自己的 7890 -> 自我递归, 每层吃掉一个 fd, 很快 "too many open files"
+# 打死整个内核(实测日志里出现过 12 万次 EMFILE)。
+# 所以这里只允许 LAN 侧访问这些端口, WAN 入方向直接 DROP。
+#
+# 为什么不用 allow-lan: false / bind 127.0.0.1 来达成同样目的:
+#   REDIRECT 在 PREROUTING 会把目标改写成**入接口的地址**(如 192.168.1.1),
+#   内核若只监听 127.0.0.1, LAN 侧就没人接 -> 直接断网(踩过)。
+OC_WAN_PORTS="7890 7891 7892 7893 7874 9090"
+
+wan_ifaces() {
+    {
+        ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'
+        ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^(ppp|wan|adsl|vwan)'
+    } | sort -u | tr '\n' ' '
+}
+
+wan_guard_apply() {
+    local i p
+    have iptables || return 0
+    for i in $(wan_ifaces); do
+        for p in $OC_WAN_PORTS; do
+            iptables -C INPUT -i "$i" -p tcp --dport "$p" -j DROP 2>/dev/null || \
+                iptables -I INPUT 1 -i "$i" -p tcp --dport "$p" -j DROP 2>/dev/null
+        done
+        iptables -C INPUT -i "$i" -p udp --dport 7874 -j DROP 2>/dev/null || \
+            iptables -I INPUT 1 -i "$i" -p udp --dport 7874 -j DROP 2>/dev/null
+    done
+    return 0
+}
+
+wan_guard_remove() {
+    local i p
+    have iptables || return 0
+    for i in $(wan_ifaces); do
+        for p in $OC_WAN_PORTS; do
+            while iptables -D INPUT -i "$i" -p tcp --dport "$p" -j DROP 2>/dev/null; do :; done
+        done
+        while iptables -D INPUT -i "$i" -p udp --dport 7874 -j DROP 2>/dev/null; do :; done
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------- 禁用 QUIC(UDP 443)
+# redirect 模式只代理 TCP, 而现代浏览器默认先试 QUIC(UDP 443)。配合 fake-ip 时,
+# QUIC 包发往 198.18.x.x(只在核心里存在的假地址)必然不可达, 浏览器只能等超时再回落
+# TCP —— 每个新站点都白等一下, 这是"感觉慢"的主要来源(比模式选择影响大得多)。
+# 这里用 REJECT(而不是 DROP)立刻回一个"端口不可达", 浏览器马上回落 TCP:
+# 提速 + 零额外开销, 也不必改代理模式(换 tun 走用户态栈, 开销大得多)。
+# 与 OpenClash 界面的「禁用 QUIC」是同一件事。
+QC_CHAIN="OPENCLASH_QUIC"
+
+quic_guard_apply() {
+    local i lan
+    have iptables || return 0
+    # 关闭透明代理时也一并撤掉(没有代理就没必要拦 QUIC);
+    # 配置项缺失时按"启用"处理(cfg_init 之前调用也安全)
+    case "$(cfg_get mode)" in off) quic_guard_remove; return 0 ;; esac
+    case "$(cfg_get quic_block)" in 0|false|no|off) quic_guard_remove; return 0 ;; esac
+
+    iptables -N "$QC_CHAIN" 2>/dev/null
+    iptables -F "$QC_CHAIN" 2>/dev/null
+    iptables -A "$QC_CHAIN" -p udp --dport 443 -j REJECT 2>/dev/null
+    lan="$(lan_if_detect)"
+    for i in ${lan:-ALL}; do
+        if test "$i" = "ALL"; then
+            iptables -C FORWARD -p udp --dport 443 -j "$QC_CHAIN" 2>/dev/null || \
+                iptables -I FORWARD 1 -p udp --dport 443 -j "$QC_CHAIN" 2>/dev/null
+        else
+            iptables -C FORWARD -i "$i" -p udp --dport 443 -j "$QC_CHAIN" 2>/dev/null || \
+                iptables -I FORWARD 1 -i "$i" -p udp --dport 443 -j "$QC_CHAIN" 2>/dev/null
+        fi
+    done
+    return 0
+}
+
+quic_guard_remove() {
+    have iptables || return 0
+    rules_del_jumps_to filter "$QC_CHAIN"
+    iptables -F "$QC_CHAIN" 2>/dev/null
+    iptables -X "$QC_CHAIN" 2>/dev/null
+    return 0
+}
+
+rules_apply() {
+    local mode mark lan dns_port redir_port tproxy_port dns_ok=1
+    mode="$(cfg_get mode)"
+    mark="$(cfg_get routing_mark)"
+    lan="$(lan_if_detect)"
+    lan="$(printf '%s' "$lan" | tr ',' ' ')"
+    dns_port="$(cfg_get dns_port)"
+    redir_port="$(cfg_get redir_port)"
+    tproxy_port="$(cfg_get tproxy_port)"
+
+    have iptables || { oc_err "缺少 iptables, 无法安装规则"; return 1; }
+
+    # ---- 安全前置: 内核不在 / 没监听目标端口时绝不装规则 --------------------
+    # "规则已装但内核不在"= 流量被 REDIRECT 到没人监听的端口 = 整网断网。
+    # 页面上的「重新安装规则」按钮可以在内核已停时被点, 必须在这里拦住。
+    if ! core_alive >/dev/null; then
+        rules_note "内核未运行"
+        oc_err "内核未运行, 拒绝安装透明代理规则(否则会断网)"
+        return 1
+    fi
+    case "$mode" in
+        redirect)
+            if ! listen_ok "$redir_port"; then
+                rules_note "内核未监听 redir_port=$redir_port(实际监听: $(listen_ports))"
+                oc_err "内核未监听 redir_port=$redir_port, 拒绝安装规则(装了会断网)"
+                oc_err "内核实际监听端口: $(listen_ports)"
+                oc_err "排查: ①内核可能还在加载 geo/规则, 等 10 秒后重试或点「重启内核」;"
+                oc_err "      ②运行 occtl ports 与 occtl conf-get redir_port 比对;"
+                oc_err "      ③自定义配置(cfg_mode=custom)里要有 redir-port: $redir_port"
+                return 1
+            fi ;;
+        tproxy)
+            if ! listen_ok "$tproxy_port"; then
+                rules_note "内核未监听 tproxy_port=$tproxy_port(实际监听: $(listen_ports))"
+                oc_err "内核未监听 tproxy_port=$tproxy_port, 拒绝安装规则(装了会断网)"
+                oc_err "内核实际监听端口: $(listen_ports)"
+                oc_err "排查: 确认配置里有 tproxy-port: $tproxy_port, 并运行 occtl ports"
+                return 1
+            fi ;;
+    esac
+    if ! listen_ok "$dns_port"; then
+        oc_log "WARN 内核未监听 DNS 端口 $dns_port, 本次跳过 DNS 劫持(避免 LAN DNS 黑洞)"
+        dns_ok=0
+    fi
+    # custom 模式下配置由用户提供: 内核可能根本没 listen 我们的端口, 明确告警
+    if test "$(cfg_get cfg_mode)" = "custom" && grep -q "^ *listen:" "$RENDERED" 2>/dev/null; then
+        grep -qE "^ *listen:.*:$(cfg_get dns_port)\$" "$RENDERED" 2>/dev/null || {
+            oc_log "WARN custom 配置里的 dns.listen 与 conf 的 $dns_port 不一致, DNS 劫持可能打空"
+            dns_ok=0
+        }
+    fi
+
+    # --- DNS 劫持(LAN 侧 53 端口 -> 内核 DNS), 与模式无关, 可单独关闭
+    if test "$dns_ok" = "1" && test "$(cfg_get dns_hijack)" = "1" && test "$(cfg_get dns_enable)" = "1"; then
+        iptables -t nat -N "$DNS_CHAIN" 2>/dev/null
+        iptables -t nat -F "$DNS_CHAIN"
+        iptables -t nat -A "$DNS_CHAIN" -m mark --mark "$mark" -j RETURN 2>/dev/null
+        iptables -t nat -A "$DNS_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$dns_port" 2>/dev/null
+        iptables -t nat -A "$DNS_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports "$dns_port" 2>/dev/null
+        local i
+        for i in ${lan:-ALL}; do
+            if test "$i" = "ALL"; then
+                iptables -t nat -C PREROUTING -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null || \
+                    iptables -t nat -I PREROUTING 1 -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null
+                iptables -t nat -C PREROUTING -p tcp --dport 53 -j "$DNS_CHAIN" 2>/dev/null || \
+                    iptables -t nat -I PREROUTING 1 -p tcp --dport 53 -j "$DNS_CHAIN" 2>/dev/null
+            else
+                iptables -t nat -C PREROUTING -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null || \
+                    iptables -t nat -I PREROUTING 1 -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null
+                iptables -t nat -C PREROUTING -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" 2>/dev/null || \
+                    iptables -t nat -I PREROUTING 1 -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" 2>/dev/null
+            fi
+        done
+        oc_log "DNS 劫持已安装(LAN=${lan:-ALL} -> 127.0.0.1:$dns_port)"
+    else
+        rules_remove_dns
+    fi
+
+    # --- 透明代理
+    case "$mode" in
+        redirect)
+            iptables -t nat -N "$NAT_CHAIN" 2>/dev/null
+            iptables -t nat -F "$NAT_CHAIN"
+            rules_private nat "$NAT_CHAIN"
+            iptables -t nat -A "$NAT_CHAIN" -p tcp -j REDIRECT --to-ports "$redir_port" 2>/dev/null
+            rules_install_prerouting nat tcp "$NAT_CHAIN" 2 "$lan"
+            if test "$(cfg_get proxy_self)" = "1"; then
+                iptables -t nat -C OUTPUT -p tcp -j "$NAT_CHAIN" 2>/dev/null || \
+                    iptables -t nat -I OUTPUT 1 -p tcp -j "$NAT_CHAIN" 2>/dev/null
+            fi
+            rules_remove_tproxy
+            oc_log "透明代理(redirect/TCP)已安装 -> 127.0.0.1:$redir_port"
+            ;;
+        tproxy)
+            if ! has_tproxy; then
+                oc_err "内核/iptables 不支持 TPROXY, 请改用 redirect 或 tun 模式"
+                rules_remove_dns   # 关键: DNS 链已在上面装好, 失败必须回滚, 否则 LAN DNS 全黑洞
+                return 1
+            fi
+            if ! have ip; then
+                oc_err "缺少 ip 命令, 无法配置 TPROXY 策略路由"
+                rules_remove_dns
+                return 1
+            fi
+            local fwm tbl net
+            fwm="$(cfg_get fwmark)"; tbl="$(cfg_get route_table)"
+            ip rule show 2>/dev/null | grep -q "fwmark 0x$(printf '%x' "$fwm") lookup $tbl" || \
+                ip rule add fwmark "$fwm" lookup "$tbl" 2>/dev/null
+            ip route show table "$tbl" 2>/dev/null | grep -q "local 0.0.0.0/0 dev lo" || \
+                ip route add local 0.0.0.0/0 dev lo table "$tbl" 2>/dev/null
+            # 私有/保留网段 throw 掉(不进本机), 并规避 src_valid_mark=1 时的
+            # martian 静默丢包 —— 这段逻辑来自 OpenClash init.d:36-52, 必须保留
+            for net in $PRIVATE_V4; do
+                ip route show table "$tbl" 2>/dev/null | grep -q "throw $net" || \
+                    ip route add throw "$net" table "$tbl" 2>/dev/null
+            done
+            iptables -t mangle -N "$MANGLE_CHAIN" 2>/dev/null
+            iptables -t mangle -F "$MANGLE_CHAIN"
+            rules_private mangle "$MANGLE_CHAIN"
+            iptables -t mangle -A "$MANGLE_CHAIN" -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port "$tproxy_port" --tproxy-mark "$fwm" 2>/dev/null
+            iptables -t mangle -A "$MANGLE_CHAIN" -p udp -j TPROXY --on-ip 127.0.0.1 --on-port "$tproxy_port" --tproxy-mark "$fwm" 2>/dev/null
+            rules_install_prerouting mangle tcp "$MANGLE_CHAIN" 1 "$lan"
+            rules_install_prerouting mangle udp "$MANGLE_CHAIN" 1 "$lan"
+            if test "$(cfg_get proxy_self)" = "1"; then
+                iptables -t mangle -N "$MARK_CHAIN" 2>/dev/null
+                iptables -t mangle -F "$MARK_CHAIN"
+                iptables -t mangle -A "$MARK_CHAIN" -m mark --mark "$mark" -j RETURN 2>/dev/null
+                iptables -t mangle -A "$MARK_CHAIN" -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null
+                iptables -t mangle -A "$MARK_CHAIN" -d 127.0.0.0/8 -j RETURN 2>/dev/null
+                iptables -t mangle -A "$MARK_CHAIN" -p tcp -j MARK --set-mark "$fwm" 2>/dev/null
+                iptables -t mangle -A "$MARK_CHAIN" -p udp -j MARK --set-mark "$fwm" 2>/dev/null
+                iptables -t mangle -C OUTPUT -p tcp -j "$MARK_CHAIN" 2>/dev/null || \
+                    iptables -t mangle -I OUTPUT 1 -p tcp -j "$MARK_CHAIN" 2>/dev/null
+                iptables -t mangle -C OUTPUT -p udp -j "$MARK_CHAIN" 2>/dev/null || \
+                    iptables -t mangle -I OUTPUT 1 -p udp -j "$MARK_CHAIN" 2>/dev/null
+            fi
+            rules_remove_redirect
+            oc_log "透明代理(TPROXY/TCP+UDP)已安装 -> 127.0.0.1:$tproxy_port"
+            ;;
+        tun)
+            rules_remove_redirect
+            rules_remove_tproxy
+            oc_log "TUN 模式: 路由由内核自行接管(auto-route)"
+            ;;
+        off|*)
+            rules_remove_redirect
+            rules_remove_tproxy
+            oc_log "透明代理已关闭(mode=$mode, 仅保留本地代理端口)"
+            ;;
+    esac
+    wan_guard_apply
+    quic_guard_apply
+    rules_note ""
+    return 0
+}
+
+# 通用: 删掉所有指向本插件链的跳转规则(含 -i 网卡、-p 协议等各种变体)。# 用 `iptables -S` 反查而不是硬编码形式, 避免残留规则导致 -X 失败、下次装规则错位。
+rules_del_jumps_to() {
+    local tbl="$1" chain="$2" rule
+    # iKuai 的 iptables 在 -S 输出里给每条规则加了 "[fastid: N] " 前缀, 直接按 ^-A
+    # 匹配会一条都匹配不到 —— 结果规则永远删不掉: 换模式/关闭代理/卸载后旧规则还挂着,
+    # 流量照样被劫走。必须先剥掉这个前缀再匹配。
+    iptables -t "$tbl" -S 2>/dev/null | sed 's/^\[fastid: [0-9]*\] //' | \
+        grep -E "^-A (PREROUTING|OUTPUT|FORWARD) .*-j $chain( |\$)" | \
+    while IFS= read -r rule; do
+        iptables -t "$tbl" ${rule/-A /-D } 2>/dev/null
+    done
+    return 0
+}
+
+rules_remove_redirect() {
+    have iptables || return 0
+    rules_del_jumps_to nat "$NAT_CHAIN"
+    iptables -t nat -F "$NAT_CHAIN" 2>/dev/null
+    iptables -t nat -X "$NAT_CHAIN" 2>/dev/null
+    return 0
+}
+
+rules_remove_tproxy() {
+    have iptables || return 0
+    rules_del_jumps_to mangle "$MANGLE_CHAIN"
+    rules_del_jumps_to mangle "$MARK_CHAIN"
+    iptables -t mangle -F "$MANGLE_CHAIN" 2>/dev/null
+    iptables -t mangle -X "$MANGLE_CHAIN" 2>/dev/null
+    iptables -t mangle -F "$MARK_CHAIN" 2>/dev/null
+    iptables -t mangle -X "$MARK_CHAIN" 2>/dev/null
+    if have ip; then
+        local fwm tbl net
+        fwm="$(cfg_get fwmark)"; tbl="$(cfg_get route_table)"
+        ip rule del fwmark "$fwm" lookup "$tbl" 2>/dev/null
+        for net in $PRIVATE_V4; do
+            ip route del throw "$net" table "$tbl" 2>/dev/null
+        done
+        ip route del local 0.0.0.0/0 dev lo table "$tbl" 2>/dev/null
+        # 注意: 不要 flush 整张表 —— iKuai/其它插件可能共用 table 100
+    fi
+    return 0
+}
+
+rules_remove_dns() {
+    have iptables || return 0
+    rules_del_jumps_to nat "$DNS_CHAIN"
+    iptables -t nat -F "$DNS_CHAIN" 2>/dev/null
+    iptables -t nat -X "$DNS_CHAIN" 2>/dev/null
+    return 0
+}
+
+rules_remove() {
+    rules_remove_redirect
+    rules_remove_tproxy
+    rules_remove_dns
+    wan_guard_remove
+    quic_guard_remove
+    oc_log "透明代理与 DNS 劫持规则已清理"
+    return 0
+}
+
+rules_show() {
+    {
+        oc_echo "== nat PREROUTING =="
+        iptables -t nat -S PREROUTING 2>/dev/null | grep -E "OPENCLASH" 
+        oc_echo "== nat OUTPUT =="
+        iptables -t nat -S OUTPUT 2>/dev/null | grep -E "OPENCLASH"
+        oc_echo "== nat $NAT_CHAIN =="
+        iptables -t nat -S "$NAT_CHAIN" 2>/dev/null
+        oc_echo "== nat $DNS_CHAIN =="
+        iptables -t nat -S "$DNS_CHAIN" 2>/dev/null
+        oc_echo "== mangle PREROUTING =="
+        iptables -t mangle -S PREROUTING 2>/dev/null | grep -E "OPENCLASH"
+        oc_echo "== mangle $MANGLE_CHAIN =="
+        iptables -t mangle -S "$MANGLE_CHAIN" 2>/dev/null
+        oc_echo "== ip rule =="
+        ip rule show 2>/dev/null | grep -E "fwmark|lookup 100"
+    } 2>/dev/null
+    return 0
+}
+
+# ------------------------------------------------------------------ 内核
+
+# 配置语法检查: 以内核退出码为准(日志里出现 "warn"/"error" 字样不代表失败)
+core_test() {
+    test -x "$CORE" || { oc_err "缺少内核: $CORE"; return 1; }
+    test -f "$RENDERED" || render >/dev/null || return 1
+    local out rc
+    # SAFE_PATHS: 内核只允许读工作目录(-d)内的路径, 这里额外放行插件 share/(面板等)
+    out="$(SAFE_PATHS="$(oc_safe_paths)" "$CORE" -t -d "$CACHE" -f "$RENDERED" 2>&1)"; rc=$?
+    CORE_TEST_OUT="$out"
+    test "$rc" = "0" || return 1
+    case "$out" in
+        *"test is successful"*) return 0 ;;
+        *"test is failed"*|*"parse config error"*) return 1 ;;
+    esac
+    return 0
+}
+
+test_config() {
+    core_test
+    local rc=$?
+    printf '%s\n' "${CORE_TEST_OUT:-（无输出）}"
+    test "$rc" = "0" && oc_echo "配置检查通过" || oc_echo "配置检查失败(退出码非 0)"
+    return $rc
+}
+
+start() {
+    setup
+    if test ! -x "$CORE"; then
+        if test "$(cfg_get core_auto)" = "1"; then
+            oc_echo "内核未就位, 正在自动下载(约 23MB)…"
+            core_fetch || { oc_err "内核不可用, 无法启动"; return 1; }
+        else
+            oc_err "缺少内核: $CORE (可运行 occtl core-fetch 或把内核放到该路径)"
+            return 1
+        fi
+    fi
+    if core_alive >/dev/null; then
+        oc_echo "内核已在运行 (pid $(core_alive))"
+        # 不能直接返回: iKuai 改防火墙/重启 dnsmasq 会冲掉跳转规则,
+        # 那样"再点启动"就永远补不回规则(cron 的判定也会被链名子串骗过)
+        rules_apply || oc_log "WARN 规则补装未完全成功"
+        return 0
+    fi
+    render || return 1
+
+    if ! core_test; then
+        oc_err "配置检查未通过, 已放弃启动:"
+        printf '%s\n' "${CORE_TEST_OUT:-（无输出）}" >&2
+        # 详细输出同时写进日志(以前只打 stderr, 从日志里看不到原因)
+        {
+            printf '%s [check] 配置检查输出:\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+            printf '%s\n' "${CORE_TEST_OUT:-（无输出）}"
+        } >> "$RLOG" 2>/dev/null
+        return 1
+    fi
+    # 缓存内核版本(页面展示用; API 起来后优先用 API 的返回)
+    "$CORE" -v 2>/dev/null | head -n1 > "$DATA/core_version" 2>/dev/null
+
+    local mode
+    mode="$(cfg_get mode)"
+    if test "$mode" = "tun" && ! tun_ok; then
+        oc_err "TUN 模式需要 /dev/net/tun(当前不可用), 请改用 redirect/tproxy 或加载 tun 模块"
+        return 1
+    fi
+
+    # 放行插件 share/(面板资源等)给内核读取(默认只允许工作目录内的路径)
+    SAFE_PATHS="$(oc_safe_paths)"
+    export SAFE_PATHS
+    : > "$RLOG"
+    oc_log "启动内核: $CORE -d $CACHE -f $RENDERED (mode=$mode) SAFE_PATHS=$SAFE_PATHS"
+    # 脱离控制终端, 避免调用方退出时被带走
+    ( trap '' HUP; exec "$CORE" -d "$CACHE" -f "$RENDERED" >> "$RLOG" 2>&1 ) &
+    local p=$!
+    echo "$p" > "$PIDF"
+    date '+%s' > "$TFILE"
+    sleep 2
+
+    if ! core_alive >/dev/null; then
+        oc_err "内核启动失败, 日志尾部:"
+        tail -n 15 "$RLOG" >&2
+        rm -f "$PIDF" "$TFILE"
+        # 关键安全动作: 内核没起来就绝不能留着透明代理规则, 否则 LAN 流量被
+        # REDIRECT 到一个没人监听的端口, 等于整网断网。
+        rules_remove
+        oc_log "启动失败, 已清理透明代理与 DNS 劫持规则"
+        return 1
+    fi
+
+    # 等 API 起来(最多 ~10 秒)
+    local i=0
+    while test "$i" -lt 20; do
+        api_alive && break
+        sleep 0.5
+        i=$((i + 1))
+    done
+
+    # 关键: API 就绪 ≠ 代理端口已绑定。
+    # mihomo 的控制端口(external-controller)先起来, redir/tproxy 监听要等 geo 与
+    # 规则加载完才 bind; 在大规则集/慢设备上这中间可能差十几秒。若此时就调
+    # rules_apply, 安全前置会因"未监听"而拒绝装规则 -> 页面上永久显示
+    # 「透明代理规则: 未安装」, 用户以为在走代理其实全是直连。这里显式等端口绑定。
+    local wait_port="" wi=0
+    case "$mode" in
+        redirect) wait_port="$redir_port" ;;
+        tproxy)   wait_port="$tproxy_port" ;;
+    esac
+    if test -n "$wait_port"; then
+        while test "$wi" -lt 40; do
+            listen_ok "$wait_port" && break
+            sleep 0.5
+            wi=$((wi + 1))
+        done
+        if ! listen_ok "$wait_port"; then
+            oc_log "WARN 等 ${wi}00ms 后内核仍未监听 $wait_port, 规则可能装不上"
+        fi
+    fi
+
+    if ! rules_apply; then
+        # 以前这里只写日志, 页面点「启动」看不到任何原因 —— 必须让用户看见
+        oc_err "透明代理规则安装失败(mode=$mode): 内核已运行但规则未生效, 当前流量为直连"
+        oc_err "可点「重新安装规则」重试, 或运行 occtl doctor / occtl ports 查看原因"
+    fi
+    # 免回环列表最多 25 次 nslookup: 放后台刷, 不阻塞启动(否则可能卡几分钟)
+    ( bypass_refresh >/dev/null 2>&1 ) &
+    sleep 1
+
+    if api_alive; then
+        oc_echo "OpenClash 已启动 (pid $p, mode=$mode, 控制端口 $(core_port))"
+        oc_log "启动完成"
+        return 0
+    fi
+    oc_echo "内核进程已启动(pid $p), 但控制接口尚未响应, 请查看日志"
+    return 0
+}
+
+stop() {
+    local p
+    p="$(core_alive)"
+    if test -n "$p"; then
+        kill "$p" 2>/dev/null
+        sleep 1
+        kill -9 "$p" 2>/dev/null
+        oc_log "已停止内核 pid=$p"
+    fi
+    # 兜底: 杀掉所有位置的本插件内核(包内 / data/bin / core_dir), 防止孤儿进程
+    # (core_dir 指向别的分区时, PID 文件若已被删, 只有按路径匹配才捞得回来)
+    pkill -f "$PLUGIN_DIR/bin/mihomo" 2>/dev/null
+    pkill -f "$PLUGIN_DIR/data/bin/mihomo" 2>/dev/null
+    local cd
+    cd="$(cfg_get core_dir)"
+    test -n "$cd" && pkill -f "$cd/mihomo" 2>/dev/null
+    rm -f "$PIDF" "$TFILE"
+    rules_remove
+    oc_echo "OpenClash 已停止, 规则已清理"
+    return 0
+}
+
+# 从内核 API 提取代理服务器地址, 写进 bypass 列表(防止回环)。
+# 换了新配置(尤其自定义配置里没写 routing-mark)时这一步很关键。
+bypass_refresh() {
+    test -d "$DATA/rules" || mkdir -p "$DATA/rules" 2>/dev/null
+    local json ips
+    json="$(oc_curl_api GET /proxies 2>/dev/null)"
+    test -n "$json" || return 0
+    ips="$(printf '%s' "$json" | tr ',' '\n' | sed -n 's/.*"server":"\([^"]*\)".*/\1/p' | sort -u)"
+    test -n "$ips" || return 0
+    {
+        oc_echo "# 由 occtl bypass-refresh 自动生成: 代理服务器地址(必须直连, 否则回环)"
+        local ip nip n=0
+        for ip in $ips; do
+            case "$ip" in
+                *[a-zA-Z]*)
+                    # 域名解析: 最多 25 个, 且限时 3 秒(内核本身还有 SO_MARK 保护)
+                    n=$((n + 1))
+                    test "$n" -gt 25 && break
+                    if have timeout; then
+                        nip="$(timeout 3 nslookup "$ip" 114.114.114.114 2>/dev/null | \
+                               awk '/^Name:/{f=1;next} f&&/^Address/{print $NF}' | \
+                               grep -E '^[0-9]+(\.[0-9]+){3}$' | grep -v '^127\.' | head -n1)"
+                    else
+                        nip=""
+                    fi
+                    test -n "$nip" && oc_echo "$nip"
+                    ;;
+                *) oc_echo "$ip/32" ;;
+            esac
+        done
+    } > "$BYPASS.auto" 2>/dev/null
+    {
+        cat "$BYPASS.auto" 2>/dev/null
+        printf '%s\n' "$BYPASS_MARK_BEGIN"
+        bypass_custom
+        printf '%s\n' "$BYPASS_MARK_END"
+    } > "$BYPASS.tmp" 2>/dev/null
+    rm -f "$BYPASS.auto" 2>/dev/null
+    mv -f "$BYPASS.tmp" "$BYPASS" 2>/dev/null
+    oc_log "已刷新免回环列表: 自动 $(bypass_auto | grep -c .) 条 + 自定义 $(bypass_custom | grep -c .) 条"
+    return 0
+}
+
+# 自动段(自定义标记之上的部分)
+bypass_auto() {
+    test -f "$BYPASS" || return 0
+    awk -v b="$BYPASS_MARK_BEGIN" '$0 == b { exit } { print }' "$BYPASS" 2>/dev/null
+}
+
+# 自定义段(两个标记之间的有效条目)
+bypass_custom() {
+    test -f "$BYPASS" || return 0
+    awk -v b="$BYPASS_MARK_BEGIN" -v e="$BYPASS_MARK_END" '
+        $0 == b { f = 1; next }
+        $0 == e { exit }
+        f && NF && $0 !~ /^#/ { print }
+    ' "$BYPASS" 2>/dev/null
+}
+
+# 用「自动段 + 自定义段」重写整个文件; 自定义条目从 stdin 取
+bypass_write() {
+    local outdir
+    outdir="$(dirname "$BYPASS")"
+    test -d "$outdir" || mkdir -p "$outdir" 2>/dev/null
+    {
+        bypass_auto
+        printf '%s\n' "$BYPASS_MARK_BEGIN"
+        cat
+        printf '%s\n' "$BYPASS_MARK_END"
+    } > "$BYPASS.tmp" 2>/dev/null
+    mv -f "$BYPASS.tmp" "$BYPASS" 2>/dev/null
+}
+
+# 规则生效中的话立刻重装, 让改动马上起作用
+bypass_reapply() {
+    core_alive >/dev/null 2>&1 && rules_apply >/dev/null 2>&1
+    return 0
+}
+
+bypass_add() {
+    local want="${1:-}"
+    case "$want" in
+        ''|-h|--help)
+            oc_echo "用法: occtl bypass-add <IP 或 CIDR>   例如 1.2.3.4 或 1.2.3.0/24"
+            return 0 ;;
+    esac
+    printf '%s' "$want" | grep -qE '^[0-9]+(\.[0-9]+){3}(/[0-9]{1,2})?$' || {
+        oc_echo "格式不对: $want (需要 IPv4 地址或 CIDR, 例如 1.2.3.4 / 1.2.3.0/24)"
+        return 1
+    }
+    case "$want" in */*) ;; *) want="$want/32" ;; esac
+    if bypass_custom | grep -qx "$want"; then
+        oc_echo "已在免代理列表: $want"
+        return 0
+    fi
+    { bypass_custom; printf '%s\n' "$want"; } | bypass_write
+    bypass_reapply
+    oc_echo "已加入免代理列表(不走 clash): $want"
+    oc_log "bypass-add $want"
+    return 0
+}
+
+bypass_del() {
+    local want="${1:-}"
+    case "$want" in
+        ''|-h|--help) oc_echo "用法: occtl bypass-del <IP 或 CIDR>"; return 0 ;;
+    esac
+    case "$want" in */*) ;; *) want="$want/32" ;; esac
+    bypass_custom | grep -qx "$want" || { oc_echo "不在自定义列表: $want"; return 0; }
+    bypass_custom | grep -vx "$want" | bypass_write
+    bypass_reapply
+    oc_echo "已从免代理列表移除: $want"
+    oc_log "bypass-del $want"
+    return 0
+}
+
+bypass_list() {
+    oc_echo "免代理列表 $BYPASS"
+    oc_echo "自动(代理服务器, bypass-refresh 维护):"
+    bypass_auto | grep -v '^#' | grep . | sed 's/^/  /'
+    oc_echo "自定义(bypass-add 添加, 刷新不会丢):"
+    bypass_custom | sed 's/^/  /'
+    test -n "$(bypass_custom)" || oc_echo "  (空)"
+    return 0
+}
+
+# ------------------------------------------------------------------ 订阅
+
+sub_detect() {
+    # $1 = 文件; 输出 yaml / uri / base64 / empty / unknown
+    local f="$1" head
+    test -s "$f" || { oc_echo "empty"; return 0; }
+    head="$(head -c 4096 "$f")"
+    case "$head" in
+        *"proxies:"*|*"proxy-groups:"*|*"Proxy:"*|*"port:"*)
+            oc_echo "yaml"; return 0 ;;
+    esac
+    # base64 特征: 只有 base64 字符集(可能带换行)
+    if printf '%s' "$head" | tr -d '\r\n' | grep -qE '^[A-Za-z0-9+/=]+$'; then
+        oc_echo "base64"; return 0
+    fi
+    case "$head" in
+        ss://*|ssr://*|vmess://*|vless://*|trojan://*|hysteria2://*|hy2://*|tuic://*|http://*|https://*|socks://*)
+            oc_echo "uri"; return 0 ;;
+    esac
+    oc_echo "unknown"
+    return 0
+}
+
+# 下载订阅到指定临时文件。**返回 curl 的退出码**而不是 0/1:
+#   6/7  域名解析失败(典型: 被 DNS 污染)
+#   22   HTTP 4xx/5xx(由于 -f, 说明地址/token 本身有问题)
+#   28   超时      51/52 服务端空回复
+#   35   TLS 握手失败(典型: 域名被 SNI 阻断, Cloudflare 站点在裸网常见)
+#   56   连接被重置  60 证书校验失败
+# 只有"传输层失败"才值得换用转换服务重试; 服务端 404 说明地址本身失效, 套转换服务也没用。
+sub_download() {
+    local u="$1" out="$2" rc
+    curl -fsSL --max-time 60 --connect-timeout 10 -A "clash-verge/v1.0.0" -o "$out" "$u" 2>>"$RLOG"
+    rc=$?
+    test "$rc" = "0" || rm -f "$out" 2>/dev/null
+    return $rc
+}
+
+# ---------------------------------------------------------------- 订阅定时自动更新
+# 为什么必须有这一段: render 里已导入的订阅是 **文件型 provider**(type: file, 没有 interval),
+# 内核不会自己去重下; conf 里的 sub_interval 只在 sub.yaml 不存在、走 http provider 时才生效。
+# 也就是说"用户点过一次「转换并应用」"之后订阅就再也不会自动更新了 —— 只能靠 cron 定时跑。
+SUB_CRON=/etc/mnt/cron.d/openclash_sub
+
+cron_commit() {
+    # iKuai 的 crond 从 /etc/crontabs/root 执行, /etc/mnt/cron.d/* 需要汇总进去才生效
+    local s
+    for s in /usr/ikuai/include/crond.sh /usr/ikuai/script/utils/crond.sh; do
+        if test -f "$s"; then ( . "$s"; crond_commit >/dev/null 2>&1 ); return 0; fi
+    done
+    return 1
+}
+
+sub_auto_apply() {
+    # 按 sub_auto / sub_auto_h 安装或移除定时任务; 幂等, 开机/安装后重铺也安全
+    local on h minute sched
+    on="$(cfg_get sub_auto)"; h="$(cfg_get sub_auto_h)"
+    test -n "$on" || on=0
+    case "$h" in ''|*[!0-9]*) h=12 ;; esac
+    mkdir -p /etc/mnt/cron.d 2>/dev/null
+    if test "$on" != "1" || test "$h" -lt 1 || test "$h" -gt 24; then
+        rm -f "$SUB_CRON" 2>/dev/null
+        cron_commit >/dev/null 2>&1
+        oc_echo "订阅定时更新: 已关闭"
+        return 0
+    fi
+    # 分钟位取个固定偏移, 避免和每分钟的守护脚本、整点任务挤在同一分钟
+    minute=$(( (h * 7 + 13) % 60 ))
+    if test "$h" -ge 24; then
+        sched="$minute 3 * * *"          # 每天 03:xx
+    elif test "$h" -le 1; then
+        sched="$minute * * * *"          # 每小时
+    else
+        sched="$minute */$h * * *"       # 每 N 小时
+    fi
+    printf '# OpenClash for iKuai: 订阅定时自动更新(用 bash 调用, 不依赖权限位)\n%s /bin/bash %s sub-auto-run >/dev/null 2>&1\n' \
+        "$sched" "$PLUGIN_DIR/bin/occtl" > "$SUB_CRON" 2>/dev/null
+    chmod 644 "$SUB_CRON" 2>/dev/null
+    if cron_commit >/dev/null 2>&1; then
+        oc_echo "订阅定时更新: 已开启(cron: $sched)"
+        oc_log "订阅定时更新已开启: $sched"
+    else
+        oc_echo "订阅定时更新: 已写入 $SUB_CRON, 但提交 crontab 失败(未找到 crond.sh)"
+        oc_log "WARN 订阅定时更新写入成功但 crontab 提交失败"
+    fi
+    return 0
+}
+
+sub_auto_run() {
+    # cron 入口: 拉订阅 → 只在内容真的变了时才重启内核(无脑重启会白白断网 10 秒)
+    local b_yaml a_yaml b_raw a_raw
+    b_yaml="$(cksum "$PROV/sub.yaml" 2>/dev/null | awk '{print $1"-"$2}')"
+    b_raw="$(cksum "$SUBDIR/raw.txt" 2>/dev/null | awk '{print $1"-"$2}')"
+    if ! sub_update auto >>"$RLOG" 2>&1; then
+        oc_log "定时更新: 下载失败(保留现有节点, 不影响当前使用)"
+        return 1
+    fi
+    a_yaml="$(cksum "$PROV/sub.yaml" 2>/dev/null | awk '{print $1"-"$2}')"
+    a_raw="$(cksum "$SUBDIR/raw.txt" 2>/dev/null | awk '{print $1"-"$2}')"
+    if test -n "$a_yaml" && test "$a_yaml" != "$b_yaml"; then
+        oc_log "定时更新: 订阅已更新, 重启内核生效"
+        if test -n "$(core_alive)"; then
+            stop >/dev/null 2>&1; start >>"$RLOG" 2>&1
+            if test -n "$(core_alive)"; then oc_log "定时更新: 内核已重启"
+            else oc_log "定时更新: 内核重启失败(每分钟的守护会兜底)"; fi
+        fi
+    elif test -n "$a_raw" && test "$a_raw" != "$b_raw"; then
+        # base64/URI 订阅的转换在浏览器端完成, cron 里没有转换器, 只能把原文刷新好
+        oc_log "定时更新: 原文已刷新, 但订阅是 base64/URI 格式, 需在插件页面点「转换并应用」"
+    else
+        oc_log "定时更新: 订阅无变化, 未重启内核"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- 日志清理
+log_clear() {
+    # 用 : > 截断而不是 rm: 内核/后端可能正持有这些文件的 inode, rm 后日志会继续写进
+    # 已删除的 inode, 页面上看起来"清了"但磁盘空间并不会释放。
+    local f n=0
+    for f in "$RLOG" "$LOGDIR/backend-noise.log" "$LOGDIR/bootstrap.log" "$LOGDIR/last-op.txt"; do
+        test -f "$f" || continue
+        if : > "$f" 2>/dev/null; then n=$((n + 1)); fi
+    done
+    oc_log "日志已清空(共 $n 个文件)"
+    oc_echo "日志已清空(共 $n 个文件)"
+    return 0
+}
+
+sub_update() {
+    # $1 = 下载模式: auto(默认, 先直连失败再自动走转换服务) / direct / converter
+    # 注意: auto 在**直连失败**时会去访问第三方转换服务 —— 这是用户明确选择的
+    # "一次点击"行为(转换服务地址可用 sub_conv 配置, 也可 sub_conv_enable=0 关掉)。
+    setup
+    local mode url_direct url_conv conv_mode conv_base rc conv_enable
+    mode="${1:-auto}"
+    url_direct="$(cfg_get sub_url)"
+    test -n "$url_direct" || { oc_err "未配置订阅地址(sub_url)"; return 1; }
+
+    conv_base="$(cfg_get sub_conv)"
+    conv_mode=0
+    # 已经填过转换服务地址 -> 视为转换模式, 不再重复套一层(否则会套成 url=...url=...)
+    case "$url_direct" in *"$CONV_DEFAULT"*|*"api.asailor.org"*) conv_mode=1 ;; esac
+
+    conv_enable="$(cfg_get sub_conv_enable)"
+    test -n "$conv_enable" || conv_enable=1
+
+    case "$mode" in
+        converter) conv_mode=1 ;;
+        direct)    conv_mode=0 ;;
+        # 自动 = 直连优先(与页面/注释说明一致)。公共转换服务几乎都架在 Cloudflare 上,
+        # 裸网常被 SNI 阻断(curl exit 35); 若默认先走转换, 则直连本来能用也要看第三方脸色,
+        # 还会把订阅地址无谓地泄露给第三方。直连失败后再回退才合理。
+        auto)      conv_mode=0 ;;
+    esac
+
+    # 构造套了转换服务的地址(转换服务返回标准 provider 格式, 支持定时更新)
+    if test -n "$conv_base"; then
+        url_conv="$conv_base?target=clash&list=true&insert=false&emoji=true&udp=true&url=$(oc_urlencode "$url_direct")"
+    else
+        url_conv="$CONV_DEFAULT?target=clash&list=true&insert=false&emoji=true&udp=true&url=$(oc_urlencode "$url_direct")"
+    fi
+
+    mkdir -p "$SUBDIR" "$PROV" 2>/dev/null
+
+    # 先把内容下到临时文件, 成功才原子替换(失败绝不能拿错误页覆盖旧订阅)
+    local dl_ok=0
+    if test "$conv_mode" = "0"; then
+        oc_log "下载订阅(直连): $url_direct"
+        sub_download "$url_direct" "$SUBDIR/raw.txt.tmp"; rc=$?
+        case "$rc" in
+            0) dl_ok=1 ;;
+            22)
+                # HTTP 层错误: 地址/token 本身有问题(或机场返回了错误页),
+                # 套转换服务去取同一个地址也一样失败, 直接告诉用户换地址。
+                oc_err "订阅下载失败(curl exit=22: 服务端返回错误页); 多为订阅地址/token 失效或过期, 请到机场官网复制最新订阅地址"
+                return 1 ;;
+            *)
+                if test "$mode" = "auto" && test "$conv_enable" != "0"; then
+                    oc_log "直连下载失败(exit=$rc), 自动改走转换服务重试"
+                    oc_echo "直连下载失败(域名可能被 DNS 污染 / SNI 阻断), 自动改用转换服务重试…"
+                    conv_mode=1
+                elif test "$mode" = "auto"; then
+                    oc_err "订阅下载失败(curl exit=$rc; 6/7=域名解析失败, 22=地址/token 失效, 28=超时, 35=TLS 握手被阻断, 56=连接被重置); 自动回退转换服务已关闭(sub_conv_enable=0)"
+                    return 1
+                else
+                    oc_err "订阅下载失败(curl exit=$rc; 6/7=域名解析失败, 22=地址/token 失效, 28=超时, 35=TLS 握手被阻断, 56=连接被重置); 可试「自动」让转换服务代取"
+                    return 1
+                fi ;;
+        esac
+    fi
+    if test "$dl_ok" = "0"; then
+        if test -z "$conv_base" && test "$conv_mode" = "1"; then
+            oc_echo "提示: 可把转换服务地址填成自己的(配置里 sub_conv), 避免依赖默认的 $CONV_DEFAULT"
+        fi
+        oc_log "下载订阅(转换服务): $url_conv"
+        sub_download "$url_conv" "$SUBDIR/raw.txt.tmp"; rc=$?
+        if test "$rc" != "0"; then
+            # 关键认知: 用户在自己电脑上能打开转换服务 ≠ 路由器能连 —— 装好之前路由器没有代理,
+            # 而公共转换服务几乎都架在 Cloudflare 上, 裸网常被 SNI 阻断(典型 curl exit 35)。
+            # 旧文案让用户"核对 sub_conv 地址"是误导: 地址没问题, 是链路被阻断。
+            oc_err "转换服务也失败了(curl exit=$rc: 6/7=解析失败, 22=地址失效, 28=超时, 35=TLS 握手被阻断, 56=连接被重置)"
+            oc_echo "注意: 在你的电脑上能打开, 不代表路由器能连(装好之前路由器本身没有代理)。"
+            oc_echo "可选: ① 下载方式改成「仅直连」再试  ② 配置里换成自己可用的 sub_conv  ③ 用「手动导入配置文件」"
+            return 1
+        fi
+        # 只有转换成功才把它写回 sub_url —— 订阅就是内核 http provider 的地址,
+        # 写回去 = 今后定时自动更新也走转换服务(否则定时更新会继续撞被墙的域名)
+        if test "$conv_mode" = "1" && test "$url_direct" != "$url_conv"; then
+            cfg_set sub_url "$url_conv"
+            oc_echo "已把订阅地址改为转换服务地址(定时自动更新也会走它)"
+            oc_echo "如需改回直连: 在页面上把订阅地址填回原地址, 或点「恢复直连地址」"
+        fi
+    fi
+    if ! test -s "$SUBDIR/raw.txt.tmp"; then
+        rm -f "$SUBDIR/raw.txt.tmp" 2>/dev/null
+        oc_err "订阅内容为空"
+        return 1
+    fi
+    mv -f "$SUBDIR/raw.txt.tmp" "$SUBDIR/raw.txt" 2>/dev/null
+    local kind
+    kind="$(sub_detect "$SUBDIR/raw.txt")"
+    cfg_set sub_time "$(date '+%Y-%m-%d %H:%M:%S')"
+    case "$kind" in
+        yaml)
+            cp -f "$SUBDIR/raw.txt" "$PROV/sub.yaml"
+            cfg_set sub_format yaml
+            oc_echo "订阅已是 Clash/Meta 格式, 已保存为 providers/sub.yaml ($(wc -c < "$PROV/sub.yaml") 字节)"
+            cfg_set cfg_mode auto
+            ;;
+        base64|uri)
+            cfg_set sub_format raw
+            if test -f "$PROV/sub.yaml"; then
+                # 换了源就必须停用旧 provider, 否则 render 会继续用旧节点(用户以为换源了)
+                mv -f "$PROV/sub.yaml" "$PROV/sub.yaml.stale" 2>/dev/null
+                oc_echo "订阅为 ${kind} 格式; 旧 Clash 订阅已停用(sub.yaml.stale), 请在页面上点「转换并应用」后再重启内核"
+            else
+                oc_echo "订阅为 ${kind} 格式(非 Clash YAML), 原始内容已存到 data/sub/raw.txt; 请在插件页面上点「转换并应用」, 由浏览器端转换后回传"
+            fi
+            ;;
+        *)
+            cfg_set sub_format raw
+            oc_echo "订阅格式未识别, 原始内容已存到 data/sub/raw.txt, 请在页面上查看/转换"
+            ;;
+    esac
+    return 0
+}
+
+sub_import() {
+    # $1 = 上传目录里的文件(浏览器转换结果或用户上传的 Clash YAML)
+    local src="$1" dst="$PROV/sub.yaml" bak="$PROV/sub.yaml.bak" free
+    test -f "$src" || { oc_err "文件不存在: $src"; return 1; }
+    mkdir -p "$PROV" 2>/dev/null
+    grep -qE '^(proxies|proxy-providers|Proxy):' "$src" 2>/dev/null || \
+        { oc_err "导入的文件不是 Clash/Meta 配置(缺少 proxies: 段)"; return 1; }
+    free="$(free_kb "$PROV")"
+    if test -n "$free" && test "$free" -lt 1024; then
+        oc_err "插件分区可用空间不足 1MB, 请先「工具→清理空间」"
+        return 1
+    fi
+    test -f "$dst" && cp -f "$dst" "$bak" 2>/dev/null
+    if ! cp -f "$src" "$dst" 2>/dev/null; then
+        oc_err "写入 $dst 失败(空间不足?)"
+        return 1
+    fi
+    cfg_set sub_format yaml
+    cfg_set cfg_mode auto
+    # 用内核自己校验: 坏节点/坏缩进不能把当前可用的订阅顶掉(内核没装就跳过这步)
+    if test -x "$CORE"; then
+        if ! render >/dev/null 2>&1 || ! core_test; then
+            if test -f "$bak"; then mv -f "$bak" "$dst" 2>/dev/null; else rm -f "$dst" 2>/dev/null; fi
+            render >/dev/null 2>&1
+            oc_err "导入的配置未通过内核校验, 已回滚: $(printf '%s' "${CORE_TEST_OUT:-}" | tail -n 2 | tr '\n' ' ')"
+            return 1
+        fi
+    fi
+    rm -f "$bak" 2>/dev/null
+    oc_echo "订阅文件已导入并通过校验: $dst ($(wc -c < "$dst") 字节, $(grep -c '^ *- ' "$dst" 2>/dev/null) 行条目)"
+    return 0
+}
+
+sub_import_custom() {
+    local src="$1"
+    test -f "$src" || { oc_err "文件不存在: $src"; return 1; }
+    grep -qE '^(proxies|proxy-providers|Proxy|mixed-port|port):' "$src" 2>/dev/null || \
+        { oc_err "不是有效的 Clash/Meta 配置"; return 1; }
+    cp -f "$src" "$CUSTOM" || { oc_err "写入 $CUSTOM 失败"; return 1; }
+    cfg_set cfg_mode custom
+    oc_echo "自定义配置已导入: $CUSTOM, 当前配置模式=custom"
+    return 0
+}
+
+# ------------------------------------------------------------------ 内核下载
+
+# 内核落盘目录: 默认 data/bin(不与插件包内文件冲突, 不破坏 MANIFEST 校验);
+# 用 core_dir 可以指到别的分区(例如 /etc/log/openclash) —— /etc/mnt 只有 43MB 时用这招。
+# 完整包自带的 bin/mihomo 优先级最低(见 core_resolve)。
+core_target_dir() {
+    local d
+    d="$(cfg_get core_dir)"
+    if test -n "$d"; then printf '%s' "$d"; else printf '%s' "$DATA/bin"; fi
+}
+
+# 解析"实际要用的内核": core_dir > data/bin > 包内 bin/mihomo(完整包自带, 只读)
+core_resolve() {
+    local d
+    d="$(cfg_get core_dir)"
+    if test -n "$d" && test -x "$d/mihomo"; then CORE="$d/mihomo"; return 0; fi
+    if test -x "$DATA/bin/mihomo"; then CORE="$DATA/bin/mihomo"; return 0; fi
+    if test -x "$CORE_PKG"; then CORE="$CORE_PKG"; return 0; fi
+    CORE="${d:-$DATA/bin}/mihomo"
+    return 0
+}
+
+# 分区可用空间(KB)
+free_kb() { df -k "$1" 2>/dev/null | tail -n1 | awk '{print $4}'; }
+
+core_status() {
+    local d free f
+    d="$(core_target_dir)"
+    free="$(free_kb "$PLUGIN_DIR")"
+    if test -x "$CORE"; then
+        oc_echo "内核    : $CORE ($(wc -c < "$CORE") 字节)"
+        "$CORE" -v 2>/dev/null | head -n1
+    else
+        oc_echo "内核    : 缺失 ($CORE)"
+    fi
+    if test "$(cfg_get core_dir)" != ""; then
+        oc_echo "内核目录: $d  (由 core_dir 指定, bin/mihomo 是指向它的软链)"
+    else
+        oc_echo "内核目录: $d  (插件自带目录)"
+    fi
+    test -n "$free" && oc_echo "可用空间: $((free / 1024)) MB @ $PLUGIN_DIR"
+    if test -x "$CORE"; then
+        if api_alive; then
+            oc_echo "控制接口: 正常(密钥匹配)"
+        else
+            oc_echo "控制接口: 无响应或密钥不匹配 —— 内核未运行, 或配置文件里的 secret 与 conf 不一致(例如还处于 custom 模式)"
+        fi
+    fi
+    for f in "$SHARE/geo/Country.mmdb" "$SHARE/geo/GeoSite.dat"; do
+        if test -f "$f"; then oc_echo "geo     : $f ($(wc -c < "$f") 字节)"
+        else oc_echo "geo     : 缺少 $(basename "$f")"; fi
+    done
+    return 0
+}
+
+# 安装内核: core_fetch <本地内核压缩包>
+#   * 只接受本地文件(墙内 GitHub 不可达, 在线下载通路已移除):
+#       网页: 插件页「工具 / 自检 → 离线安装内核」选择 mihomo 的 .gz
+#       命令行: occtl core-fetch /绝对路径/mihomo.gz
+#   * 解压后约 60MB, 装之前会做空间预检; 空间不够可用 core_dir 换分区, 或先 occtl cleanup
+core_fetch() {
+    local src="${1:-}"
+    if test -z "$src"; then
+        oc_err "请提供内核压缩包路径(在线下载已禁用):"
+        oc_err "  网页: 插件页「工具 / 自检 → 离线安装内核」选择 mihomo 的 .gz"
+        oc_err "  命令行: occtl core-fetch /绝对路径/mihomo.gz"
+        return 1
+    fi
+    local sum f
+    local tdir need_kb free
+    tdir="$(core_target_dir)"
+    mkdir -p "$tdir" 2>/dev/null || { oc_err "无法创建目录: $tdir"; return 1; }
+
+    if test ! -f "$src"; then oc_err "文件不存在: $src"; return 1; fi
+    if gzip -t "$src" 2>/dev/null; then
+        oc_log "使用本地内核压缩包: $src ($(wc -c < "$src") 字节)"
+    else
+        oc_err "不是有效的 gzip 文件: $src (请确认上传的是 mihomo-*.gz)"
+        return 1
+    fi
+
+    need_kb=$((70 * 1024))
+    free="$(free_kb "$tdir")"
+    # 插件分区(43MB)放不下 70MB 解压产物时, 自动改用有空间的分区并把 core_dir 指过去。
+    # 不做这一步, 在 /etc/mnt 只剩几 MB 的机器上内核永远装不上(日志会报"可用 28MB")。
+    case "$tdir" in
+        /etc/mnt|/etc/mnt/*)
+            if test -n "$free" && test "$free" -lt "$need_kb"; then
+                local alt=""
+                for cand in /etc/log /etc/disk/*; do
+                    test -d "$cand" || continue
+                    if test "$(free_kb "$cand" 2>/dev/null)" -ge "$need_kb"; then alt="$cand/openclash"; break; fi
+                done
+                if test -n "$alt"; then
+                    oc_log "插件分区可用 $((free / 1024))MB 不足, 内核自动改放 $alt"
+                    oc_echo "插件分区空间不足($((free / 1024))MB), 已自动把内核改放 $alt"
+                    tdir="$alt"
+                    mkdir -p "$tdir" 2>/dev/null
+                    cfg_set core_dir "$tdir" || oc_echo "提示: core_dir 写入失败(插件分区满?), 本次仍安装到 $tdir"
+                    free="$(free_kb "$tdir")"
+                fi
+            fi
+            ;;
+    esac
+    if test -n "$free" && test "$free" -lt "$need_kb"; then
+        oc_err "目标分区空间不足: $tdir 可用 $((free / 1024)) MB, 解压需要约 70 MB"
+        oc_echo "可选做法:"
+        oc_echo "  1) 清理归档: occtl cleanup"
+        oc_echo "  2) 换分区:   occtl conf-set core_dir /etc/log/openclash && occtl core-fetch $src"
+        oc_echo "  3) 看占用:   du -sh /etc/mnt/* 2>/dev/null | sort -h | tail"
+        return 1
+    fi
+
+    if ! gzip -dc "$src" > "$tdir/mihomo.tmp" 2>/dev/null; then
+        oc_err "内核解压失败(空间不足或文件损坏)"
+        rm -f "$tdir/mihomo.tmp" 2>/dev/null
+        return 1
+    fi
+    # 必须是 ELF 可执行文件: 防止把 .tgz/.zip 当成内核装上(页面的 file 选择框允许 .tgz)
+    # ELF magic = 0x7f 'E' 'L' 'F'; 同样不依赖 od
+    if ! head -c 4 "$tdir/mihomo.tmp" 2>/dev/null | grep -qa 'ELF'; then
+        oc_err "解压结果不是 ELF 可执行文件(是不是上传了 .tgz/.zip 而不是 mihomo 的 .gz?)"
+        rm -f "$tdir/mihomo.tmp" 2>/dev/null
+        return 1
+    fi
+    chmod +x "$tdir/mihomo.tmp" 2>/dev/null
+    # 新内核必须真的能跑, 否则宁可保留可用的旧内核(镜像投毒/截断/架构不符)
+    if ! "$tdir/mihomo.tmp" -v >/dev/null 2>&1; then
+        oc_err "新内核无法执行(架构不符或文件损坏), 已保留原内核"
+        rm -f "$tdir/mihomo.tmp" 2>/dev/null
+        return 1
+    fi
+    if ! mv -f "$tdir/mihomo.tmp" "$tdir/mihomo" 2>/dev/null; then
+        oc_err "写入 $tdir/mihomo 失败(空间不足?)"
+        rm -f "$tdir/mihomo.tmp" 2>/dev/null
+        return 1
+    fi
+
+    # 注意: 绝不往包内 bin/mihomo 装/软链 —— 那会破坏 MANIFEST 校验, 下次开机
+    # 框架 plugin_verify 失败会跳过整个插件(表现为"能上网但插件页全废")
+    core_resolve
+    "$CORE" -v 2>/dev/null | head -n1 > "$DATA/core_version" 2>/dev/null
+    oc_echo "内核已就位: $CORE ($(wc -c < "$CORE" 2>/dev/null) 字节)"
+    cat "$DATA/core_version" 2>/dev/null
+    return 0
+}
+
+# 清理可删的空间占用: 插件包归档(.installed/*.zip)、待安装 zip、旧备份、残留内核 gz
+cleanup() {
+    local before after z d
+    before="$(free_kb "$PLUGIN_DIR")"
+    oc_echo "== 清理前 =="
+    df -h "$PLUGIN_DIR" 2>/dev/null | tail -n1
+    for z in /etc/mnt/plugins/.installed/*.zip "$DATA/mihomo.gz" "$PLUGIN_DIR/mihomo.gz" "$DATA/ui.tmp/ui.zip" "$SHARE"/geo/*.bad; do
+        if test -f "$z"; then
+            oc_echo "  删除 $(( $(wc -c < "$z") / 1048576 )) MB: $z"
+            rm -f "$z" 2>/dev/null
+        fi
+    done
+    # 过期锁文件: 后台下载被中断时残留会导致"自动下载内核"永久失效
+    rm -f "$DATA/.core-fetch.lock" 2>/dev/null
+    rm -rf "$DATA/ui.tmp" 2>/dev/null
+    for d in /etc/mnt/openclash-backup-*; do
+        test -d "$d" || continue
+        oc_echo "  删除目录: $d"
+        rm -rf "$d" 2>/dev/null
+    done
+    after="$(free_kb "$PLUGIN_DIR")"
+    oc_echo "== 清理后 =="
+    df -h "$PLUGIN_DIR" 2>/dev/null | tail -n1
+    if test -n "$before" && test -n "$after"; then
+        oc_echo "释放约 $(( (after - before) / 1024 )) MB"
+    fi
+    return 0
+}
+
+# 可选的 geosite 数据(GEOSITE 规则需要; 缺失时规则自动降级成 GEOIP/DOMAIN)
+# 写进**工作目录** data/cache/GeoSite.dat: 内核按这个位置读取, 且不受插件包
+# MANIFEST 约束(写包内 share/geo 会让完整包下次开机校验失败)
+geo_fetch() {
+    # 只保留离线导入(geo-import): 墙内下不到 GitHub, 在线下载通路已移除
+    oc_err "请用离线导入: occtl geo-import /绝对路径/GeoSite.dat"
+    oc_err "  网页: 插件页「工具 / 自检 → 离线安装 GEOSITE」"
+    return 1
+}
+
+# 可选的面板(zashboard): 精简/极简包里不含面板资源, 用这个在设备上下载。
+# 注意: 这是本插件最后一个在线下载通路(面板是可选功能, 且只由用户在页面上
+# 手动触发); 内核与 geo 数据都已改为纯离线导入。
+ui_fetch() {
+    local tmp="/tmp/openclash-ui.tmp" ui_dir="$CACHE/ui" ok=0 m url d
+    have curl || { oc_err "缺少 curl"; return 1; }
+    have unzip || { oc_err "缺少 unzip, 无法解包面板"; return 1; }
+    rm -rf "$tmp" 2>/dev/null
+    mkdir -p "$tmp" 2>/dev/null
+    for m in "" $DL_MIRRORS; do
+        url="$m$UI_URL"
+        oc_log "下载面板: $url"
+        if curl -sL --connect-timeout 20 --max-time 600 --retry 2 -o "$tmp/ui.zip" "$url" 2>>"$RLOG"; then
+            if unzip -oq "$tmp/ui.zip" -d "$tmp" 2>>"$RLOG"; then ok=1; break; fi
+        fi
+    done
+    if test "$ok" != "1"; then
+        rm -rf "$tmp" 2>/dev/null
+        oc_err "面板下载或解包失败(可跳过, 面板是可选项)"
+        return 1
+    fi
+    rm -rf "$ui_dir/zashboard" 2>/dev/null
+    mkdir -p "$ui_dir" 2>/dev/null
+    if test -d "$tmp/$UI_INNER"; then
+        mv "$tmp/$UI_INNER" "$ui_dir/zashboard" 2>/dev/null
+    else
+        d="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n1)"
+        test -n "$d" && mv "$d" "$ui_dir/zashboard" 2>/dev/null
+    fi
+    rm -rf "$tmp" 2>/dev/null
+    if test -f "$ui_dir/zashboard/index.html"; then
+        cfg_set ui_name zashboard
+        render >/dev/null 2>&1
+        oc_echo "面板已就位: $ui_dir/zashboard(重启内核后用 /ui/zashboard/ 打开)"
+        return 0
+    fi
+    oc_err "面板解包结果不完整"; return 1
+}
+
+# 离线导入 GeoSite.dat(墙内下不到时的唯一通路)
+geo_import() {
+    local src="$1"
+    test -f "$src" || { oc_err "文件不存在: $src"; return 1; }
+    if ! geo_ok "$src"; then
+        oc_err "不是有效的 GeoSite.dat($(wc -c < "$src" 2>/dev/null) 字节; 正常约 10MB, 且不能是 HTML/JSON)"
+        return 1
+    fi
+    mkdir -p "$CACHE" 2>/dev/null
+    rm -f "$CACHE/GeoSite.dat" 2>/dev/null
+    if ! cp -f "$src" "$CACHE/GeoSite.dat" 2>/dev/null; then
+        oc_err "写入 $CACHE/GeoSite.dat 失败(/etc/mnt 空间不足? 需要约 11MB)"
+        return 1
+    fi
+    cfg_set geosite auto
+    render >/dev/null 2>&1
+    oc_echo "GeoSite.dat 已就位: $CACHE/GeoSite.dat ($(wc -c < "$CACHE/GeoSite.dat") 字节), 配置已重新渲染"
+    return 0
+}
+
+# ------------------------------------------------------------------ 状态
+
+status_text() {
+    local p mode cfg_mode
+    p="$(core_alive)"
+    mode="$(cfg_get mode)"
+    cfg_mode="$(cfg_get cfg_mode)"
+    oc_echo "运行状态 : $(test -n "$p" && oc_echo "运行中 (pid $p)" || oc_echo "未运行")"
+    oc_echo "代理模式 : $mode"
+    oc_echo "配置模式 : $cfg_mode"
+    oc_echo "控制接口 : $(cfg_get ctrl)  (secret $(test -n "$(cfg_get secret)" && oc_echo 已设置 || oc_echo 未设置))"
+    oc_echo "本地端口 : mixed=$(cfg_get mixed_port) redir=$(cfg_get redir_port) tproxy=$(cfg_get tproxy_port) dns=$(cfg_get dns_port)"
+    oc_echo "订阅地址 : $(cfg_get sub_url)"
+    oc_echo "订阅时间 : $(cfg_get sub_time)"
+    oc_echo "订阅格式 : $(cfg_get sub_format)"
+    oc_echo "配置检查 : $(api_alive && oc_echo "$(oc_curl_api GET /version)" || oc_echo '控制接口无响应')"
+    return 0
+}
+
+status_json() {
+    local p up now started mem corever api rules_on dns_on
+    p="$(core_alive)"
+    now="$(date '+%s')"
+    started="$(cat "$TFILE" 2>/dev/null)"
+    up=0
+    if test -n "$started" && test -n "$p"; then up=$((now - started)); fi
+    mem=0
+    if test -n "$p" && test -r "/proc/$p/status"; then
+        mem="$(awk '/^VmRSS:/{print $2}' "/proc/$p/status" 2>/dev/null)"
+    fi
+    api=0; api_alive && api=1
+    corever=""
+    if test "$api" = "1"; then
+        corever="$(oc_curl_api GET /version 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -n1)"
+    fi
+    test -n "$corever" || corever="$(cat "$DATA/core_version" 2>/dev/null | head -n1)"
+    rules_on=0
+    # 必须精确匹配 "-j 链名$": 否则 OPENCLASH_DNS 会被当成 OPENCLASH(子串),
+    # 于是"透明代理规则丢了"也永远显示已安装、cron 也永远不自愈
+    iptables -t nat -S PREROUTING 2>/dev/null | grep -qE -- "-j $NAT_CHAIN\$" && rules_on=1
+    iptables -t nat -S OUTPUT 2>/dev/null | grep -qE -- "-j $NAT_CHAIN\$" && rules_on=1
+    iptables -t mangle -S PREROUTING 2>/dev/null | grep -qE -- "-j $MANGLE_CHAIN\$" && rules_on=1
+    dns_on=0
+    iptables -t nat -S PREROUTING 2>/dev/null | grep -qE -- "-j $DNS_CHAIN\$" && dns_on=1
+
+    local o="{"
+    o="$o$(oc_num running "$(test -n "$p" && echo 1 || echo 0)"),"
+    o="$o$(oc_num pid "${p:-0}"),"
+    o="$o$(oc_num uptime "$up"),"
+    o="$o$(oc_num mem_kb "${mem:-0}"),"
+    o="$o$(oc_num api "$api"),"
+    o="$o$(oc_num rules "$rules_on"),"
+    o="$o$(oc_kv rules_reason "$(cat "$RRFILE" 2>/dev/null)"),"
+    o="$o$(oc_num dns_hijack "$dns_on"),"
+    o="$o$(oc_kv mode "$(cfg_get mode)"),"
+    o="$o$(oc_kv cfg_mode "$(cfg_get cfg_mode)"),"
+    o="$o$(oc_kv clash_mode "$(cfg_get clash_mode)"),"
+    o="$o$(oc_kv ctrl "$(cfg_get ctrl)"),"
+    o="$o$(oc_kv secret "$(cfg_get secret)"),"
+    o="$o$(oc_kv mixed_port "$(cfg_get mixed_port)"),"
+    o="$o$(oc_kv redir_port "$(cfg_get redir_port)"),"
+    o="$o$(oc_kv tproxy_port "$(cfg_get tproxy_port)"),"
+    o="$o$(oc_kv dns_port "$(cfg_get dns_port)"),"
+    o="$o$(oc_kv sub_url "$(cfg_get sub_url)"),"
+    o="$o$(oc_kv sub_time "$(cfg_get sub_time)"),"
+    o="$o$(oc_kv sub_format "$(cfg_get sub_format)"),"
+    o="$o$(oc_kv core_version "$corever"),"
+    o="$o$(oc_num core_exists "$(test -x "$CORE" && echo 1 || echo 0)"),"
+    o="$o$(oc_kv core_dir "$(core_target_dir)"),"
+    # geo 状态用 geo_ok 判定(与 doctor 一致), 避免"残留半个文件"显示成"有"
+    o="$o$(oc_num geosite "$(geo_active_ok GeoSite.dat && echo 1 || echo 0)"),"
+    o="$o$(oc_num geoip "$(geo_active_ok Country.mmdb && echo 1 || echo 0)"),"
+    o="$o$(oc_kv rules_file "$BYPASS"),"
+    o="$o$(oc_kv lan_if "$(lan_if_detect)"),"
+    o="$o$(oc_kv plugin_version "$(sed -n 's/^version=//p' "$PLUGIN_DIR/Release" 2>/dev/null | head -n1)"),"
+    o="$o$(oc_kv config_file "$RENDERED"),"
+    o="$o$(oc_kv log_file "$RLOG")"
+    o="$o}"
+    printf '%s' "$o"
+    return 0
+}
+
+doctor() {
+    local ok="[ OK ]" warn="[WARN]" bad="[FAIL]"
+    oc_echo "OpenClash for iKuai 环境自检 $(date '+%Y-%m-%d %H:%M:%S')"
+    oc_echo "插件目录 : $PLUGIN_DIR"
+    oc_echo "系统     : $(uname -srm 2>/dev/null)"
+    oc_echo "bash     : ${BASH_VERSION:-unknown}"
+    oc_echo ""
+    oc_echo "--- 依赖命令 ---"
+    local c
+    for c in bash curl iptables ip nslookup openssl sed awk grep unzip; do
+        if have "$c"; then printf '%-10s %s\n' "$c" "$ok $(command -v "$c")"
+        else printf '%-10s %s\n' "$c" "$bad 缺失"; fi
+    done
+    printf '%-10s %s\n' "ipset" "$(have ipset && echo "$ok" || echo "$warn 缺失(仅自定义规则需要)")"
+    oc_echo ""
+    oc_echo "--- 内核与数据 ---"
+    if test -x "$CORE"; then
+        printf '%s\n' "内核二进制 $ok $(wc -c < "$CORE") 字节"
+        printf '%s\n' "内核版本   $("$CORE" -v 2>/dev/null | head -n1)"
+    else
+        printf '%s\n' "内核二进制 $bad 缺失: $CORE"
+    fi
+    local f p
+    for f in Country.mmdb GeoSite.dat; do
+        p="$(geo_path "$SHARE/geo/$f")"
+        if geo_ok "$p"; then
+            printf '%-12s %s\n' "$f" "$ok $(wc -c < "$p") 字节 -> $p"
+        elif test -f "$p"; then
+            printf '%-12s %s\n' "$f" "$bad 内容无效($(wc -c < "$p") 字节) —— 删除或重新获取, 否则内核会联网下载并卡 90 秒；配置里已自动降级"
+        elif test -f "$SHARE/geo/$f.bad"; then
+            printf '%-12s %s\n' "$f" "$warn 已隔离为 .bad(内容无效), 规则已降级(occtl cleanup 可删除)"
+        else
+            printf '%-12s %s\n' "$f" "$warn 缺失(相关规则自动降级)"
+        fi
+    done
+    oc_echo "geosite 开关 : $(cfg_get geosite)  (auto=按数据可用性决定 / 1=强制启用 / 0=强制关闭)"
+    test -d "$SHARE/ui" && printf '%s\n' "面板资源   $ok $(du -sh "$SHARE/ui" 2>/dev/null | awk '{print $1}')" || \
+        printf '%s\n' "面板资源   $warn 未包含"
+    oc_echo ""
+    oc_echo "--- 透明代理能力 ---"
+    test -c /dev/net/tun && printf '%s\n' "TUN 设备   $ok /dev/net/tun" || printf '%s\n' "TUN 设备   $warn 不可用(无法使用 tun 模式)"
+    have iptables && iptables -t nat -S >/dev/null 2>&1 && printf '%s\n' "iptables nat $ok" || printf '%s\n' "iptables nat $bad 不可用"
+    has_tproxy && printf '%s\n' "TPROXY     $ok 可用" || printf '%s\n' "TPROXY     $warn 不可用(只能 redirect/tun)"
+    have ip && printf '%s\n' "策略路由   $ok ip 命令存在" || printf '%s\n' "策略路由   $warn 缺 ip 命令(tproxy 模式不可用)"
+    printf '%-10s %s\n' "LAN 网卡" "$(lan_if_detect)"
+    oc_echo ""
+    oc_echo "--- 运行状态 ---"
+    status_text
+    oc_echo ""
+    oc_echo "--- 规则 ---"
+    rules_show
+    return 0
+}
+
+# ------------------------------------------------------------------ 分发
+
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ---------------------------------------------------------------- 互斥锁
+# cron 守护(每分钟) / boot.sh / 页面点击 / 多个标签页 都会调用 occtl,
+# 而无锁时会撞出"双内核 + PID 文件错乱 + 规则互相拆" —— 状态改变类命令必须串行。
+LOCKD="$RUNDIR/occtl.lock.d"
+oc_lock() {
+    local max="${1:-120}" i=0
+    mkdir -p "$RUNDIR" 2>/dev/null
+    while ! mkdir "$LOCKD" 2>/dev/null; do
+        # 持有者被 kill 会留下死锁: 超过 2 分钟强制接管
+        if test -n "$(find "$LOCKD" -maxdepth 0 -mmin +2 2>/dev/null)"; then
+            rm -rf "$LOCKD" 2>/dev/null
+            continue
+        fi
+        test "$max" = "0" && return 1
+        i=$((i + 1))
+        if test "$i" -gt "$max"; then
+            oc_err "另一个 occtl 操作正在进行, 请稍后重试"
+            return 1
+        fi
+        sleep 1
+    done
+    trap 'rm -rf "$LOCKD" 2>/dev/null' EXIT INT TERM
+    return 0
+}
+
+cmd="$1"
+shift 2>/dev/null
+
+# 只读命令不加锁(页面轮询不能被卡); autostart 撞上就退出(下一分钟再来)
+case "$cmd" in
+    # sub-auto 只写一个 cron 文件, 幂等且毫秒级, 不该抢互斥锁(它会被 bootstrap 在每次
+    # 请求里调用, 一旦和 start/render 之类的长任务撞上就会白等最多 120 秒)
+    ""|-h|--help|help|version|status|status-json|log|log-clear|conf-get|conf-dump|sub-detect|\
+core-status|api|doctor|rules-show|ports|sub-auto) : ;;
+    autostart) oc_lock 0 || exit 0 ;;
+    *)         oc_lock 120 || exit 1 ;;
+esac
+
+core_resolve
+
+case "$cmd" in
+    setup)         setup ;;
+    conf-init)     cfg_init; oc_echo "$CONF" ;;
+    conf-get)      cfg_get "$1" ;;
+    conf-set)      cfg_init; cfg_set "$1" "$(oc_urldecode "$2")"; oc_echo "$1=$(cfg_get "$1")" ;;
+    conf-dump)     cfg_dump_json ;;
+    render)        render ;;
+    rules)         rules_apply ;;
+    unrules)       rules_remove ;;
+    rules-show)    rules_show ;;
+    start)         start ;;
+    stop)          stop ;;
+    restart)       stop >/dev/null; start ;;
+    reload)
+        if core_alive >/dev/null; then
+            # 热重载: 内核的 PUT /configs 只接受工作目录(-d)内的路径, 且 HTTP 失败时
+            # curl 仍返回 0 —— 必须检查响应内容, 否则会"报成功但根本没生效"。
+            out="$(oc_curl_api PUT /configs '{"path":"'"$RENDERED"'"}' 2>/dev/null)"
+            case "$out" in
+                *"level"*"error"*|*'"message"'*|'')
+                    oc_log "热重载未生效(响应: ${out:-空}), 回落为完整重启"
+                    stop >/dev/null
+                    start
+                    ;;
+                *) oc_echo "已热重载配置" ;;
+            esac
+        else
+            oc_echo "内核未运行, 无需重载"
+        fi
+        ;;
+    status)        status_text ;;
+    status-json)   status_json ;;
+    doctor)        doctor ;;
+    test)          test_config ;;
+    log)
+        n="${1:-120}"
+        test -f "$RLOG" && tail -n "$n" "$RLOG" || oc_echo "(暂无日志: $RLOG)"
+        ;;
+    sub-update)    sub_update "${1:-auto}" ;;
+    sub-auto)      sub_auto_apply ;;
+    sub-auto-run)  sub_auto_run ;;
+    log-clear)     log_clear ;;
+    sub-detect)    sub_detect "${1:-$SUBDIR/raw.txt}" ;;
+    sub-import)    sub_import "$1" ;;
+    sub-import-custom) sub_import_custom "$1" ;;
+    bypass-refresh) bypass_refresh ;;
+    bypass-add)    bypass_add "${1:-}" ;;
+    bypass-del)    bypass_del "${1:-}" ;;
+    bypass-list)   bypass_list ;;
+    core-status)   core_status ;;
+    core-fetch)    core_fetch "${1:-}" ;;
+    geo-fetch)     geo_fetch ;;
+    geo-import)    geo_import "$1" ;;
+    ui-fetch)      ui_fetch ;;
+    cleanup)       cleanup ;;
+    api)
+        method="${1:-GET}"; path="$2"; body="$3"
+        oc_curl_api "$method" "$path" "$body"
+        ;;
+    version)
+        oc_echo "occtl (OpenClash for iKuai) plugin=$(sed -n 's/^version=//p' "$PLUGIN_DIR/Release" 2>/dev/null | head -n1)"
+        ;;
+    ports)
+        # 诊断"规则为什么装不上": 把配置端口与内核实际监听端口摆在一起
+        p="$(core_alive)"
+        oc_echo "内核      : $(test -n "$p" && oc_echo "运行中 (pid $p)" || oc_echo "未运行")"
+        oc_echo "模式      : $(cfg_get mode)"
+        oc_echo "配置端口  : mixed=$(cfg_get mixed_port) redir=$(cfg_get redir_port) tproxy=$(cfg_get tproxy_port) dns=$(cfg_get dns_port) ctrl=$(core_port)"
+        oc_echo "实际监听  : $(listen_ports)"
+        oc_echo "--- 逐个核对 ---"
+        check_port() {
+            printf '%-10s %-6s %s\n' "$1" "$2" \
+                "$(listen_ok "$2" && oc_echo '✔ 已监听' || oc_echo '✘ 未监听')"
+        }
+        check_port mixed  "$(cfg_get mixed_port)"
+        check_port redir  "$(cfg_get redir_port)"
+        check_port tproxy "$(cfg_get tproxy_port)"
+        check_port dns    "$(cfg_get dns_port)"
+        check_port ctrl   "$(core_port)"
+        oc_echo ""
+        oc_echo "规则状态  : 透明代理=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -qE -- "-j $NAT_CHAIN\$" && oc_echo 已安装 || oc_echo 未安装)  DNS 劫持=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -qE -- "-j $DNS_CHAIN\$" && oc_echo 已安装 || oc_echo 未安装)"
+        oc_echo "渲染配置  : $RENDERED"
+        if test -f "$RENDERED"; then
+            oc_echo "--- 配置里的端口声明 ---"
+            grep -nE '^(mixed-port|redir-port|tproxy-port|port|socks-port|external-controller):|^ *listen:' "$RENDERED" 2>/dev/null || oc_echo "(没有找到端口声明)"
+        fi
+        ;;
+    bootstrap)
+        # 开机/安装时的统一入口: 建目录 + 按 enable 决定是否启动
+        setup
+        if test "$(cfg_get enable)" = "1"; then
+            start
+        else
+            oc_echo "enable=0, 仅完成目录与软链准备, 未启动内核"
+        fi
+        ;;
+    autostart)
+        # 供 cron/守护使用: 内核不在就拉起来; 内核在但规则丢了(重启后)就补规则
+        test "$(cfg_get enable)" = "1" || exit 0
+        if core_alive >/dev/null; then
+            need=0
+            case "$(cfg_get mode)" in
+                redirect) iptables -t nat -S PREROUTING 2>/dev/null | grep -qE -- "-j $NAT_CHAIN\$" || need=1 ;;
+                tproxy)   iptables -t mangle -S PREROUTING 2>/dev/null | grep -qE -- "-j $MANGLE_CHAIN\$" || need=1 ;;
+            esac
+            if test "$(cfg_get dns_hijack)" = "1"; then
+                iptables -t nat -S PREROUTING 2>/dev/null | grep -qE -- "-j $DNS_CHAIN\$" || need=1
+            fi
+            test "$need" = "1" && { oc_log "守护: 规则缺失, 重新安装"; rules_apply >>"$RLOG" 2>&1; }
+        else
+            if ! start >>"$RLOG" 2>&1; then
+                # 起不来就把规则撤掉, 避免"规则在、内核不在"导致断网
+                oc_log "守护: 启动失败, 清理透明代理规则以免断网"
+                rules_remove >>"$RLOG" 2>&1
+            fi
+        fi
+        ;;
+    ""|-h|--help|help) usage ;;
+    *) oc_err "未知命令: $cmd"; usage; exit 1 ;;
+esac

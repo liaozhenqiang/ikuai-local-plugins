@@ -1,0 +1,387 @@
+#!/bin/bash
+#
+# ttydctl —— TTYD 网页终端 控制器(纯 shell)
+#
+# 框架会把 pkg/bin/* 软链到 /usr/sbin/ 并去掉 .sh 后缀, 设备上直接 `ttydctl <命令>`。
+#
+# 命令:
+#   start [nowait] | stop | restart    启停(幂等; nowait 给开机用)
+#   status | status-json               人类可读 / JSON 状态
+#   port <1-65535>                     自定义端口(先停->改->再起, 失败回滚)
+#   auth <0|1>                         是否启用访问口令(Basic Auth)
+#   passwd <新密码>                     设置访问口令(用户名固定 admin)
+#   log [行数]                         查看运行日志
+#   ensure                             确保目录就位(不启动)
+#   version                            版本
+#
+# 真机实测结论(改之前先看):
+#   * ttyd 1.7.7 官方 ttyd.x86_64 是纯静态 ELF, uClibc 1.0.40 设备直接跑;
+#     /dev/pts(devpts) 已挂载, 浏览器实测能开 BusyBox shell(截图验证)。
+#   * ttyd 没有配置文件, 一切靠命令行参数, 所以"改设置"= 停进程 -> 改我们的
+#     conf -> 再拉起(顺序无所谓, 但要停干净再起, 否则端口被旧进程占着)。
+#   * 日志用 -d 3(只记 ERR/WARN): 默认 7 会把每次 HTTP 请求都写进日志, 长期跑会涨。
+#   * 设备没有 nohup/setsid, 后台常驻只能 `( trap '' HUP; exec ... ) &`。
+#   * 这是 root shell! 口令默认随机生成并显示在插件页面, 页面上有关闭口令的开关,
+#     关掉前页面会明确警告。
+#
+set -u
+
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+ROOT="${PLUGIN_DIR:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+BIN="$ROOT/share/ttyd"                  # 大二进制放 share/ —— 框架不软链这个目录
+PIDF="$ROOT/data/ttyd.pid"
+STARTF="$ROOT/data/ttyd.start"
+CTLCONF="$ROOT/data/ttydctl.conf"
+LOG=/etc/log/ttyd/ttyd.log
+DEF_PORT=7681
+DEF_USER=admin
+
+have() { command -v "$1" >/dev/null 2>/dev/null; }
+oc_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null; }
+
+# 随机十六进制串(取 6 字节 -> 12 个字符)
+hexstr() {
+    head -c 6 /dev/urandom 2>/dev/null | \
+        hexdump -C 2>/dev/null | \
+        awk '{ sub(/\|.*/,""); sub(/^[^ ]+ */,""); gsub(/ /,""); printf "%s", $0 }'
+}
+
+ensure_dirs() {
+    mkdir -p "$ROOT/data" "$(dirname "$LOG")" 2>/dev/null
+    return 0
+}
+
+cfg_get() { sed -n "s/^$1=//p" "$CTLCONF" 2>/dev/null | head -n1; }
+cfg_set() {
+    local k="$1" v="$2"
+    test -f "$CTLCONF" || : > "$CTLCONF" 2>/dev/null
+    if grep -q "^$k=" "$CTLCONF" 2>/dev/null; then
+        sed -i "s|^$k=.*|$k=$v|" "$CTLCONF" 2>/dev/null
+    else
+        printf '%s=%s\n' "$k" "$v" >> "$CTLCONF" 2>/dev/null
+    fi
+}
+
+# 只认 0/1, 默认开 —— 装完就该能用
+autostart_get() {
+    case "$(cfg_get autostart)" in
+        0) printf '0' ;;
+        *) printf '1' ;;
+    esac
+}
+
+# 口令开关默认开; 只有显式写 0 才关
+auth_get() {
+    case "$(cfg_get auth)" in
+        0) printf '0' ;;
+        *) printf '1' ;;
+    esac
+}
+
+port_get() {
+    local p
+    p="$(cfg_get port)"
+    case "$p" in ''|*[!0-9]*) p="$DEF_PORT" ;; esac
+    printf '%s' "$p"
+}
+
+# 用户名固定 admin; 密码: 首次生成随机值存盘(页面会显示), 之后以 conf 为准
+pass_get() {
+    local p
+    p="$(cfg_get pass)"
+    if test -z "$p"; then
+        p="$(hexstr)"
+        case "$p" in
+            '') return 1 ;;
+            *)  cfg_set pass "$p" ;;
+        esac
+    fi
+    printf '%s' "$p"
+}
+
+# 日志超过 1MB 只留最后 1000 行(每次看日志/启动时都会顺手裁一次)
+log_trim() {
+    local kb
+    kb="$(du -k "$LOG" 2>/dev/null | awk '{print $1}')"
+    case "$kb" in ''|*[!0-9]*) return 0 ;; esac
+    if test "$kb" -gt 1024; then
+        tail -n 1000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG" 2>/dev/null
+        oc_log "[log] 日志过大($kb KB), 已裁剪"
+    fi
+    return 0
+}
+
+pid_alive() {
+    local p
+    test -f "$PIDF" || return 1
+    p="$(cat "$PIDF" 2>/dev/null)"
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$p" 2>/dev/null || return 1
+    # 防 pid 复用: 必须是"我们的 ttyd"(cmdline 里有自己的二进制路径)
+    if test -r "/proc/$p/cmdline"; then
+        case "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" in
+            *"$BIN"*) : ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+# 端口是否已被"别的进程"占用(自己占用不算)。没有 netstat 就放弃预判,
+# 启动时还有"进程秒退"检测兜底。
+port_busy_others() {
+    local p="$1" self line pid
+    have netstat || return 1
+    self="$(cat "$PIDF" 2>/dev/null)"
+    line="$(netstat -tlnp 2>/dev/null | awk -v pt=":$p\$" '$4 ~ pt {print $NF; exit}')"
+    case "$line" in ''|'-'*) return 1 ;; esac
+    pid="${line%%/*}"
+    case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+    test "$pid" = "$self" && return 1
+    return 0
+}
+
+# 端口真的在应答了才算"就绪"(进程死了立即返回, 不傻等)
+port_ready() {
+    local p="$1" i=0
+    if ! have curl; then return 0; fi
+    while test "$i" -lt 30; do
+        if ! pid_alive; then
+            oc_log "[start] 进程已退出, 启动失败"
+            return 1
+        fi
+        if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$p/" 2>/dev/null; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    return 1
+}
+
+# 日志里带可能的控制字符, 摘出来给用户看之前剥掉
+plain() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' 2>/dev/null; }
+
+cmd_start() {
+    local port auth pass args=""
+    test -x "$BIN" || { echo "缺少 ttyd 二进制: $BIN"; return 1; }
+    ensure_dirs
+    log_trim
+    if pid_alive; then
+        echo "ttyd 已在运行 pid=$(cat "$PIDF")"
+        return 0
+    fi
+    port="$(port_get)"
+    auth="$(auth_get)"
+    case "$auth" in
+        1)  pass="$(pass_get)" || { echo "生成访问口令失败"; return 1; }
+            args="$args -c $DEF_USER:$pass" ;;
+    esac
+    # -W 可写(默认只读终端没法敲命令); -d 3 只记错误, 防日志疯长
+    ( trap '' HUP; exec "$BIN" -W -d 3 -p "$port" $args /bin/bash ) >> "$LOG" 2>&1 &
+    printf '%s' "$!" > "$PIDF" 2>/dev/null
+    date +%s > "$STARTF" 2>/dev/null
+    oc_log "[start] pid=$(cat "$PIDF" 2>/dev/null) port=$port auth=$auth"
+    if test "${1:-}" = "nowait"; then
+        echo "ttyd 已启动 pid=$(cat "$PIDF")"
+        return 0
+    fi
+    if port_ready "$port"; then
+        echo "ttyd 已启动 pid=$(cat "$PIDF") 端口=$port"
+        return 0
+    fi
+    echo "ttyd 启动失败(端口 $port 未就绪): $(tail -n 3 "$LOG" 2>/dev/null | plain | tr '\n' ' ' | cut -c1-180)"
+    return 1
+}
+
+cmd_stop() {
+    local p i=0
+    if test -f "$PIDF"; then
+        p="$(cat "$PIDF" 2>/dev/null)"
+        kill "$p" 2>/dev/null
+    fi
+    # 兜底: pid 文件丢了也要按路径把残留进程清掉
+    for p in $(ps 2>/dev/null | grep "ttyd.*$BIN" | grep -v grep | awk '{print $1}'); do
+        kill "$p" 2>/dev/null
+    done
+    # 等它真的退出, 否则马上重启会绑不上端口
+    while test "$i" -lt 10; do
+        test -z "$(ps 2>/dev/null | grep "ttyd.*$BIN" | grep -v grep)" && break
+        i=$((i + 1))
+        sleep 1
+    done
+    rm -f "$PIDF" "$STARTF" 2>/dev/null
+    oc_log "[stop] 已停止"
+    echo "ttyd 已停止"
+    return 0
+}
+
+cmd_restart() {
+    cmd_stop >/dev/null 2>&1
+    sleep 1
+    cmd_start "${1:-}"
+}
+
+json_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+lan_ip() {
+    local i
+    i="$(ip -o -4 addr show 2>/dev/null | \
+         awk '$4 ~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/ {sub(/\/.*/,"",$4); print $4; exit}')"
+    printf '%s' "${i:-127.0.0.1}"
+}
+
+cmd_status_json() {
+    local port running=false pid=0 up=0 ver="" auth=1 pass="" ip
+    test -x "$BIN" || {
+        printf '{"installed":false,"running":false,"error":"缺少 ttyd 二进制, 请重新安装插件"}\n'
+        return 0
+    }
+    port="$(port_get)"
+    auth="$(auth_get)"
+    pass="$(cfg_get pass 2>/dev/null)"
+    if pid_alive; then
+        running=true
+        pid="$(cat "$PIDF" 2>/dev/null)"
+        if test -f "$STARTF"; then
+            up=$(( $(date +%s) - "$(cat "$STARTF" 2>/dev/null)" ))
+        fi
+        case "$up" in ''|*[!0-9]*) up=0 ;; esac
+        test "$up" -lt 0 && up=0
+    fi
+    ver="$("$BIN" --version 2>/dev/null | head -n1 | awk '{print $3}')"
+    ip="$(lan_ip)"
+    printf '{"installed":true,"running":%s,"pid":%s,"uptime":%s,"port":%s,"version":"%s",' \
+        "$running" "${pid:-0}" "${up:-0}" "$port" "$(json_esc "${ver:-}")"
+    printf '"web_url":"http://%s:%s/","auth":"%s","auth_user":"%s","auth_pass":"%s","autostart":%s}\n' \
+        "$ip" "$port" "$auth" "$DEF_USER" "$(json_esc "$pass")" "$(autostart_get)"
+    return 0
+}
+
+cmd_status() {
+    cmd_status_json
+}
+
+cmd_port() {
+    local p="${1:-}" old was_running=no
+    case "$p" in
+        ''|*[!0-9]*) echo "端口必须是数字"; return 1 ;;
+    esac
+    if test "$p" -lt 1 || test "$p" -gt 65535; then
+        echo "端口需在 1~65535 之间"; return 1
+    fi
+    ensure_dirs
+    old="$(port_get)"
+    pid_alive && was_running=yes
+    if test "$p" = "$old"; then
+        echo "端口未变化($p)"
+        return 0
+    fi
+    if port_busy_others "$p"; then
+        echo "端口 $p 已被其它进程占用, 请换一个"
+        return 1
+    fi
+    if test "$was_running" = yes; then
+        cmd_stop >/dev/null 2>&1
+    fi
+    cfg_set port "$p"
+    if test "$was_running" = yes; then
+        if cmd_start wait >/dev/null 2>&1; then
+            oc_log "[port] $old -> $p"
+            echo "端口已改为 $p 并重启"
+            return 0
+        fi
+        cfg_set port "$old"
+        cmd_start wait >/dev/null 2>&1
+        oc_log "[port] $old -> $p 失败, 已回滚到 $old"
+        echo "端口 $p 启动失败, 已回滚到 $old: $(tail -n 3 "$LOG" 2>/dev/null | plain | tr '\n' ' ' | cut -c1-160)"
+        return 1
+    fi
+    oc_log "[port] $old -> $p (未运行, 下次启动生效)"
+    echo "端口已设为 $p(服务未运行, 下次启动生效)"
+    return 0
+}
+
+cmd_auth() {
+    local v="${1:-}" was_running=no
+    case "$v" in
+        0|1) : ;;
+        *)   echo "取值必须是 0 或 1"; return 1 ;;
+    esac
+    pid_alive && was_running=yes
+    if test "$was_running" = yes; then
+        cmd_stop >/dev/null 2>&1
+    fi
+    cfg_set auth "$v"
+    if test "$was_running" = yes; then
+        cmd_start wait >/dev/null 2>&1 || { echo "重启失败, 请查看日志"; return 1; }
+        echo "访问口令已$(test "$v" = 1 && echo 开启 || echo 关闭)并重启"
+    else
+        echo "访问口令已$(test "$v" = 1 && echo 开启 || echo 关闭)(下次启动生效)"
+    fi
+    oc_log "[auth] -> $v"
+    return 0
+}
+
+cmd_autostart() {
+    case "${1:-}" in
+        0|1) cfg_set autostart "$1"
+             echo "开机自启: $(test "$1" = 1 && echo 开启 || echo 关闭)"; return 0 ;;
+        *)   echo "用法: ttydctl autostart <0|1>"; return 1 ;;
+    esac
+}
+
+cmd_passwd_set() {
+    local p="${1:-}" n was_running=no
+    test -n "$p" || { echo "密码不能为空"; return 1; }
+    # 参数值不能含空格/引号(lua 侧会拒)。用 grep 做白名单校验:
+    # case 模式里写不开 & 这种字符(bash 会当控制符切词)。
+    if printf '%s\n' "$p" | grep -q '[^0-9A-Za-z!@#$%^*()_+.,:;<>?/~{}-]'; then
+        echo "密码含不允许的字符(不能有空格、引号、反斜杠、方括号)"; return 1
+    fi
+    n="${#p}"
+    if test "$n" -lt 4; then echo "密码至少 4 位"; return 1; fi
+    if test "$n" -gt 64; then echo "密码最多 64 位"; return 1; fi
+    ensure_dirs
+    pid_alive && was_running=yes
+    if test "$was_running" = yes; then
+        cmd_stop >/dev/null 2>&1
+    fi
+    cfg_set pass "$p"
+    if test "$was_running" = yes; then
+        cmd_start wait >/dev/null 2>&1 || { echo "重启失败, 请查看日志"; return 1; }
+        echo "访问口令已修改并重启"
+    else
+        echo "访问口令已修改(下次启动生效)"
+    fi
+    oc_log "[passwd] 访问口令已修改"
+    return 0
+}
+
+cmd_log() {
+    local n="${1:-60}"
+    case "$n" in ''|*[!0-9]*) n=60 ;; esac
+    log_trim
+    tail -n "$n" "$LOG" 2>/dev/null || echo "(暂无日志)"
+}
+
+cmd_version() {
+    "$BIN" --version 2>/dev/null | head -n1
+}
+
+case "${1:-}" in
+    start)         shift; cmd_start "${1:-wait}" ;;
+    start-nowait)  cmd_start nowait ;;
+    stop)          cmd_stop ;;
+    restart)       cmd_restart wait ;;
+    status)        cmd_status ;;
+    status-json)   cmd_status_json ;;
+    port)          shift; cmd_port "${1:-}" ;;
+    auth)          shift; cmd_auth "${1:-}" ;;
+    autostart)     shift; cmd_autostart "${1:-}" ;;
+    passwd)        shift; cmd_passwd_set "${1:-}" ;;
+    log)           shift; cmd_log "${1:-60}" ;;
+    ensure)        ensure_dirs; pass_get >/dev/null 2>&1; log_trim; echo "目录与配置已就位" ;;
+    version)       cmd_version ;;
+    *)             sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

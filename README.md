@@ -1,12 +1,15 @@
 # ikuai-local-plugins
 
-两个给 iKuai（爱快）软路由用的第三方插件，目标是**不绑定爱快云也能在本地看到/管住局域网设备**。
-纯 shell + Lua + 前端补丁，不需要额外的服务器、Docker 或主机。
+自己写的两个 iKuai（爱快）软路由插件，加上**我这台路由器上在跑的其它 15 个社区插件的集成层源码**
+（AdGuard Home / AList / aria2 / OpenClash / FRP / NPS / TTYD …，见 [plugins/](plugins/README.md)）。
+目标都是：不绑定爱快云，也能在本地看到/管住路由器上的服务。纯 shell + Lua + 前端补丁，
+不需要额外的服务器、Docker 或主机。
 
-| 插件 | 状态 | 作用 |
+| 目录 | 状态 | 作用 |
 | --- | --- | --- |
 | [devmon](devmon/README.md) | **在用 / 1.1.0** | 把「状态监控」下被云平台拦住的摄像头/交换机/周边设备三个页面合并成一个本地「周边设备监控」：设备清单、品牌型号、在线/离线、增删改、局域网发现导入、新设备自动收录 |
 | [mimon](mimon/README.md) | 已废弃（存档） | 小米/米家设备发现与监控（ARP + IEEE OUI + miIO DID + iKuai 终端列表取型号）。已从设备卸载、不再更新，只作为那几段发现实现的参考 |
+| [plugins/](plugins/README.md) | 在用（集成层） | 15 个社区插件的 iKuai 集成层源码：AdGuard Home、AList、aria2、awesun、bnfix、ddns-go、frpc/frps、集客AC、ikupd、miot-panel、npc/nps、OpenClash、TTYD。第三方二进制不入库，需按上游自行补齐 |
 
 ## 运行环境
 

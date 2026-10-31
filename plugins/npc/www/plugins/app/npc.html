@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>NPC 内网穿透客户端</title>
+<style>
+  :root { --bd:#e4e7ed; --fg:#303133; --mut:#909399; --pri:#409eff; --ok:#67c23a; --warn:#e6a23c; --err:#f56c6c; --bg:#f5f7fa; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:14px; font:13px/1.6 "Microsoft YaHei",Helvetica,Arial,sans-serif; color:var(--fg); background:#fff; }
+  h3 { margin:0; font-size:15px; }
+  h4 { margin:16px 0 6px; font-size:13px; color:#606266; }
+  .bar { display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; }
+  .card { flex:1 1 150px; min-width:140px; border:1px solid var(--bd); border-radius:6px; padding:10px 12px; background:var(--bg); }
+  .card .k { color:var(--mut); font-size:12px; }
+  .card .v { font-size:15px; font-weight:700; margin-top:2px; word-break:break-all; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .err { color:var(--err); }
+  button { cursor:pointer; border:1px solid var(--bd); background:#fff; border-radius:4px; padding:5px 12px; font-size:12px; }
+  button:hover { border-color:var(--pri); color:var(--pri); }
+  button.pri { background:var(--pri); border-color:var(--pri); color:#fff; }
+  button.danger:hover { border-color:var(--err); color:var(--err); }
+  .msg { min-height:18px; font-size:12px; color:var(--mut); }
+  .tag { display:inline-block; padding:1px 7px; border-radius:9px; font-size:11px; background:var(--bd); color:#fff; }
+  .tip { color:var(--mut); font-size:12px; line-height:1.8; }
+  .warnbox { border:1px solid #fde2e2; background:#fef0f0; color:#c45656; border-radius:5px; padding:7px 10px; font-size:12px; margin:6px 0; }
+  input { border:1px solid var(--bd); border-radius:4px; padding:4px 8px; font-size:12px; }
+  code { background:#f2f3f5; padding:0 4px; border-radius:3px; }
+  label { color:var(--mut); font-size:12px; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h3 style="margin:0">NPC 内网穿透客户端</h3>
+  <span class="tag">npc</span>
+  <span style="flex:1"></span>
+  <span class="msg" id="msg"></span>
+  <button onclick="load()">刷新</button>
+</div>
+
+<div class="row" id="cards"></div>
+
+<h4>控制</h4>
+<div class="bar">
+  <button class="pri" onclick="ctl('start')">启动</button>
+  <button class="danger" onclick="ctl('stop')">停止</button>
+  <button onclick="ctl('restart')">重启</button>
+</div>
+<div class="bar">
+  <label>开机自启</label>
+  <button id="auto1" onclick="setAuto(1)">开启</button>
+  <button id="auto0" onclick="setAuto(0)">关闭</button>
+  <span class="tip">关闭后，重启路由器不会自动连接服务端，需手动点「启动」</span>
+</div>
+
+<h4>配置</h4>
+<div class="bar">
+  <label>服务端地址</label> <input id="server" size="22" placeholder="1.2.3.4:8024">
+  <label>密钥 vkey</label> <input id="vkey" size="22" placeholder="在 nps 的客户端页面复制">
+</div>
+<div class="bar">
+  <label>附加参数</label> <input id="extra" size="46" placeholder="可留空，例如 -config=conf/npc.conf">
+  <button class="pri" onclick="save()">保存并重启</button>
+</div>
+<div id="hint" class="tip"></div>
+<p class="tip">
+  服务端地址与密钥请到 <b>nps 服务端</b> 的 Web 管理界面里新建一个客户端，页面会直接给出连接命令
+  <code>npc -server=&lt;地址&gt; -vkey=&lt;密钥&gt;</code>，把这两项填进来即可。
+  配置保存在 <code>/etc/mnt/plugins/npc/data/npc.env</code>，重启与升级不丢。
+</p>
+
+<h4>运行日志 <button onclick="loadLog()">刷新日志</button> <button class="danger" onclick="clearLog()">清空日志</button></h4>
+<pre id="log" style="max-height:300px;overflow:auto;background:var(--bg);border:1px solid var(--bd);border-radius:4px;padding:8px;font-size:12px;white-space:pre-wrap;word-break:break-all;margin:0">（点「刷新日志」查看）</pre>
+
+<script>
+
+function api(action, param) {
+  return fetch('/Action/call', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ func_name:'npc', action:action, param:param||{} })
+  }).then(function(r){ return r.json(); }).then(function(j){
+    if (j.Result !== 30000) { throw new Error(j.ErrMsg || ('错误码 '+j.Result)); }
+    return j.Data || {};
+  });
+}
+function tip(t, cls) {
+  var m = document.getElementById('msg');
+  m.textContent = t || ''; m.className = (cls || 'msg');
+  if (t) { setTimeout(function(){ if (m.textContent===t) m.textContent=''; }, 7000); }
+}
+function card(k, v, cls) {
+  return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';
+}
+function pick(d, key) { return (d && d[key]) || (d && d.data && d.data[key]) || null; }
+function hint(text, cls) {
+  var el = document.getElementById('hint');
+  el.className = cls || 'tip';
+  el.textContent = text || '';
+}
+function setVal(id, v) {
+  var el = document.getElementById(id);
+  if (document.activeElement !== el) el.value = (v == null ? '' : v);
+}
+
+var curStatus = {};
+function isRun() {
+  var r = curStatus.running;
+  return r === true || r === 'true' || r === 1 || r === '1';
+}
+
+function load() {
+  return api('show', {TYPE:'data'}).then(function(d){
+    var s = pick(d,'status') || {};
+    curStatus = s;
+    var run = isRun();
+    var html = '';
+    html += card('运行状态', run ? '运行中' : '未运行', run ? 'ok' : 'err');
+    html += card('进程 PID', s.pid || '-');
+    html += card('服务端', s.server || '未配置', s.server ? '' : 'warn');
+    html += card('版本', 'v' + (s.version || '-'));
+    document.getElementById('cards').innerHTML = html;
+
+    setVal('server', s.server);
+    setVal('vkey', s.vkey);
+    setVal('extra', s.extra);
+    setAutoUI(s.autostart);
+
+    if (!s.server || !s.vkey) {
+      hint('尚未配置 —— 请填写服务端地址与密钥后点「保存并重启」。', 'warnbox');
+    } else if (!run) {
+      hint('已配置但未运行 —— 点上面的「启动」试试；若仍失败，请确认服务端地址可达、密钥正确。', 'warnbox');
+    } else {
+      hint('正在运行，已连接 ' + s.server + '。隧道是否生效请到 nps 服务端的客户端列表查看。');
+    }
+  }).catch(function(e){ tip('加载失败: '+e.message, 'err'); });
+}
+function ctl(action) {
+  api(action, {}).then(function(){ tip('已执行: '+action, 'ok'); load(); })
+    .catch(function(e){ tip('操作失败: '+e.message, 'err'); });
+}
+// 开机自启: 只改"下次开机要不要自动连上去", 不动当前运行状态
+function setAuto(v) {
+  api('seting', {key:'autostart', value:String(v)}).then(function(){
+    tip(v ? '开机自启已开启' : '开机自启已关闭', 'ok'); load();
+  }).catch(function(e){ tip('保存失败: '+e.message, 'err'); });
+}
+function setAutoUI(v) {
+  var on = (v === '1' || v === 1 || v === true);
+  document.getElementById('auto1').className = on ? 'pri' : '';
+  document.getElementById('auto0').className = on ? '' : 'danger';
+}
+function save() {
+  var s = document.getElementById('server').value.trim();
+  var v = document.getElementById('vkey').value.trim();
+  var x = document.getElementById('extra').value.trim();
+  if (!s) { tip('服务端地址不能为空', 'err'); return; }
+  if (!v) { tip('密钥不能为空', 'err'); return; }
+
+  var items = [['server', s], ['vkey', v]];
+  if (x !== '') items.push(['extra', x.replace(/ /g, '+')]);
+
+  var p = Promise.resolve();
+  items.forEach(function(it){
+    p = p.then(function(){ return api('seting', {key:it[0], value:it[1]}); });
+  });
+  p.then(function(){ return api('restart', {}); })
+   .then(function(){ tip('已保存并重启', 'ok'); load(); })
+   .catch(function(e){ tip('保存/重启失败: '+e.message, 'err'); load(); });
+}
+
+function loadLog(){
+  var e = document.getElementById('log');
+  e.textContent = '读取中 …';
+  return api('show', {TYPE:'log'}).then(function(d){
+    e.textContent = pick(d, 'log') || '(无日志)';
+    e.scrollTop = e.scrollHeight;
+  }).catch(function(err){ e.textContent = '读取失败: ' + err.message; });
+}
+function clearLog(){
+  if (!confirm('确定清空运行日志吗？')) return;
+  api('logclear', {}).then(function(){ tip('日志已清空', 'ok'); return loadLog(); })
+    .catch(function(err){ tip('清空失败: ' + err.message, 'err'); });
+}
+
+load();
+setInterval(function(){ if (!document.hidden) load(); }, 15000);
+</script>
+</body>
+</html>

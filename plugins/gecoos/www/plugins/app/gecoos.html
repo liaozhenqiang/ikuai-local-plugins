@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>集客AC 无线控制器</title>
+<style>
+  :root { --bd:#e4e7ed; --fg:#303133; --mut:#909399; --pri:#409eff; --ok:#67c23a; --warn:#e6a23c; --err:#f56c6c; --bg:#f5f7fa; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:14px; font:13px/1.6 "Microsoft YaHei",Helvetica,Arial,sans-serif; color:var(--fg); background:#fff; }
+  h3 { margin:0 0 10px; font-size:15px; }
+  h4 { margin:16px 0 6px; font-size:13px; color:#606266; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; }
+  .card { flex:1 1 150px; min-width:140px; border:1px solid var(--bd); border-radius:6px; padding:10px 12px; background:var(--bg); }
+  .card .k { color:var(--mut); font-size:12px; }
+  .card .v { font-size:16px; font-weight:700; margin-top:2px; word-break:break-all; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .err { color:var(--err); } .mut { color:var(--mut); }
+  pre { margin:0; padding:10px; background:#1e1e1e; color:#d4d4d4; border-radius:5px; max-height:260px; overflow:auto; font:12px/1.5 Consolas,Monaco,monospace; white-space:pre-wrap; }
+  button { cursor:pointer; border:1px solid var(--bd); background:#fff; border-radius:4px; padding:5px 12px; font-size:12px; }
+  button:hover:not(:disabled) { border-color:var(--pri); color:var(--pri); }
+  button.pri { background:var(--pri); border-color:var(--pri); color:#fff; }
+  button.pri:hover:not(:disabled) { background:#66b1ff; color:#fff; }
+  button.dgr { color:var(--err); border-color:#fbc4c4; }
+  button.dgr:hover:not(:disabled) { background:var(--err); border-color:var(--err); color:#fff; }
+  button:disabled { cursor:not-allowed; opacity:.5; }
+  .bar { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  .msg { min-height:18px; font-size:12px; color:var(--mut); }
+  .tag { display:inline-block; padding:1px 8px; border-radius:9px; font-size:11px; color:#fff; background:var(--mut); }
+  .tag.run { background:var(--ok); } .tag.stp { background:var(--err); }
+  .tip { color:var(--mut); font-size:12px; line-height:1.8; }
+  input { border:1px solid var(--bd); border-radius:4px; padding:4px 8px; font-size:12px; }
+  input:focus { outline:none; border-color:var(--pri); }
+  code { background:#f2f3f5; padding:0 4px; border-radius:3px; }
+  .linkbox { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+  .linkbox a { color:var(--pri); text-decoration:none; word-break:break-all; }
+  .linkbox a:hover { text-decoration:underline; }
+  .warnbox { background:#fdf6ec; border:1px solid #faecd8; border-radius:6px; padding:10px 12px; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <h3 style="margin:0">集客AC 无线控制器</h3>
+  <span class="tag stp" id="tag">检测中…</span>
+  <span style="flex:1"></span>
+  <span class="msg" id="msg"></span>
+  <button onclick="load()">刷新</button>
+</div>
+
+<div class="row" id="cards"></div>
+
+<h4>管理入口</h4>
+<div class="linkbox">
+  <span class="mut">管理地址:</span><a id="webUrl" href="#" target="_blank">—</a>
+  <button id="bOpen" class="pri" onclick="openWeb()">打开管理页面</button>
+  <button onclick="copyText(el('webUrl').href)">复制</button>
+</div>
+<div id="credBox" class="warnbox">
+  Web 登录密码 <b id="webPass" style="user-select:all"></b>
+  <button onclick="copyText(el('webPass').textContent)">复制</button>
+  <span class="tip">（在 AC 登录页输入；默认 <code>admin</code>，建议装好就改掉）</span>
+</div>
+
+<h4>服务</h4>
+<div class="bar">
+  <button id="bStart" class="pri" onclick="ctl('start')">启动</button>
+  <button id="bStop"  class="dgr" onclick="ctl('stop')">停止</button>
+  <button id="bRestart" onclick="ctl('restart')">重启</button>
+  <span class="tip">改端口/密码会自动重启生效</span>
+</div>
+
+<h4>设置</h4>
+<div class="bar">
+  管理端口 <input id="port" size="6" maxlength="5" placeholder="8080">
+  <button class="pri" onclick="savePort()">保存端口</button>
+  <span class="tip">默认 8080；冲突会自动保留旧端口</span>
+</div>
+<div class="bar">
+  AP通信端口 <input id="apport" size="6" maxlength="5" placeholder="60650">
+  <button class="pri" onclick="saveApport()">保存端口</button>
+  <span class="tip">默认 <b>60650</b> —— 集客 AP 用它发现/关联 AC，<b>改了 AP 就找不到 AC</b>，没有特殊需求别动</span>
+</div>
+<div class="bar">
+  开机自启
+  <button id="bAuto1" onclick="saveAuto(1)">开启</button>
+  <button id="bAuto0" onclick="saveAuto(0)">关闭</button>
+</div>
+<div class="bar">
+  公网访问
+  <button id="bWan1" onclick="saveWan(1)">开启</button>
+  <button id="bWan0" onclick="saveWan(0)">关闭</button>
+  <span class="tip">默认 <b>关闭</b> —— 关闭时外网连不上管理界面，只有内网能进（更安全）；
+    需要从外网管理 AC 时再打开。<b>AP 通信端口不受此开关控制</b>，AP 该连还能连。</span>
+</div>
+
+<h4>Web 管理密码</h4>
+<div class="bar">
+  新密码 <input id="npwd" size="22" autocomplete="new-password">
+  <button onclick="genPwd()">随机生成</button>
+  <button class="pri" onclick="savePwd()">修改密码</button>
+  <span class="tip">4~64 位，不能含空格、引号、反斜杠；改完用新密码登录 AC</span>
+</div>
+<div class="tip" style="margin-bottom:8px">
+  密码以本页面显示的为准 —— 如果在 AC 自己的网页里改了密码，插件下次重启会把它改回这里显示的值。
+</div>
+
+<p class="tip">
+  集客 AC 用于集中管理集客(GECOOS)系列 AP：AP 与 AC 在同一二层广播域即可自动发现；
+  跨网段需在 AP 上手动指定 AC 地址(VLAN/路由可达)。AP 固件需 <b>7.6 及以上</b> 才能被 V2.2 管理。<br>
+  管理页面含 AP 配置能力，请勿把端口暴露到公网。
+</p>
+
+<h4>运行日志 <button onclick="loadLog()">刷新日志</button></h4>
+<pre id="log">（点「刷新日志」查看）</pre>
+
+<script>
+function el(id){ return document.getElementById(id); }
+function tip(t, cls){
+  var m = el('msg'); m.textContent = t || ''; m.className = (cls || 'msg');
+  if (t) { setTimeout(function(){ if (m.textContent===t) m.textContent=''; }, 6000); }
+}
+function copyText(t){
+  t = String(t || '');
+  if (!t || t === '—') return;
+  var done = function(){ tip('已复制', 'msg ok'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(done, function(){ fallback(); });
+  } else { fallback(); }
+  function fallback(){
+    var ta = document.createElement('textarea');
+    ta.value = t; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch(e){ tip('复制失败，请手动选择', 'msg err'); }
+    document.body.removeChild(ta);
+  }
+}
+function fmtUp(s){
+  s = parseInt(s, 10) || 0;
+  if (s <= 0) return '-';
+  var d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d) return d + '天' + h + '时';
+  if (h) return h + '时' + m + '分';
+  return m + '分';
+}
+// action 调用: show 类返回 Data, 其它动作成功时后端不回传内容
+function api(action, param, opt){
+  opt = opt || {};
+  var ms = opt.timeout || 20000;
+  var ab = (typeof AbortController === 'function') ? new AbortController() : null;
+  var timer = null;
+  var init = { method:'POST', headers:{'Content-Type':'application/json'},
+               body: JSON.stringify({ func_name:'gecoos', action:action, param:param||{} }) };
+  if (ab) { init.signal = ab.signal; timer = setTimeout(function(){ ab.abort(); }, ms); }
+  return fetch('/Action/call', init).then(function(r){ return r.json(); }).then(function(j){
+    if (timer) clearTimeout(timer);
+    if (j.Result !== 30000) throw new Error(j.ErrMsg || ('错误码 ' + j.Result));
+    return j.Data || {};
+  }).catch(function(e){
+    if (timer) clearTimeout(timer);
+    if (e.name === 'AbortError') throw new Error('后端 ' + Math.round(ms/1000) + ' 秒无响应(action=' + action + ')');
+    throw e;
+  });
+}
+
+var S = null;   // 最近一次 status
+
+function load(){ return api('show', {TYPE:'status'}).then(render).catch(function(e){ tip('加载失败: '+e.message, 'msg err'); }); }
+
+function render(d){
+  var s = d && d.status;
+  if (!s || typeof s !== 'object') { tip('后端没有返回状态数据', 'msg err'); return; }
+  S = s;
+  var run = s.running === true;
+  var tag = el('tag');
+  tag.textContent = run ? '运行中' : '未运行';
+  tag.className = 'tag ' + (run ? 'run' : 'stp');
+
+  var html = '';
+  html += card('运行状态', run ? '运行中' : '未运行', run ? 'ok' : 'err');
+  html += card('管理端口', s.port || '-');
+  html += card('AP通信端口', s.apport || '-');
+  html += card('AC 版本', s.version || '-');
+  html += card('运行时长', run ? fmtUp(s.uptime) : '-');
+  el('cards').innerHTML = html;
+
+  var w = el('webUrl');
+  // 用"当前访问页面用的地址"拼管理 URL —— 路由器可能有多个 IP(WAN/LAN),
+  // 后端猜的 IP 未必是你正在用的那个; location.hostname 一定是你能访问到的。
+  var host = (typeof location !== 'undefined' && location && location.hostname) ? location.hostname : '';
+  var url = host ? ('http://' + host + ':' + (s.port || 8080) + '/') : (s.web_url || '#');
+  w.textContent = url; w.href = url;
+
+  el('bStart').disabled = run; el('bStop').disabled = !run; el('bRestart').disabled = !run;
+
+  if (document.activeElement.id !== 'port') el('port').value = s.port || '';
+  if (document.activeElement.id !== 'apport') el('apport').value = s.apport || '';
+  setSegUI('bAuto', s.autostart);
+  setSegUI('bWan', s.wan_access);
+  el('webPass').textContent = s.passwd || 'admin';
+}
+function card(k, v, cls){
+  return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+'</div></div>';
+}
+
+function setSegUI(base, v){
+  var on = (v == 1 || v === '1' || v === true);
+  el(base+'1').className = on ? 'pri' : '';
+  el(base+'0').className = on ? '' : 'dgr';
+}
+
+function busy(btn, on, txt){
+  if (on) { btn.dataset.t = btn.textContent; btn.textContent = txt || '执行中…'; btn.disabled = true; }
+  else { btn.textContent = btn.dataset.t || btn.textContent; btn.disabled = false; }
+}
+
+function ctl(op){
+  // start/restart 后端要等端口就绪, 给足超时
+  var long = (op === 'start' || op === 'restart');
+  var btn = el(op === 'start' ? 'bStart' : (op === 'stop' ? 'bStop' : 'bRestart'));
+  busy(btn, true);
+  api('ctl', {op:op}, {timeout: long ? 50000 : 15000}).then(function(){
+    tip(op === 'stop' ? '已停止' : '已' + (op === 'start' ? '启动' : '重启'), 'msg ok');
+  }).catch(function(e){
+    tip((op === 'start' ? '启动' : op === 'stop' ? '停止' : '重启') + '失败: ' + e.message, 'msg err');
+  }).then(function(){ busy(btn, false); load(); });
+}
+
+function savePort(){
+  var v = el('port').value.trim();
+  if (!/^\d{1,5}$/.test(v) || +v < 1 || +v > 65535) { tip('端口需为 1~65535 的数字', 'msg err'); return; }
+  if (+v === +((S && S.port) || 0)) { tip('端口未变化', 'msg'); return; }
+  api('seting', {key:'port', value:v}, {timeout:50000}).then(function(){
+    return load();
+  }).then(function(){
+    var now = (S && S.port) ? S.port : v;
+    tip(now == v ? ('管理端口已生效: ' + now) : ('已保留在端口 ' + now + '（新端口不可用）'), S.running ? 'msg ok' : 'msg warn');
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+
+function saveApport(){
+  var v = el('apport').value.trim();
+  if (!/^\d{1,5}$/.test(v) || +v < 1024 || +v > 65535) { tip('AP通信端口需为 1024~65535 的数字', 'msg err'); return; }
+  if (+v === +((S && S.apport) || 0)) { tip('端口未变化', 'msg'); return; }
+  if (+v !== 60650 && !window.confirm('60650 是集客 AP 的标准通信端口，改成 ' + v + ' 后 AP 将无法自动发现 AC，\n需要在每台 AP 上手动指定新的 AC 地址。确定要修改吗？')) return;
+  api('seting', {key:'apport', value:v}, {timeout:50000}).then(function(){
+    return load();
+  }).then(function(){
+    var now = (S && S.apport) ? S.apport : v;
+    tip(now == v ? ('AP通信端口已生效: ' + now) : ('已保留在端口 ' + now + '（新端口不可用）'), 'msg ' + (now == v ? 'ok' : 'warn'));
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+
+function saveAuto(v){
+  api('seting', {key:'autostart', value:String(v)}).then(function(){
+    tip(v ? '开机自启已开启' : '开机自启已关闭', 'msg ok');
+    setSegUI('bAuto', v);
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+
+function saveWan(v){
+  api('seting', {key:'wan_access', value:String(v)}).then(function(){
+    tip(v ? '公网访问已开启：外网可通过 ' + location.hostname + ':' + ((S && S.port) || 8080) + ' 访问管理界面'
+          : '公网访问已关闭：外网连不上管理界面，仅内网可访问', 'msg ok');
+    setSegUI('bWan', v);
+  }).catch(function(e){ tip('保存失败: '+e.message, 'msg err'); });
+}
+
+function genPwd(){
+  var n = 12, s = '', arr = new Uint8Array(n);
+  if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(arr);
+  else for (var i=0;i<n;i++) arr[i] = Math.floor(Math.random()*256);
+  var hex = '0123456789abcdef';
+  for (var i=0;i<n;i++) s += hex[arr[i] & 15];
+  el('npwd').value = s;
+}
+
+function savePwd(){
+  var v = el('npwd').value;
+  if (!v) { tip('请先输入或随机生成新密码', 'msg err'); return; }
+  if (/[\s"'\\]/.test(v)) { tip('密码不能含空格、引号、反斜杠', 'msg err'); return; }
+  if (v.length < 4) { tip('密码至少 4 位', 'msg err'); return; }
+  api('passwd', {op:'set', value:v}, {timeout:50000}).then(function(){
+    el('npwd').value = '';
+    tip('密码已修改, 登录 AC 时用新密码', 'msg ok');
+    return load();
+  }).catch(function(e){ tip('修改失败: '+e.message, 'msg err'); });
+}
+
+function loadLog(){
+  el('log').textContent = '加载中…';
+  api('show', {TYPE:'log'}).then(function(d){
+    el('log').textContent = d.logtext || '（暂无日志）';
+    el('log').scrollTop = el('log').scrollHeight;
+  }).catch(function(e){ el('log').textContent = '加载失败: ' + e.message; });
+}
+
+function openWeb(){
+  var u = (S && S.web_url) || el('webUrl').href;
+  if (u && u !== '#') window.open(u, '_blank');
+}
+
+load();
+setInterval(function(){ if (!document.hidden && !el('npwd').value) load(); }, 30000);
+</script>
+</body>
+</html>

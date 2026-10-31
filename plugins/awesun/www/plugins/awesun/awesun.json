@@ -1,0 +1,1 @@
+{"name":"awesun","manufacturer":"iKuai","version":"1.0.0","title":"向日葵远程控制","author":"deadash","description":"把路由器变成一个可远程控制的向日葵被控端：自带 glibc 运行向日葵 Linux 命令行版，X11 虚拟桌面渲染 TUI 界面，接管远端键鼠，登录身份可持久保留（重启/换机免登录）"}
