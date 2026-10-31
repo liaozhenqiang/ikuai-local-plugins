@@ -10,7 +10,7 @@
 
 | 有完整包 | 只有源码 |
 | --- | --- |
-| adguardhome、alist、aria2、bnfix、ddnsgo、frpc、frps、ikupd、miot-panel、npc、nps、openclash、ttyd | awesun（向日葵官方闭源客户端，473MB）、gecoos（集客 AC 厂商二进制）——主体是厂商程序，不在这里再分发 |
+| adguardhome、alist、aria2、bnfix、ddnsgo、frpc、frps、gecoos、ikupd、miot-panel、npc、nps、openclash、ttyd | awesun（向日葵官方闭源客户端，473MB）——主体是厂商程序，不在这里再分发 |
 
 要自己重新打完整包：在路由器上 `bash tools/pack-on-device.sh <插件名>`，它会排除 `data/`
 （证书 / token / 清单都在那里），并按 `<插件名>-v<版本>-plugin.zip` 命名。
