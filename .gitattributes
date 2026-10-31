@@ -14,5 +14,3 @@ Release     text eol=lf
 # 无扩展名的入口脚本必须是 LF
 devmon/pkg/bin/devmon   text eol=lf
 devmon/pkg/function/devmon text eol=lf
-mimon/pkg/bin/mimon     text eol=lf
-mimon/pkg/function/mimon text eol=lf

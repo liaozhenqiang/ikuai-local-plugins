@@ -1,3 +1,0 @@
-plugin=awesun
-version=1.0.0
-comment=向日葵远程控制 + 虚拟桌面（X11 渲染 / 键鼠接管 / 身份凭证持久化）

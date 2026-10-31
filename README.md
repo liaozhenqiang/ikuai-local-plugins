@@ -1,14 +1,13 @@
 # ikuai-local-plugins
 
 给 iKuai（爱快）软路由用的第三方插件集合：**一个自己写的本地设备监控插件（devmon）**，
-以及**我这台路由器上实际在跑的 15 个社区插件的 iKuai 集成层**。
+以及**我这台路由器上实际在跑的 13 个社区插件的 iKuai 集成层**。
 全部是纯 shell + 前端补丁 + 现成二进制包装，不依赖 Docker、不需要额外主机、不绑定爱快云。
 
 | 目录 | 内容 | 发布形态 |
 | --- | --- | --- |
 | [devmon/](devmon/README.md) | 本地「周边设备监控」（替代云平台的摄像头/交换机/周边设备三个页面） | 源码 + 完整安装包 |
-| [plugins/](plugins/README.md) | 15 个社区插件的集成层源码（AdGuard Home、AList、OpenClash、FRP…） | 源码；其中 14 个提供含二进制的完整包（awesun 仅源码） |
-| [mimon/](mimon/README.md) | 小米/米家设备发现与监控 | 已废弃，只留源码存档 |
+| [plugins/](plugins/README.md) | 13 个社区插件的集成层源码（AdGuard Home、AList、OpenClash、FRP…） | 源码 + 含二进制的完整安装包 |
 
 所有安装包都在 [Releases](releases)，命名统一为 `<插件名>-v<版本>-plugin.zip`，
 **含程序本体、可直接安装，也能被「插件在线升级」(ikupd) 直接升级**。
@@ -25,13 +24,13 @@ ikplugin install /root/devmon-v1.1.0-plugin.zip
 ikplugin remove devmon
 ```
 
-**在线升级**：装好 `ikupd` 后，在它的「仓库列表」里加
+**在线升级**：装好 `ikupd`（第三方在线升级插件，本仓库不包含，用上游的包）后，在它的「仓库列表」里加
 
 ```
 https://github.com/liaozhenqiang/ikuai-local-plugins/releases
 ```
 
-点「检查更新」即可看到本仓库的 15 个包。首次使用建议在「代理 → GitHub Token」填一个
+点「检查更新」即可看到本仓库的 14 个包。首次使用建议在「代理 → GitHub Token」填一个
 只读 Token —— 匿名调 GitHub API 每小时只有 60 次，很容易 `API rate limit exceeded`。
 
 ---
@@ -55,34 +54,27 @@ https://github.com/liaozhenqiang/ikuai-local-plugins/releases
 
 细节（菜单怎么改、数据表结构、CLI、已知限制）见 [devmon/README.md](devmon/README.md)。
 
-### plugins/ — 15 个在用的社区插件
+### plugins/ — 13 个在用的社区插件
 
 | 插件 | 能做什么 |
 | --- | --- |
 | **AdGuard Home** 0.107.79.3 | 局域网 DNS 广告/追踪拦截：启停、重启、改监听端口、上游 DNS 设置、运行日志查看与清空 |
 | **AList** 3.65.0 | 网盘聚合（阿里云盘/115/天翼云盘/夸克/OneDrive…）统一 Web 与 WebDAV：装好即自启，卡片一键打开管理界面，端口可改 |
 | **aria2** 1.0.4 | 多协议下载器（HTTP/FTP/BT/磁力）+ AriaNg 网页界面：RPC 密钥、下载目录（落在数据盘）、启停、日志 |
-| **awesun** 1.0.0 | 向日葵远程控制 + 虚拟桌面（X11 渲染、键鼠接管、多屏、登录绑定、本地密码、凭证保存/还原）<br>⚠️ 含厂商闭源客户端，**不提供安装包**，源码仅供本机使用 |
 | **bnfix** 1.0.0 | 修系统 `libcrypto.so.1.0.0` 里 `BN_mod_sqrt()` 的死循环（1 字节补丁，`je`→`jle`）：状态查询、单点校验、完整校验、重启 |
 | **ddns-go** 6.17.7 | 动态域名解析客户端：启停、重启、监听端口、运行日志 |
 | **frpc** 0.71.1 | FRP 内网穿透客户端：服务端地址与 token、多条 tcp/udp/http/https 代理规则增删、启停、日志 |
 | **frps** 0.71.1 | FRP 内网穿透服务端：通信端口、仪表盘端口、认证 Token 自动生成、启停、日志 |
 | **集客AC (gecoos)** 2.2 | 集中管理集客 AP：启停、管理端口、AP 通信端口、公网访问开关（默认仅内网）、Web 管理密码 |
-| **ikupd** 1.0.0 | 插件在线升级：仓库列表管理、HTTP/socks5 代理、GitHub Token、检查更新、下载校验 sha256、安装/丢弃 |
 | **米家面板 (miot-panel)** 1.1.1 | 跑在路由器本机的米家墙面板（设备控制/摄像头/音乐中心）：启停、端口、日志、一键打开面板 |
 | **npc** 0.26.39 | 内网穿透客户端：装好即开机自启，卡片直达其自身管理界面 |
 | **nps** 0.26.39 | 内网穿透服务端：默认端口 81，装好即自启，卡片直达 Web 管理 |
 | **OpenClash** 0.48.003 | mihomo(Meta) 内核 + 订阅导入/转换 + 透明代理（redirect/tproxy/tun）+ 原生 Web 控制台：配置/订阅/规则/节点/延迟测试/旁路/自检/日志 |
 | **TTYD** 1.7.7 | 浏览器里的 root 终端：启停、自定义端口、访问口令 |
 
-两个插件是「装好即用、页面只做入口」的形态：AList、npc、nps 没有自定义后端，
+三个插件是「装好即用、页面只做入口」的形态：AList、npc、nps 没有自定义后端，
 页面负责打开它们自己的管理界面；其余插件都有 `function/<名字>` 后端，
 可以在卡片页里直接启停/改配置/看日志。
-
-### mimon — 小米设备接入（已废弃）
-
-按早期需求做的「小米/米家设备清单」，用 ARP + IEEE OUI + miIO 广播 DID + iKuai 终端列表识别型号。
-方向已废弃、设备上已完整卸载，源码留作 miIO 发现与 OUI 过滤的实现参考，**不提供安装包**。
 
 ---
 
@@ -137,8 +129,7 @@ devmon/              自研插件：本地周边设备监控
   pkg/               插件包本体（Release / install.sh / boot.sh / bin / function / share / www）
   tests/smoke.sh     34 项本地冒烟（假 ARP / 终端列表 / ping）
   tools/mp_test.sh   前端菜单补丁的隔离副本验证脚本
-mimon/               已废弃的小米设备插件（源码存档）
-plugins/             15 个社区插件的集成层源码
+plugins/             13 个社区插件的集成层源码
 tools/               pack_plugin.py（本地打包）、pack-on-device.sh（设备上打完整包）
 build-all.sh         打包入口
 ```
@@ -152,7 +143,7 @@ build-all.sh         打包入口
 * `jq` **1.4**（没有 `--argjson` / `--indent` / 组合 `-cn`）
 * `sqlite3` **3.8.11.1**（没有 UPSERT / RETURNING / json1）
 * `bash` + busybox（没有 python / node / timeout / nohup / setsid，`ps` 功能很弱）
-* `zip` / `unzip` / `sha256sum` / `base64` 都有；`LuaJIT 2.1` + `cjson` + `lsqlite3`（mimon 用）
+* `zip` / `unzip` / `sha256sum` / `base64` 都有
 * 持久分区只有 `/etc/mnt` 和 `/etc/log`；**根分区每次重启还原**，所以插件靠 `boot.sh`
   每次开机重新铺开（devmon 的菜单补丁也是每次开机重打）
 
