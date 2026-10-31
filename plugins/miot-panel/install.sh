@@ -92,6 +92,9 @@ if [ -f "$RT/lib/libc.so.6" ] && [ ! -e "$RT/lib/libutil.so.1" ]; then
     ln -sf libc.so.6 "$RT/lib/libutil.so.1" 2>/dev/null
 fi
 
+# 完整包经过 zip 重新打包时可能丢掉执行位：loader/python 必须先恢复 +x。
+chmod +x "$PY" "$RT/lib/ld-linux-x86-64.so.2" 2>/dev/null
+
 run_py() { "$RT/lib/ld-linux-x86-64.so.2" --library-path "$RT/lib" "$PY" "$@"; }
 
 if ! run_py -c 'import ssl' >/dev/null 2>&1; then
@@ -121,8 +124,43 @@ mkdir -p "$APP"
 cp -a "$ROOT/payload/panel/." "$APP/" 2>/dev/null
 echo "$(date '+%F %T') [install] app 已同步: $(ls "$APP" | wc -l) 项" >> "$LOG"
 
+# ---------------------------------------------------------------- 音乐组件工具
+# 完整包把 ffmpeg/ffprobe 放在 payload/panel/music-stack；复制到数据盘，
+# 这样升级时不会因为旧 data/music-stack 缺工具而扫描/转码失败。
+STACK="$DATA/music-stack"
+STACK_SRC="$ROOT/payload/panel/music-stack"
+if [ -d "$STACK_SRC" ]; then
+    mkdir -p "$STACK/bin" "$STACK/songloft/music" "$STACK/songloft/covers" 2>/dev/null
+    for f in ffmpeg ffprobe; do
+        if [ -f "$STACK_SRC/$f" ]; then
+            cp -f "$STACK_SRC/$f" "$STACK/bin/$f" 2>>"$LOG" && chmod 755 "$STACK/bin/$f" 2>>"$LOG"
+        fi
+    done
+    echo "$(date '+%F %T') [install] 音乐工具已就绪: $(ls "$STACK_SRC" | tr '\n' ' ')" >> "$LOG"
+fi
+
+# 旧的 Songloft/go-music-dl 进程不继承新 PATH；先停掉，让新面板启动时重新拉起。
+if [ -f "$STACK/stack.json" ]; then
+    for key in songloft_pid gmd_pid; do
+        pid="$(grep -o "\"$key\":[0-9]*" "$STACK/stack.json" 2>/dev/null | head -n1 | cut -d: -f2)"
+        if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            echo "$(date '+%F %T') [install] 停止旧音乐进程 $key=$pid" >> "$LOG"
+        fi
+    done
+fi
+# stack.json 可能是旧 PID，按实际命令行再清一次。
+for pat in "$STACK/bin/songloft" "$STACK/bin/music-dl"; do
+    for pid in $(ps w 2>/dev/null | grep "$pat" | grep -v grep | grep -v "bash -c" | sed -n 's/^ *\([0-9]*\).*/\1/p'); do
+        kill "$pid" 2>/dev/null
+        echo "$(date '+%F %T') [install] 停止运行中的音乐进程 $pid" >> "$LOG"
+    done
+done
+sleep 1
+
 # ---------------------------------------------------------------- 初始化
 chmod +x "$ROOT/bin/miot-panel" "$ROOT/share/menu_patch.sh" 2>/dev/null
+chmod +x "$STACK/bin/"* 2>/dev/null
 
 # 左侧菜单补丁默认不启用：爱快 3.7.16 实测前端不随 /json/menu.json 刷新，
 # 打上去也不会显示。脚本留在 share/ 下，需要时用 `miot-panel menu on` 手动试。

@@ -19,7 +19,7 @@
 | [frpc](frpc/) | 0.71.1.1 | FRP 客户端：服务端地址/token、多条 tcp/udp/http/https 代理规则增删、启停、日志 | 后端 + 页面 | ✅ |
 | [frps](frps/) | 0.71.1.1 | FRP 服务端：通信端口、仪表盘端口、认证 Token 自动生成、启停、日志 | 后端 + 页面 | ✅ |
 | [gecoos](gecoos/) | 2.2.20251015.1 | 集客 AC：集中管理集客 AP、管理端口、AP 通信端口、公网访问开关（默认仅内网）、Web 密码 | 后端 + 页面 | ✅ |
-| [miot-panel](miot-panel/) | 1.1.3 | 米家墙面板（设备控制/摄像头/音乐中心）：启停、端口、日志、一键打开面板 | 后端 + 页面 | ✅ |
+| [miot-panel](miot-panel/) | 1.1.4 | 米家墙面板（设备控制/摄像头/音乐中心）：内置 Songloft/go-music-dl/FFmpeg，装好即用；启停、端口、日志、一键打开面板 | 后端 + 页面 | ✅ |
 | [npc](npc/) | 0.26.39.2 | NPC 内网穿透客户端：装好即自启，卡片直达其自身管理界面 | 启动器 + 页面 | ✅ |
 | [nps](nps/) | 0.26.39.3 | NPS 内网穿透服务端：默认端口 81，自启，卡片直达 Web 管理 | 启动器 + 页面 | ✅ |
 | [openclash](openclash/) | 0.48.003 | mihomo(Meta) 内核 + 订阅导入/转换 + 透明代理（redirect/tproxy/tun）+ 原生 Web 控制台：配置/订阅/规则/节点/延迟/旁路/自检/日志 | 后端 + 页面 | ✅ |
@@ -30,7 +30,7 @@
 
 **源码里缺的二进制**（只有自己重新打包时才需要补）：`AdGuardHome`、`alist`、`ddns-go`、`ttyd`、
 `frpc`/`frps`、`npc`/`nps`、`gecoos` 的 `share/ac`、`aria2c` 与 AriaNg、openclash 的
-`bin/mihomo` + `share/geo/*` + `share/ui/zashboard/*`、miot-panel 的 `app/ payload/ site/`（python 运行时由 `install.sh` 在线下载）。
+`bin/mihomo` + `share/geo/*` + `share/ui/zashboard/*`、miot-panel 的 `app/ payload/ site/`（1.1.4 完整包还内置 `Songloft`、`go-music-dl`、`FFmpeg/FFprobe` 和音乐插件）。
 
 > `awesun`（向日葵远程控制）和 `ikupd`（插件在线升级）**不在本仓库**：
 > 前者是厂商闭源客户端，后者用上游 [deadash/ikuai-plugins](https://github.com/deadash/ikuai-plugins/releases) 的包。

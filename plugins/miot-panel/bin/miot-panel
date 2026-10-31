@@ -76,7 +76,7 @@ cmd_url() {
 cmd_start() {
     if is_running; then echo "已在运行 pid=$(cat "$PIDFILE")"; return 0; fi
     if [ ! -x "$PY" ]; then echo "缺少 Python 运行时，请重新安装插件"; return 1; fi
-    local p; p="$(port)"
+    local p lip; p="$(port)"; lip="$(lan_ip)"
     # 爱快是 uClibc，系统里没有 glibc 的 /lib64/ld-linux-x86-64.so.2，而 python 的 ELF
     # 里 PT_INTERP 写死了这个路径：直接 exec 会在内核加载解释器那一步 ENOENT
     # （env 报 "can't execute ...: No such file or directory"），LD_LIBRARY_PATH 不起作用。
@@ -90,6 +90,7 @@ cmd_start() {
     ( trap '' HUP
       exec env LD_LIBRARY_PATH="$RT/lib" PYTHONPATH="$SITE" \
         MIOT_ROOT="$DATA" MIOT_APP_DIR="$APP" MIOT_PORT="$p" \
+        MIOT_LAN_IP="$lip" MIOT_AUTO_MUSIC=1 \
         MIOT_LOG_FILE="$LOG" MIOT_DISCOVERY_PORT=37020 \
         "${run[@]}" "$APP/miot-cloud.py" >> "$LOG" 2>&1 ) &
     echo $! > "$PIDFILE"
