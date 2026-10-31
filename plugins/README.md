@@ -1,53 +1,66 @@
-# plugins/ —— 我这条 iKuai 上在跑的其它插件
+# plugins/ —— 我这台 iKuai 上在用的社区插件
 
-这里放的是除 [devmon](../devmon/README.md) 之外、我按同一套插件框架做的 **iKuai 集成层源码**：
+除 [devmon](../devmon/README.md) 之外、按同一套插件框架做的 **iKuai 集成层**：
 `Release` / `install.sh` / `boot.sh` / `uninstall.sh`、后端 `function/*`、`bin/*ctl` 控制脚本、
 `www/plugins/**` 卡片与页面，以及必要的默认配置。
 
-**第三方程序本体没有放进仓库**——它们体积大（几个到几百 MB）、各有自己的许可证和发布渠道。
-不过 [Releases](../../releases) 里提供了**含程序本体的完整包**（打包时排除了各插件的 `data/`），
-可以直接 `ikplugin install` 或被「插件在线升级」(ikupd) 直接升级：
+各组件的**第三方程序本体不放进仓库**（体积大、各有许可证和发布渠道），但
+[Releases](../../releases) 里提供**含程序本体的完整包**，可直接安装、也能被 ikupd 升级。
 
-| 有完整包 | 只有源码 |
-| --- | --- |
-| adguardhome、alist、aria2、bnfix、ddnsgo、frpc、frps、gecoos、ikupd、miot-panel、npc、nps、openclash、ttyd | awesun（向日葵官方闭源客户端，473MB）——主体是厂商程序，不在这里再分发 |
+## 一览
 
-要自己重新打完整包：在路由器上 `bash tools/pack-on-device.sh <插件名>`，它会排除 `data/`
-（证书 / token / 清单都在那里），并按 `<插件名>-v<版本>-plugin.zip` 命名。
-
-| 插件 | 版本 | 作用 | 仓库里有 | 需要自己补 |
+| 插件 | 版本 | 功能 | 形态 | 完整包 |
 | --- | --- | --- | --- | --- |
-| [adguardhome](adguardhome/) | 0.107.79.3 | AdGuard Home 广告拦截（DNS） | 集成层 + `share/AdGuardHome.yaml.default` | `share/AdGuardHome` 静态二进制 |
-| [alist](alist/) | 3.65.0 | AList 网盘聚合（WebDAV/多网盘） | 集成层 | `share/alist` 二进制 |
-| [aria2](aria2/) | 1.0.4 | aria2 下载器 + AriaNg 界面 | 集成层 + `aria2_page_check.js` | `bin/aria2c`、`www/plugins/app/aria2ng.html` |
-| [awesun](awesun/) | 1.0.0 | 向日葵远程控制 + 虚拟桌面（X11） | 集成层 + `bin/*` 渲染/键鼠脚本 | `payload/`（向日葵 Linux 客户端、Xvfb 等） |
-| [bnfix](bnfix/) | 1.0.0 | 修系统 `libcrypto.so.1.0.0` 里 `BN_mod_sqrt` 死循环（1 字节补丁） | 补丁描述 + 控制脚本 | 无（作用于系统库，按你的固件版本核对偏移） |
-| [ddnsgo](ddnsgo/) | 6.17.7 | ddns-go 动态域名解析 | 集成层 | `share/ddns-go` 二进制 |
-| [frpc](frpc/) | 0.71.1.1 | FRP 内网穿透（客户端） | 集成层 + 页面 | `share/frpc` 二进制 |
-| [frps](frps/) | 0.71.1.1 | FRP 内网穿透（服务端） | 集成层 + 页面 | `share/frps` 二进制 |
-| [gecoos](gecoos/) | 2.2.20251015.1 | 集客 AC 无线控制器 | 集成层 | `share/ac` 二进制 |
-| [ikupd](ikupd/) | 1.0.0 | 插件在线升级（从 GitHub Release 检查/下载/安装） | 全部 | 无 |
-| [miot-panel](miot-panel/) | 1.1.1 | 米家墙面板（设备控制/摄像头/音乐，跑在路由器本机） | 集成层 + 菜单补丁 | `app/`、`payload/`、`site/`；`runtime/python` 由 `install.sh` 在线下载 |
-| [npc](npc/) | 0.26.39.2 | npc 内网穿透客户端 | 集成层 + 页面 | `share/npc` 二进制 |
-| [nps](nps/) | 0.26.39.3 | nps 内网穿透服务端（默认端口 81） | 集成层 + 页面 | `share/nps` 二进制 |
-| [openclash](openclash/) | 0.48.003 | OpenClash for iKuai：mihomo 内核 + 订阅 + 透明代理 | 集成层（`bin/occtl`、`function/openclash`、页面、`share/conf/template.yaml`、`openclash-guard.sh`） | `bin/mihomo`、`share/geo/*`、`share/ui/zashboard/*` |
-| [ttyd](ttyd/) | 1.7.7 | 浏览器里的 root 终端 | 集成层 | `share/ttyd` 二进制 |
+| [adguardhome](adguardhome/) | 0.107.79.3 | 局域网 DNS 广告/追踪拦截：启停、重启、监听端口、上游 DNS、运行日志（查看/清空） | 后端 + 页面 | ✅ |
+| [alist](alist/) | 3.65.0 | 网盘聚合（阿里云盘/115/天翼云盘/夸克/OneDrive…）统一 Web 与 WebDAV：自启、端口、一键打开管理界面 | 启动器 + 页面 | ✅ |
+| [aria2](aria2/) | 1.0.4 | 多协议下载（HTTP/FTP/BT/磁力）+ AriaNg 界面：RPC 密钥、下载目录、启停、日志 | 后端 + 页面 | ✅ |
+| [awesun](awesun/) | 1.0.0 | 向日葵远程控制 + 虚拟桌面：X11 渲染、键鼠接管、多屏、登录绑定、本地密码、凭证保存/还原 | 后端 + 页面 | ❌ 厂商闭源客户端，仅本机使用 |
+| [bnfix](bnfix/) | 1.0.0 | 修系统 `libcrypto.so.1.0.0` 里 `BN_mod_sqrt()` 的死循环（1 字节补丁 `je`→`jle`）：状态、单点校验、完整校验、重启 | 后端 + 页面 | ✅ |
+| [ddnsgo](ddnsgo/) | 6.17.7 | ddns-go 动态域名客户端：启停、重启、监听端口、日志 | 后端 + 页面 | ✅ |
+| [frpc](frpc/) | 0.71.1.1 | FRP 客户端：服务端地址/token、多条 tcp/udp/http/https 代理规则增删、启停、日志 | 后端 + 页面 | ✅ |
+| [frps](frps/) | 0.71.1.1 | FRP 服务端：通信端口、仪表盘端口、认证 Token 自动生成、启停、日志 | 后端 + 页面 | ✅ |
+| [gecoos](gecoos/) | 2.2.20251015.1 | 集客 AC：集中管理集客 AP、管理端口、AP 通信端口、公网访问开关（默认仅内网）、Web 密码 | 后端 + 页面 | ✅ |
+| [ikupd](ikupd/) | 1.0.0 | 插件在线升级：仓库列表、HTTP/socks5 代理、GitHub Token、检查更新、下载校验 sha256、安装/丢弃 | 后端 + 页面 | ✅ |
+| [miot-panel](miot-panel/) | 1.1.1 | 米家墙面板（设备控制/摄像头/音乐中心）：启停、端口、日志、一键打开面板 | 后端 + 页面 | ✅ |
+| [npc](npc/) | 0.26.39.2 | NPC 内网穿透客户端：装好即自启，卡片直达其自身管理界面 | 启动器 + 页面 | ✅ |
+| [nps](nps/) | 0.26.39.3 | NPS 内网穿透服务端：默认端口 81，自启，卡片直达 Web 管理 | 启动器 + 页面 | ✅ |
+| [openclash](openclash/) | 0.48.003 | mihomo(Meta) 内核 + 订阅导入/转换 + 透明代理（redirect/tproxy/tun）+ 原生 Web 控制台：配置/订阅/规则/节点/延迟/旁路/自检/日志 | 后端 + 页面 | ✅ |
+| [ttyd](ttyd/) | 1.7.7 | 浏览器里的 root 终端：启停、自定义端口、访问口令 | 后端 + 页面 | ✅ |
 
-## 怎么装
+**形态说明**：`后端 + 页面` = 有 `function/<插件名>` 接口，卡片页里能直接启停/改配置/看日志；
+`启动器 + 页面` = 没有自定义后端，`install.sh`/`boot.sh` 拉起进程，页面只负责打开它自己的管理界面。
 
-补齐上表「需要自己补」的文件后，把插件目录按 iKuai 插件包格式打成 zip（顶层就是
-`Release`/`install.sh`/`bin`/`function`/`www`/`share`）：
+**源码里缺的二进制**（只有自己重新打包时才需要补）：`AdGuardHome`、`alist`、`ddns-go`、`ttyd`、
+`frpc`/`frps`、`npc`/`nps`、`gecoos` 的 `share/ac`、`aria2c` 与 AriaNg、openclash 的
+`bin/mihomo` + `share/geo/*` + `share/ui/zashboard/*`、awesun 的 `payload/`、
+miot-panel 的 `app/ payload/ site/`（python 运行时由 `install.sh` 在线下载）。
+
+## 安装
+
+从 [Releases](../../releases) 下载对应 `<插件名>-v<版本>-plugin.zip`：
 
 ```bash
-cd plugins/ttyd && zip -r ../../dist/ttyd.zip .      # 或 bash build.sh 里同样的做法
+ikplugin install /root/ttyd-v1.7.7-plugin.zip
 ```
 
-然后在「高级应用 → 插件管理」上传，或 SSH `ikplugin install /root/ttyd.zip`。
+或在「高级应用 → 插件管理」上传；卸载 `ikplugin remove <插件名>`。
+
+## 自己打完整包
+
+```bash
+# 在路由器上：把已安装的插件连同二进制打回安装包（排除 data/、日志、旧签名清单）
+bash tools/pack-on-device.sh ttyd     # => /tmp/ttyd-v1.7.7-plugin.zip + sha256
+gh release upload <tag> ttyd-v1.7.7-plugin.zip
+```
+
+包名必须守 `<插件名>-v<版本>-plugin.zip`，ikupd 只认这个格式；
+详见[根 README 的「插件在线升级」](../README.md#插件在线升级ikupd)。
 
 ## 注意
 
-* 插件以 root 运行，并且都会修改 `/usr/ikuai`（菜单/SPA 路由/i18n）或启动常驻进程。
-  **装之前先读 `install.sh` 和 `function/*`**，确认它在你机器上要做什么。
-* 这些集成层是按我这台 **iKuai 3.7.16 x64 Build202411141700** 写的：二进制路径、服务名、
+* 插件以 **root** 运行，并且会修改 `/usr/ikuai`（菜单 / SPA 路由 / i18n）或启动常驻进程。
+  **装之前先读 `install.sh` 和 `function/*`**。
+* 集成层按 **iKuai 3.7.16 x64 Build202411141700** 编写/验证：二进制路径、服务名、
   菜单锚点都依赖这个固件版本，换版本可能要重新适配。
-* 二进制版本号我按装在这台机器上的写；你要换新版本，注意 `bin/*ctl` 里可能按版本号做过判断。
+* 安装会**替换整个插件目录**，只保留 `data/`（证书 / 配置 / 数据库）；升级前别手改插件目录里的文件。
+* 发布包**不含 `data/`**：那里有证书、token、清单和数据库，不随包分发。
